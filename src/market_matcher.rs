@@ -4,7 +4,7 @@
 use crate::market::Market;
 use crate::category_mapper::CategoryMapper;
 use crate::unclassified_logger::UnclassifiedLogger;
-use crate::query_params::{SIMILARITY_THRESHOLD, SIMILARITY_TOP_K};
+use crate::system_params::{SIMILARITY_THRESHOLD, SIMILARITY_TOP_K};
 use crate::category_vectorizer::{CategoryVectorizer, CategoryVectorizerManager};
 use crate::text_vectorizer::VectorizerConfig;
 use crate::validation::ValidationPipeline;

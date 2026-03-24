@@ -602,6 +602,111 @@ pub fn parse_kalshi_orderbook(data: &Value, side: &str) -> Option<Vec<(f64, f64)
     }
 }
 
+// ==================== 卖出侧（bid 阶梯）用于模拟平仓 ====================
+
+/// 本周期同一 HTTP 响应解析出的双腿 ask/bid，避免重复请求。
+#[derive(Debug, Clone)]
+pub struct PairOrderbookLadders {
+    pub pm_asks: Vec<(f64, f64)>,
+    pub ks_asks: Vec<(f64, f64)>,
+    /// 卖出 pm_side 时吃 bid：已按价格**从高到低**（先最优 bid）
+    pub pm_bids_desc: Vec<(f64, f64)>,
+    pub ks_bids_desc: Vec<(f64, f64)>,
+}
+
+fn json_num_field(v: &Value) -> Option<f64> {
+    v.as_f64()
+        .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+}
+
+/// Polymarket CLOB：卖出 `side`（YES/NO）时取对应 token 的 **bids**，按价格降序。
+pub fn parse_polymarket_bids_desc(data: &Value, side: &str) -> Option<Vec<(f64, f64)>> {
+    let _ = side;
+    let bids = data.get("bids")?.as_array()?;
+    let mut result = Vec::new();
+    for bid in bids {
+        let price = json_num_field(bid.get("price")?)?;
+        let size = json_num_field(bid.get("size")?)?;
+        if price > 0.0 && size > 0.0 {
+            result.push((price, size));
+        }
+    }
+    if result.is_empty() {
+        return None;
+    }
+    result.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+    Some(result)
+}
+
+/// Kalshi `orderbook_fp`：卖出 YES 用 `yes_dollars` bid；卖出 NO 用 `no_dollars` bid。价格降序。
+pub fn parse_kalshi_bids_desc(data: &Value, side: &str) -> Option<Vec<(f64, f64)>> {
+    let orderbook = data.get("orderbook_fp")?;
+    let arr = if side == "YES" {
+        orderbook.get("yes_dollars")?.as_array()?
+    } else if side == "NO" {
+        orderbook.get("no_dollars")?.as_array()?
+    } else {
+        return None;
+    };
+    let mut result = Vec::new();
+    for entry in arr {
+        let bid_price = json_num_field(entry.get(0)?)?;
+        let size = json_num_field(entry.get(1)?)?;
+        if bid_price > 0.01 && bid_price < 1.0 && size > 0.0 {
+            result.push((bid_price, size));
+        }
+    }
+    if result.is_empty() {
+        return None;
+    }
+    result.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+    Some(result)
+}
+
+/// 从已获取的 PM/Kalshi 订单簿 JSON 构建双腿 ask + 卖出用 bid 阶梯。
+pub fn build_pair_orderbook_ladders(
+    pm_book: &Value,
+    ks_book: &Value,
+    pm_side: &str,
+    ks_side: &str,
+) -> Option<PairOrderbookLadders> {
+    let pm_asks = parse_polymarket_orderbook(pm_book, pm_side)?;
+    let ks_asks = parse_kalshi_orderbook(ks_book, ks_side)?;
+    let pm_bids_desc = parse_polymarket_bids_desc(pm_book, pm_side)?;
+    let ks_bids_desc = parse_kalshi_bids_desc(ks_book, ks_side)?;
+    Some(PairOrderbookLadders {
+        pm_asks,
+        ks_asks,
+        pm_bids_desc,
+        ks_bids_desc,
+    })
+}
+
+/// 在 `bids_desc`（价高优先）上卖出恰好 `n` 份，返回 (总回款 USDT, 加权均价)。
+pub fn proceeds_for_exact_contracts_sell(bids_desc: &[(f64, f64)], n: f64) -> Option<(f64, f64)> {
+    if n <= 0.0 || !n.is_finite() {
+        return None;
+    }
+    const EPS: f64 = 1e-9;
+    let mut remaining = n;
+    let mut total_proceeds = 0.0;
+    for (price, size) in bids_desc {
+        if remaining <= EPS {
+            break;
+        }
+        if *size <= 0.0 || *price <= 0.0 {
+            continue;
+        }
+        let take = remaining.min(*size);
+        total_proceeds += take * price;
+        remaining -= take;
+    }
+    if remaining > 1e-6 {
+        return None;
+    }
+    Some((total_proceeds, total_proceeds / n))
+}
+
 #[cfg(test)]
 mod arb_tests {
     use super::*;
@@ -649,5 +754,13 @@ mod arb_tests {
         let (c_pm, _) = cost_for_exact_contracts(&pm, opp.contracts).unwrap();
         let (c_ks, _) = cost_for_exact_contracts(&ks, opp.contracts).unwrap();
         assert!((opp.capital_used - (c_pm + c_ks)).abs() < 0.01);
+    }
+
+    #[test]
+    fn proceeds_sell_walks_bids_desc() {
+        let bids = [(0.6, 10.0), (0.5, 10.0)];
+        let (p, avg) = proceeds_for_exact_contracts_sell(&bids, 5.0).unwrap();
+        assert!((p - 3.0).abs() < 1e-9);
+        assert!((avg - 0.6).abs() < 1e-9);
     }
 }

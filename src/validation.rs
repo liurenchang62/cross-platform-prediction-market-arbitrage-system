@@ -391,6 +391,40 @@ impl WeatherValidator {
             (None, None) => true,                        // 都无地区（generic）则放行
         }
     }
+
+    /// 提取「N°F or below」或「N° or below」中的整数档位（高温上限类命题）。
+    fn extract_or_below_fahrenheit_threshold(title: &str) -> Option<i32> {
+        let re_f = Regex::new(r"(?i)(\d+)\s*°\s*F\s*or\s+below").ok()?;
+        if let Some(c) = re_f.captures(title) {
+            if let Ok(n) = c.get(1)?.as_str().parse::<i32>() {
+                if (20..=120).contains(&n) {
+                    return Some(n);
+                }
+            }
+        }
+        let re_plain = Regex::new(r"(?i)(\d+)\s*°\s*or\s+below").ok()?;
+        if let Some(c) = re_plain.captures(title) {
+            if let Ok(n) = c.get(1)?.as_str().parse::<i32>() {
+                if (20..=120).contains(&n) {
+                    return Some(n);
+                }
+            }
+        }
+        None
+    }
+
+    /// 两侧都能解析出「or below」华氏档位时，阈值必须相同（避免 PM 37°F 档 vs Kalshi 49°F 档）。
+    pub fn fahrenheit_or_below_buckets_match(pm_title: &str, kalshi_title: &str) -> bool {
+        if !Self::is_temperature_market(pm_title) || !Self::is_temperature_market(kalshi_title) {
+            return true;
+        }
+        let pm = Self::extract_or_below_fahrenheit_threshold(pm_title);
+        let ks = Self::extract_or_below_fahrenheit_threshold(kalshi_title);
+        match (pm, ks) {
+            (Some(a), Some(b)) => a == b,
+            _ => true,
+        }
+    }
 }
 
 /// ==================== 电竞局数验证器 ====================
@@ -650,9 +684,9 @@ impl ExactScoreVsGoalsTotalsValidator {
     }
 }
 
-/// ==================== 电竞「Will X win 大赛」vs 传统体育进球盘 ====================
-/// 例：PM「Will Cloud9 New York win DreamHack Major 2?」误配 Kalshi「… over 2.5 goals?」
-/// 仅靠队名/城市相似会高分，命题不同。要求 Will-win 侧含明确电竞语境，另一侧为 goals O/U，才拦截。
+/// ==================== 电竞「Will X win 大赛」vs 传统体育进球/让分盘 ====================
+/// 例：PM「Will Cloud9 New York win DreamHack Major 2?」误配 Kalshi「… over 2.5 goals?」或「… wins by over 1.5 Points?」
+/// 仅靠队名/城市相似会高分，命题不同。要求 Will-win 侧含明确电竞语境，另一侧为 goals O/U 或净胜分 Points 盘，才拦截。
 pub struct EsportsTournamentWinnerVsSportsGoalsValidator;
 
 impl EsportsTournamentWinnerVsSportsGoalsValidator {
@@ -719,11 +753,19 @@ impl EsportsTournamentWinnerVsSportsGoalsValidator {
         ANCHORS.iter().any(|a| l.contains(a))
     }
 
+    /// 传统体育净胜分/让分表述：「wins by over/under X.X Points」（与 Major/系列赛夺冠不同命题）
+    fn is_wins_by_points_margin_line(title: &str) -> bool {
+        Regex::new(r"(?i)wins?\s+by\s+(over|under)\s+\d+\.?\d*\s*points")
+            .map(|re| re.is_match(title))
+            .unwrap_or(false)
+    }
+
     pub fn allows_pair(pm_title: &str, kalshi_title: &str) -> bool {
         for (a, b) in [(pm_title, kalshi_title), (kalshi_title, pm_title)] {
             if Self::is_will_side_win_event_proposition(a)
                 && Self::has_esports_series_anchor(a)
-                && ExactScoreVsGoalsTotalsValidator::is_goals_totals_line(b)
+                && (ExactScoreVsGoalsTotalsValidator::is_goals_totals_line(b)
+                    || Self::is_wins_by_points_margin_line(b))
             {
                 return false;
             }
@@ -1552,6 +1594,10 @@ impl ValidationPipeline {
             self.record_filter(pm_title, kalshi_title, "天气地区不匹配");
             return None;
         }
+        if !WeatherValidator::fahrenheit_or_below_buckets_match(pm_title, kalshi_title) {
+            self.record_filter(pm_title, kalshi_title, "温度档位(°For below)不一致");
+            return None;
+        }
 
         // 1.1b 娱乐榜单：Billboard #1 与 Top 10 不能匹配
         if EntertainmentChartValidator::is_billboard_spotify_cross(pm_title, kalshi_title) {
@@ -1608,7 +1654,7 @@ impl ValidationPipeline {
             self.record_filter(
                 pm_title,
                 kalshi_title,
-                "电竞赛事夺冠命题与体育进球Totals不能匹配",
+                "电竞赛事夺冠命题与体育进球Totals/净胜分Points盘不能匹配",
             );
             return None;
         }
@@ -1967,6 +2013,22 @@ mod tests {
     }
 
     #[test]
+    fn test_weather_fahrenheit_or_below_bucket() {
+        assert!(!WeatherValidator::fahrenheit_or_below_buckets_match(
+            "Will the highest temperature in Chicago be 37°F or below on March 24?",
+            "Will the high temp in Chicago be <50° on Mar 24, 2026? - 49° or below"
+        ));
+        assert!(WeatherValidator::fahrenheit_or_below_buckets_match(
+            "Will the highest temperature in Chicago be 37°F or below on March 24?",
+            "Chicago high on Mar 24 - 37° or below"
+        ));
+        assert!(WeatherValidator::fahrenheit_or_below_buckets_match(
+            "Some unrelated market 100 points",
+            "Another market without temp or below"
+        ));
+    }
+
+    #[test]
     fn test_esports_single_vs_series() {
         // BO5/First Stand vs 单局胜者 -> 不能匹配
         assert!(!EsportsGameValidator::single_vs_series_match(
@@ -2121,6 +2183,17 @@ mod tests {
         assert!(EsportsTournamentWinnerVsSportsGoalsValidator::allows_pair(
             "Will Arsenal win the Premier League?",
             "Arsenal vs Chelsea: Over 2.5 goals?"
+        ));
+
+        // Kalshi「净胜分 Points」盘（非 goals）亦应拦截
+        let ks_points = "New York wins by over 1.5 Points? - New York wins by over 1.5 Points";
+        assert!(!EsportsTournamentWinnerVsSportsGoalsValidator::allows_pair(pm, ks_points));
+        let mut pipe2 = ValidationPipeline::new();
+        assert!(pipe2.validate(pm, ks_points, 0.95, "esports").is_none());
+        // 电竞 Major vs 普通单场胜负：仍放行
+        assert!(EsportsTournamentWinnerVsSportsGoalsValidator::allows_pair(
+            "Will FaZe win IEM Cologne?",
+            "FaZe vs NaVi Winner? - FaZe"
         ));
     }
 

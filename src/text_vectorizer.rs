@@ -4,7 +4,7 @@
 use std::collections::{HashMap, HashSet};
 use rust_stemmers::{Algorithm, Stemmer};
 use ndarray::Array1;
-use crate::query_params::MAX_VOCAB_SIZE;
+use crate::system_params::MAX_VOCAB_SIZE;
 
 /// 停用词集合（常见无意义词语）
 fn get_stop_words() -> HashSet<&'static str> {

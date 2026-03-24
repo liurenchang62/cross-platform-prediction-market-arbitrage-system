@@ -13,8 +13,9 @@ The pipeline combines text-based market matching (vector similarity and category
 - **Market data**: Loads open markets from the Polymarket Gamma API and the Kalshi Trade API, with configurable pagination and upper bounds.
 - **Matching**: TF-IDF-style text vectors and cosine similarity; optional category constraints and scoring from `config/categories.toml`.
 - **Execution-style PnL**: For each candidate pair, costs and net profit for a **notional-capped, depth-walked** buy scenario are derived from **parsed ask ladders** on both venues (see **Order-book PnL model**).
-- **Tracking**: Maintains a set of tracked pairs across cycles, with periodic full rebuilds and parameter-driven intervals (`src/query_params.rs`).
+- **Tracking**: Maintains a set of tracked pairs across cycles, with periodic full rebuilds and parameter-driven intervals (`src/system_params.rs`).
 - **Logging**: Cycle outputs and monitor CSVs under `logs/`; unmatched or low-signal items may be recorded under `logs/unclassified/`.
+- **Paper trading (optional)**: Set **`PAPER_TRADING_ENABLED`** to `true` in `src/system_params.rs`; CSV output is gated by **`PAPER_WRITE_TRADE_LOG`**. Logic in `src/paper_trading.rs`, details in `docs/PAPER_TRADING.md`.
 
 ## Order-book PnL model
 
@@ -24,7 +25,7 @@ The scenario used for reporting (e.g. Top-10 and `net_profit_100`) is defined as
    For a matched pair, the program requests the **current** Polymarket and Kalshi **order books** over HTTP and parses resting liquidity into **ascending ask ladders** `(price, size)`.
 
 2. **Per-leg notional cap**  
-   Each leg is allocated a maximum spend of **100 USDT** (`trade_amount` in `src/main.rs`). The ladder is traversed level by level until that cap is reached or liquidity is exhausted (`calculate_slippage_with_fixed_usdt` in `src/arbitrage_detector.rs`), yielding a **fillable contract count** per venue.
+   Each leg is allocated a maximum spend of **100 USDT** (`PAPER_PER_LEG_CAP_USDT` in `src/system_params.rs`, used for monitoring and paper). The ladder is traversed level by level until that cap is reached or liquidity is exhausted (`calculate_slippage_with_fixed_usdt` in `src/arbitrage_detector.rs`), yielding a **fillable contract count** per venue.
 
 3. **Hedged size**  
    The scenario size **n** is the **minimum** of the two per-leg contract counts so that both legs can be notionally filled at the same size.
@@ -53,11 +54,12 @@ Ensure **`config/categories.toml`** exists before the first run (included in the
 | Path | Purpose |
 |------|---------|
 | `config/categories.toml` | Category names, weights, and keywords for classification and matching |
-| `src/query_params.rs` | Request pacing, page limits, `SIMILARITY_THRESHOLD`, `SIMILARITY_TOP_K`, `FULL_FETCH_INTERVAL`, `RESOLUTION_HORIZON_DAYS`, etc. |
+| `src/system_params.rs` | HTTP/matching/window constants; paper switches (`PAPER_TRADING_ENABLED`, `PAPER_WRITE_TRADE_LOG`, …), CSV paths |
 
 ### Optional environment variables
 
 - **`POLYMARKET_TAG_SLUG`**: When set, Polymarket market fetches may be restricted by tag (see `src/clients.rs`).
+- **`PAPER_RUN_LABEL`** (optional): appended to paper CSV `notes`; see `PAPER_RUN_LABEL_ENV` in `src/system_params.rs`.
 
 ## Repository layout
 
@@ -69,13 +71,15 @@ src/
   text_vectorizer.rs    Text vectorization
   vector_index.rs       Vector search
   arbitrage_detector.rs Order-book traversal, fees, and PnL helpers
-  query_params.rs       Shared tuning constants
+  system_params.rs       Shared tuning constants
   validation.rs         Validation helpers
   tracking.rs           Per-cycle monitor state
+  paper_trading.rs      Optional paper trading / positions
 config/
   categories.toml
 docs/
   MATCHING_VERIFICATION.md
+  PAPER_TRADING.md
 ```
 
 Further detail on matching and indexing: **[docs/MATCHING_VERIFICATION.md](docs/MATCHING_VERIFICATION.md)**.

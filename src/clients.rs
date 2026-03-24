@@ -1,5 +1,5 @@
 use crate::market::{Market, MarketPrices};
-use crate::query_params::*;
+use crate::system_params::*;
 use anyhow::{Context, Result};
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 use reqwest::Client;
@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tokio::time::sleep;
 
-/// Gamma `events[].markets[]` 或 `GET /markets` 单条：`endDate`（RFC3339）为主；仅日历日时有 `endDateIso`。
+/// Gamma `events[].markets[]` 或 `GET /markets` 单条：`endDate`（RFC3339）写入 `resolution_date`；与 Kalshi 展示对齐时见 `parse_kalshi_market_resolution_date`。
 /// 从 Gamma 单条 `market` JSON 解析 `Market`（用于 `/markets?id=` 等）；已关闭/已结算返回 `None`。
 pub(crate) fn parse_polymarket_gamma_market_row(
     market_data: &Value,
@@ -80,6 +80,8 @@ pub(crate) fn parse_polymarket_gamma_market_row(
     })
 }
 
+/// Polymarket：统一以 **`endDate`**（及 `endDateIso`）表示 Gamma 上的「市场/事件结束时刻」；缺失时再尝试关市、UMA 等。
+/// 与 Kalshi 对表时，优先与 Kalshi 的 **`expected_expiration_time`** 对齐（见下），二者都比 Kalshi 单独的 `close_time` 更接近「结果窗口结束」。
 pub(crate) fn parse_polymarket_market_resolution_date(market_data: &Value) -> Option<DateTime<Utc>> {
     for key in ["endDate", "end_date"] {
         if let Some(s) = market_data[key].as_str() {
@@ -92,6 +94,24 @@ pub(crate) fn parse_polymarket_market_resolution_date(market_data: &Value) -> Op
         }
     }
     if let Some(s) = market_data["endDateIso"].as_str() {
+        if let Ok(d) = NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+            let ndt = d.and_hms_opt(0, 0, 0)?;
+            return Some(Utc.from_utc_datetime(&ndt));
+        }
+    }
+    for key in ["closedTime", "closed_time"] {
+        if let Some(dt) = parse_rfc3339_field(market_data, key) {
+            return Some(dt);
+        }
+    }
+    if let Some(s) = market_data["umaEndDate"].as_str() {
+        if !s.is_empty() {
+            if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
+                return Some(dt.with_timezone(&Utc));
+            }
+        }
+    }
+    if let Some(s) = market_data["umaEndDateIso"].as_str() {
         if let Ok(d) = NaiveDate::parse_from_str(s, "%Y-%m-%d") {
             let ndt = d.and_hms_opt(0, 0, 0)?;
             return Some(Utc.from_utc_datetime(&ndt));
@@ -113,13 +133,13 @@ fn parse_rfc3339_field(market_data: &Value, key: &str) -> Option<DateTime<Utc>> 
         .map(|dt| dt.with_timezone(&Utc))
 }
 
-/// Kalshi 列表/详情：优先 **`expected_expiration_time`**（接近「赛果/事件可判定」时刻，便于与 Polymarket `endDate` 对齐）；
-/// 再依次 `expiration_time`、`close_time`；**`latest_expiration_time` 置末**（规则上的最晚窗口，常与真实赛日相差甚远）。
+/// Kalshi：与 Polymarket **`endDate`** 做跨平台展示/筛选时，**优先 `expected_expiration_time`**（API 释义：预计到期/结果落定相关），
+/// 数值上通常与 PM `endDate` 最接近。`close_time` 多为交易所关市截止，常晚于真实赛果窗口，作第二顺位。
 pub(crate) fn parse_kalshi_market_resolution_date(market_data: &Value) -> Option<DateTime<Utc>> {
     for key in [
         "expected_expiration_time",
-        "expiration_time",
         "close_time",
+        "expiration_time",
         "latest_expiration_time",
     ] {
         if let Some(dt) = parse_rfc3339_field(market_data, key) {
@@ -886,6 +906,23 @@ mod resolution_date_field_tests {
     }
 
     #[test]
+    fn polymarket_closed_time_fallback() {
+        let market = serde_json::json!({
+            "closedTime": "2026-05-01T12:00:00Z",
+            "question": "q"
+        });
+        let dt = parse_polymarket_market_resolution_date(&market).unwrap();
+        assert_eq!(dt.to_rfc3339(), "2026-05-01T12:00:00+00:00");
+    }
+
+    #[test]
+    fn polymarket_uma_end_date_iso_fallback() {
+        let market = serde_json::json!({"umaEndDateIso": "2026-08-15"});
+        let dt = parse_polymarket_market_resolution_date(&market).unwrap();
+        assert_eq!(dt, Utc.with_ymd_and_hms(2026, 8, 15, 0, 0, 0).unwrap());
+    }
+
+    #[test]
     fn kalshi_uses_expiration_time_rfc3339() {
         let market = serde_json::json!({
             "ticker": "TEST-26",
@@ -904,25 +941,33 @@ mod resolution_date_field_tests {
     }
 
     #[test]
-    fn kalshi_prefers_expected_expiration_for_event_end() {
+    fn kalshi_prefers_expected_expiration_to_align_with_pm_enddate() {
         let market = serde_json::json!({
-            "expected_expiration_time": "2026-01-01T00:00:00Z",
+            "close_time": "2026-04-07T12:00:00Z",
+            "expected_expiration_time": "2026-03-24T18:00:00Z",
             "expiration_time": "2026-03-01T00:00:00Z",
-            "close_time": "2026-03-15T00:00:00Z",
             "latest_expiration_time": "2026-06-01T00:00:00Z",
         });
         let dt = parse_kalshi_market_resolution_date(&market).unwrap();
-        assert_eq!(dt.to_rfc3339(), "2026-01-01T00:00:00+00:00");
+        assert_eq!(dt.to_rfc3339(), "2026-03-24T18:00:00+00:00");
     }
 
     #[test]
-    fn kalshi_falls_back_past_expected_to_expiration_not_latest() {
-        let market = serde_json::json!({
+    fn kalshi_falls_back_close_then_expiration_then_latest() {
+        let no_expected = serde_json::json!({
+            "close_time": "2026-03-15T00:00:00Z",
             "expiration_time": "2026-03-01T00:00:00Z",
             "latest_expiration_time": "2026-06-01T00:00:00Z",
         });
-        let dt = parse_kalshi_market_resolution_date(&market).unwrap();
-        assert_eq!(dt.to_rfc3339(), "2026-03-01T00:00:00+00:00");
+        let dt = parse_kalshi_market_resolution_date(&no_expected).unwrap();
+        assert_eq!(dt.to_rfc3339(), "2026-03-15T00:00:00+00:00");
+
+        let only_exp = serde_json::json!({
+            "expiration_time": "2026-03-01T00:00:00Z",
+            "latest_expiration_time": "2026-06-01T00:00:00Z",
+        });
+        let dt2 = parse_kalshi_market_resolution_date(&only_exp).unwrap();
+        assert_eq!(dt2.to_rfc3339(), "2026-03-01T00:00:00+00:00");
     }
 
     #[test]

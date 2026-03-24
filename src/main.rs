@@ -17,10 +17,11 @@ mod category_mapper;
 mod validation;
 mod unclassified_logger;
 mod tracking;
-mod query_params;
+mod system_params;
 mod category_vectorizer;  // 新增
 mod cycle_statistics;
 mod market_filter;
+mod paper_trading;
 
 use crate::category_mapper::CategoryMapper;
 use crate::unclassified_logger::UnclassifiedLogger;
@@ -30,11 +31,12 @@ use market_matcher::{MarketMatcher, MarketMatcherConfig};
 use arbitrage_detector::{ArbitrageDetector, ArbitrageOpportunity};
 use monitor_logger::MonitorLogger;
 use crate::tracking::{MonitorState};
-use crate::query_params::{FULL_FETCH_INTERVAL, SIMILARITY_THRESHOLD};
-use crate::market_filter::filter_markets_by_resolution_horizon;
-use crate::arbitrage_detector::{
-    orderbook_best_ask_price, parse_kalshi_orderbook, parse_polymarket_orderbook,
+use crate::system_params::{
+    FULL_FETCH_INTERVAL, PAPER_PER_LEG_CAP_USDT, SIMILARITY_THRESHOLD,
 };
+use crate::market_filter::filter_markets_by_resolution_horizon;
+use crate::arbitrage_detector::build_pair_orderbook_ladders;
+use crate::paper_trading::{validate_opportunity_from_ladders, PaperEngine};
 
 /// Top10 / 追踪共用的套利行（含双方解析日）
 type OpportunityRow = (
@@ -102,6 +104,9 @@ async fn main() -> Result<()> {
     
     // 初始化套利检测器
     let arb_detector = ArbitrageDetector::new(0.02);
+
+    // 模拟盘（可选）：见 `system_params::PAPER_TRADING_ENABLED`
+    let mut paper_engine: Option<PaperEngine> = PaperEngine::try_new()?;
     
     // 初始化监控状态
     let mut monitor_state = MonitorState::new(FULL_FETCH_INTERVAL, 10000);  // 改为10000
@@ -145,6 +150,7 @@ async fn main() -> Result<()> {
             &arb_detector,
             &logger,
             &mut monitor_state,
+            &mut paper_engine,
         ).await {
             Ok(stats) => {
                 println!("📊 周期统计: 新匹配 {} 对, 套利 {} 个, 追踪 {} 对", 
@@ -161,7 +167,7 @@ async fn main() -> Result<()> {
     }
 }
 
-/// 验证单个套利对（带滑点检查，100 USDT 本金模式）
+/// 验证单个套利对（带滑点检查）；本周期对 PM/Kalshi **各拉一次**订单簿，解析 ask+bid，供模拟平仓与套利共用。
 async fn validate_arbitrage_pair(
     polymarket: &PolymarketClient,
     kalshi: &KalshiClient,
@@ -176,47 +182,29 @@ async fn validate_arbitrage_pair(
     cycle_id: usize,
     cycle_phase: &str,
     logger: &MonitorLogger,
+    pair_label: &str,
+    paper: &mut Option<PaperEngine>,
 ) -> Option<(ArbitrageOpportunity, Option<DateTime<Utc>>, Option<DateTime<Utc>>)> {
-    // 定价与套利一律以订单簿为准：最优价 = 解析后第一档（最低可买价），不用 Gamma/API 快照价
-    let pm_orderbook_vec: Vec<(f64, f64)> = if let Some(tid) = pm_market.token_ids.first() {
-        polymarket
-            .get_order_book(tid)
-            .await
-            .ok()
-            .flatten()
-            .and_then(|ob| parse_polymarket_orderbook(&ob, pm_side))
-            .unwrap_or_default()
-    } else {
-        return None;
-    };
-    if pm_orderbook_vec.is_empty() {
-        return None;
-    }
-
-    let kalshi_orderbook_vec: Vec<(f64, f64)> = kalshi
+    let tid = pm_market.token_ids.first()?;
+    let pm_book = polymarket.get_order_book(tid).await.ok()??;
+    let ks_book = kalshi
         .get_order_book(&kalshi_market.market_id)
         .await
-        .ok()
-        .flatten()
-        .and_then(|ob| parse_kalshi_orderbook(&ob, kalshi_side))
-        .unwrap_or_default();
-    if kalshi_orderbook_vec.is_empty() {
-        return None;
-    }
+        .ok()??;
 
-    let pm_optimal = orderbook_best_ask_price(&pm_orderbook_vec)?;
-    let kalshi_optimal = orderbook_best_ask_price(&kalshi_orderbook_vec)?;
+    let ladders = build_pair_orderbook_ladders(&pm_book, &ks_book, pm_side, kalshi_side)?;
 
-    let opp = arb_detector.calculate_arbitrage_100usdt(
-        pm_optimal,
-        kalshi_optimal,
-        Some(pm_orderbook_vec.as_slice()),
-        Some(kalshi_orderbook_vec.as_slice()),
+    let opp = validate_opportunity_from_ladders(
+        arb_detector,
+        &ladders,
         pm_side,
         kalshi_side,
         needs_inversion,
         capital_usdt,
     )?;
+
+    let pm_orderbook_vec = &ladders.pm_asks;
+    let kalshi_orderbook_vec = &ladders.ks_asks;
 
     let inv = if needs_inversion { " (Y/N颠倒)" } else { "" };
     let pm_slip = if opp.pm_optimal > 0.0 { (opp.pm_avg_slipped - opp.pm_optimal) / opp.pm_optimal * 100.0 } else { 0.0 };
@@ -286,7 +274,97 @@ async fn validate_arbitrage_pair(
         eprintln!("         ⚠️ 写入监控 CSV 失败: {}", e);
     }
 
+    if let Some(engine) = paper.as_mut() {
+        if let Err(e) = engine.try_open(
+            pair_label,
+            &opp,
+            pm_side,
+            kalshi_side,
+            cycle_id,
+            &pm_market.market_id,
+            &kalshi_market.market_id,
+            tid.as_str(),
+            Utc::now(),
+        ) {
+            eprintln!("   ⚠️ [Paper] try_open 失败: {}", e);
+        }
+    }
+
     Some((opp, pm_expiry, ks_expiry))
+}
+
+/// 周期开始：对已持仓逐对拉双边订单簿，按 bid 真实吃单评估平仓，写入同一交易 CSV（`CLOSE` / `NO_CLOSE`）。
+async fn paper_cycle_start_close_checks(
+    polymarket: &PolymarketClient,
+    kalshi: &KalshiClient,
+    paper: &mut Option<PaperEngine>,
+    cycle_id: usize,
+) -> Result<()> {
+    let Some(engine) = paper.as_mut() else {
+        return Ok(());
+    };
+    let positions = engine.snapshot_open_positions();
+    if positions.is_empty() {
+        return Ok(());
+    }
+    let check_time = Utc::now();
+    for pos in positions {
+        let pm_book = match polymarket.get_order_book(&pos.pm_token_id).await {
+            Ok(Some(b)) => b,
+            Ok(None) => {
+                engine.log_no_close_book_error(
+                    &pos,
+                    cycle_id,
+                    check_time,
+                    "pm_orderbook_empty",
+                )?;
+                continue;
+            }
+            Err(_) => {
+                engine.log_no_close_book_error(
+                    &pos,
+                    cycle_id,
+                    check_time,
+                    "pm_orderbook_fetch_failed",
+                )?;
+                continue;
+            }
+        };
+        let ks_book = match kalshi.get_order_book(&pos.kalshi_market_id).await {
+            Ok(Some(b)) => b,
+            Ok(None) => {
+                engine.log_no_close_book_error(
+                    &pos,
+                    cycle_id,
+                    check_time,
+                    "kalshi_orderbook_empty",
+                )?;
+                continue;
+            }
+            Err(_) => {
+                engine.log_no_close_book_error(
+                    &pos,
+                    cycle_id,
+                    check_time,
+                    "kalshi_orderbook_fetch_failed",
+                )?;
+                continue;
+            }
+        };
+        let Some(ladders) =
+            build_pair_orderbook_ladders(&pm_book, &ks_book, &pos.pm_side, &pos.kalshi_side)
+        else {
+            engine.log_no_close_book_error(
+                &pos,
+                cycle_id,
+                check_time,
+                "orderbook_parse_failed",
+            )?;
+            continue;
+        };
+        engine.check_early_close_at_cycle(&pos.pair_label, &ladders, cycle_id, check_time)?;
+    }
+    Ok(())
 }
 
 
@@ -304,6 +382,7 @@ async fn run_full_match_cycle(
     logger: &MonitorLogger,
     monitor_state: &mut MonitorState,
     trade_amount: f64,
+    paper: &mut Option<PaperEngine>,
 ) -> Result<(usize, usize, String, String)> {
     println!("   📡 执行全量匹配...");
     
@@ -311,6 +390,7 @@ async fn run_full_match_cycle(
     let polymarket_raw: Vec<Market> = polymarket.fetch_all_markets().await?;
     let kalshi_raw: Vec<Market> = kalshi.fetch_all_markets().await?;
     let now = Utc::now();
+    // 21d：`Market.resolution_date`（PM endDate 链 / Kalshi expected_expiration 优先），与终端「到期」一致
     let polymarket_markets = filter_markets_by_resolution_horizon(polymarket_raw, now);
     let kalshi_markets = filter_markets_by_resolution_horizon(kalshi_raw, now);
 
@@ -347,6 +427,7 @@ async fn run_full_match_cycle(
     let mut opportunities: Vec<OpportunityRow> = Vec::new();
 
     for (pm_market, kalshi_market, similarity, pm_side, kalshi_side, needs_inversion) in &matches {
+        let pair_label = format!("{}:{}", pm_market.market_id, kalshi_market.market_id);
         if let Some((verified, pm_exp, ks_exp)) = validate_arbitrage_pair(
             polymarket,
             kalshi,
@@ -361,6 +442,8 @@ async fn run_full_match_cycle(
             monitor_state.current_cycle,
             "full_match",
             logger,
+            &pair_label,
+            paper,
         )
         .await
         {
@@ -397,6 +480,7 @@ async fn run_tracking_cycle(
     logger: &MonitorLogger,
     monitor_state: &mut MonitorState,
     trade_amount: f64,
+    paper: &mut Option<PaperEngine>,
 ) -> Result<(usize, String)> {
     println!("   📡 执行价格追踪...");
     println!("      追踪 {} 个匹配对", monitor_state.tracked_pairs.len());
@@ -446,6 +530,8 @@ async fn run_tracking_cycle(
             monitor_state.current_cycle,
             "price_track",
             logger,
+            &pair.pair_id,
+            paper,
         )
         .await
         {
@@ -479,13 +565,20 @@ async fn run_cycle(
     arb_detector: &ArbitrageDetector,
     logger: &MonitorLogger,
     monitor_state: &mut MonitorState,
+    paper: &mut Option<PaperEngine>,
 ) -> Result<CycleStats> {
     let start_time = Local::now();
     println!("🔄 开始新周期 #{} - {}", monitor_state.current_cycle, start_time.format("%H:%M:%S"));
 
     monitor_state.prune_tracked_beyond_resolution_horizon(Utc::now());
 
-    let trade_amount = 100.0;
+    if let Some(p) = paper.as_mut() {
+        p.tick_cooldowns();
+    }
+
+    paper_cycle_start_close_checks(polymarket, kalshi, paper, monitor_state.current_cycle).await?;
+
+    let trade_amount = PAPER_PER_LEG_CAP_USDT;
     let is_full_match_cycle = monitor_state.should_full_match();
 
     // 大周期边界：只重置累计器，不输出「上一大周期总绩效」（小周期结束时的报告仍保留）。
@@ -497,16 +590,29 @@ async fn run_cycle(
     let (new_matches, opportunities, _top10_block, _full_roi_block) = if is_full_match_cycle {
         // 全量匹配周期
         let (m, v, top10, full) = run_full_match_cycle(
-            polymarket, kalshi, matcher, arb_detector, logger, 
-            monitor_state, trade_amount
-        ).await?;
+            polymarket,
+            kalshi,
+            matcher,
+            arb_detector,
+            logger,
+            monitor_state,
+            trade_amount,
+            paper,
+        )
+        .await?;
         (m, v, top10, Some(full))
     } else {
         // 价格追踪周期
         let (c, top10) = run_tracking_cycle(
-            polymarket, kalshi, arb_detector, logger,
-            monitor_state, trade_amount
-        ).await?;
+            polymarket,
+            kalshi,
+            arb_detector,
+            logger,
+            monitor_state,
+            trade_amount,
+            paper,
+        )
+        .await?;
         (0, c, top10, None)
     };
     
@@ -530,6 +636,7 @@ async fn fetch_initial_markets(
     let kalshi_raw: Vec<Market> = kalshi.fetch_all_markets().await?;
 
     let now = Utc::now();
+    // 同上：resolution_date 与展示用到期同源（见 system_params::RESOLUTION_HORIZON_DAYS）
     let polymarket_markets = filter_markets_by_resolution_horizon(polymarket_raw, now);
     let kalshi_markets = filter_markets_by_resolution_horizon(kalshi_raw, now);
 

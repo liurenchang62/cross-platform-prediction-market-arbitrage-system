@@ -14,7 +14,7 @@
 
 - 路径：`logs/monitor_YYYY-MM-DD.csv`（按**本地日期**切分）。
 - **仅套利行**：每次验证通过追加一行，无 `cycle_report`、无周期 Top10 汇总行。列含 `event_time_utc_rfc3339`、`event_time_local`、`cycle_id`、`cycle_phase` 及与终端详单一致的数值字段；两侧订单簿前 5 档为 `orderbook_pm_top5_json` / `orderbook_kalshi_top5_json`（JSON 数组 `[[价,量],...]`）。
-- 解析日窗口：`query_params::RESOLUTION_HORIZON_DAYS = 21`，无解析日期的市场保留；有日期且晚于「当前 UTC + 21 天」的剔除（全量拉取与追踪列表修剪）。
+- 解析日窗口：`system_params::RESOLUTION_HORIZON_DAYS = 21`，无解析日期的市场保留；有日期且晚于「当前 UTC + 21 天」的剔除（全量拉取与追踪列表修剪）。
 
 ## 建议操作
 
@@ -51,7 +51,7 @@ cargo run --release
 1. **保存旧版二进制或打 git tag**，在同一快照数据上各跑一轮，比较 `初筛匹配对`（二筛前）是否 **≥ 旧版**（或记录差异原因）。
 2. 若有黄金样本（已知 PM↔Kalshi 真对），检查在**二筛前**是否仍出现在候选里。
 
-## 可调参数（`src/query_params.rs`）
+## 可调参数（`src/system_params.rs`）
 
 | 常量 | 含义 |
 |------|------|
