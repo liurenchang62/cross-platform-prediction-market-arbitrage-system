@@ -8,6 +8,8 @@
 
 The pipeline combines text-based market matching (vector similarity and category rules), scheduled full refreshes and incremental tracking cycles, and structured logging under `logs/`.
 
+The repository is a **Cargo workspace**: the main binary is `arbitrage-monitor` (package root), and a separate **`backtest`** crate provides an interactive CLI to summarize paper-trading CSVs by session.
+
 ## Features
 
 - **Market data**: Loads open markets from the Polymarket Gamma API and the Kalshi Trade API, with configurable pagination and upper bounds.
@@ -15,7 +17,8 @@ The pipeline combines text-based market matching (vector similarity and category
 - **Execution-style PnL**: For each candidate pair, costs and net profit for a **notional-capped, depth-walked** buy scenario are derived from **parsed ask ladders** on both venues (see **Order-book PnL model**).
 - **Tracking**: Maintains a set of tracked pairs across cycles, with periodic full rebuilds and parameter-driven intervals (`src/system_params.rs`).
 - **Logging**: Cycle outputs and monitor CSVs under `logs/`; unmatched or low-signal items may be recorded under `logs/unclassified/`.
-- **Paper trading (optional)**: Set **`PAPER_TRADING_ENABLED`** to `true` in `src/system_params.rs`; CSV output is gated by **`PAPER_WRITE_TRADE_LOG`**. Logic in `src/paper_trading.rs`, details in `docs/PAPER_TRADING.md`.
+- **Paper trading (optional)**: Set **`PAPER_TRADING_ENABLED`** to `true` in `src/system_params.rs`; CSV output is gated by **`PAPER_WRITE_TRADE_LOG`**. Logic in `src/paper_trading.rs`, details in `docs/PAPER_TRADING.md`. Each process run gets a monotonic **`session_id`**; the log includes **session start** and **session end** marker rows (with wall time, last seen monitor cycle, and end reason) so post-hoc tools can segment runs without splitting a session at calendar boundaries.
+- **Paper backtest CLI (`backtest`)**: After selecting a **UTC calendar day** (by **session start** time only), choose a session to print aligned **capital**, **position counts**, and **profit** breakdown (realized closes plus hold-to-maturity estimate for open legs), wall-clock span, and monitor **cycle count** span. See **Paper backtest tool** below.
 
 ## Order-book PnL model
 
@@ -49,6 +52,16 @@ cargo run --release    # recommended for long runs
 
 Ensure **`config/categories.toml`** exists before the first run (included in the repository).
 
+### Paper backtest tool
+
+```bash
+cargo run -p backtest
+```
+
+- Defaults to `logs/paper_trades.csv`; override with environment variable **`PAPER_TRADES_CSV`** if needed.
+- **Session vs. monitor cycle**: A session follows one paper-engine lifetime (one process run). It is **independent** of the periodic **full-match** refresh (every `FULL_FETCH_INTERVAL` monitor cycles). A single session normally spans **many** full-match and tracking cycles until the process exits.
+- **Calendar rule**: Only sessions whose **start** timestamp falls on the chosen UTC day are listed; metrics always use **all** rows for that `session_id` (multi-day runs are not cut at midnight for reporting).
+
 ## Configuration
 
 | Path | Purpose |
@@ -64,17 +77,19 @@ Ensure **`config/categories.toml`** exists before the first run (included in the
 ## Repository layout
 
 ```
-src/
+Cargo.toml              Workspace root (members: `.`, `backtest`)
+src/                    Package `arbitrage-monitor`
   main.rs               Entry point and monitor loop
   clients.rs            HTTP clients for Polymarket and Kalshi
   market_matcher.rs     Matching and index construction
   text_vectorizer.rs    Text vectorization
   vector_index.rs       Vector search
   arbitrage_detector.rs Order-book traversal, fees, and PnL helpers
-  system_params.rs       Shared tuning constants
+  system_params.rs      Shared tuning constants
   validation.rs         Validation helpers
   tracking.rs           Per-cycle monitor state
   paper_trading.rs      Optional paper trading / positions
+backtest/               Package `backtest` — paper CSV performance CLI
 config/
   categories.toml
 docs/

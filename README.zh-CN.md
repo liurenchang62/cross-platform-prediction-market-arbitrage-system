@@ -8,6 +8,8 @@
 
 整体流程包括：市场列表拉取、向量匹配与索引、全量刷新与增量追踪、以及将结果写入 `logs/` 等结构化日志。
 
+本仓库为 **Cargo 工作区**：根目录包为监控主程序 **`arbitrage-monitor`**，另含独立 crate **`backtest`**，用于在事后对模拟交易 CSV 按会话做交互式绩效汇总。
+
 ## 功能概览
 
 - **市场数据**：通过 Polymarket Gamma API、Kalshi Trade API 获取开放市场，分页与数量上限可配置。
@@ -15,7 +17,8 @@
 - **订单簿场景盈亏**：对每个候选配对，在双方**卖档深度**上按**固定本金上限**模拟吃单，得到占用资金、手续费、Gas 假设下的净利润等指标（见 **订单簿盈亏模型**）。
 - **状态追踪**：维护追踪列表，按参数进行全量重建与周期更新（`src/system_params.rs`）。
 - **日志**：周期输出与监控 CSV 写入 `logs/`；未匹配或低信号样本可记入 `logs/unclassified/`。
-- **模拟交易（可选）**：在 `system_params.rs` 将 **`PAPER_TRADING_ENABLED`** 设为 `true`；是否写 CSV 由 **`PAPER_WRITE_TRADE_LOG`** 控制；逻辑在 `paper_trading.rs`，说明见 `docs/PAPER_TRADING.md`。
+- **模拟交易（可选）**：在 `system_params.rs` 将 **`PAPER_TRADING_ENABLED`** 设为 `true`；是否写 CSV 由 **`PAPER_WRITE_TRADE_LOG`** 控制；逻辑在 `paper_trading.rs`，说明见 `docs/PAPER_TRADING.md`。每次进程启动分配递增的 **`session_id`**；日志中写入**会话开始**与**会话结束**标记行（墙钟时间、最后见到的监控周期号、结束原因等），便于事后按会话切段，且**不会因跨自然日**而将同一会话拆成两段。
+- **模拟回测 CLI（`backtest`）**：按 **UTC 日历日**筛选时，仅以**会话启动时刻**所在日归类；选定会话后输出对齐的**资金**、**仓位笔数**、**利润**分解（已平仓实现盈亏 + 未平仓按持有到期估算），以及墙钟跨度与**监控周期数**跨度。详见下文 **模拟回测工具**。
 
 ## 订单簿盈亏模型
 
@@ -49,6 +52,16 @@ cargo run --release    # 长时间运行建议
 
 首次运行前请确保存在 **`config/categories.toml`**（仓库已附带示例）。
 
+### 模拟回测工具
+
+```bash
+cargo run -p backtest
+```
+
+- 默认读取 `logs/paper_trades.csv`；可通过环境变量 **`PAPER_TRADES_CSV`** 指定其他路径。
+- **会话与监控周期**：会话对应一次进程内模拟盘引擎的生命周期；与周期性**全量匹配**（每 **`FULL_FETCH_INTERVAL`** 个监控小周期一次）**相互独立**。一次会话通常会**连续跨越多次**全量匹配与追踪周期，直至进程结束。
+- **日历规则**：列表中只出现「**启动日**落在所选 UTC 日」的会话；绩效汇总始终使用该 **`session_id` 下全部记录**（跨日长跑不会在午夜被截断为两个会话）。
+
 ## 配置说明
 
 | 路径 | 说明 |
@@ -64,17 +77,19 @@ cargo run --release    # 长时间运行建议
 ## 仓库结构
 
 ```
-src/
+Cargo.toml              工作区根（成员：`.`、`backtest`）
+src/                    包 `arbitrage-monitor`
   main.rs               入口与监控主循环
   clients.rs            Polymarket / Kalshi HTTP 客户端
   market_matcher.rs     匹配与索引构建
   text_vectorizer.rs    文本向量化
   vector_index.rs       向量检索
   arbitrage_detector.rs 订单簿遍历、费用与盈亏辅助逻辑
-  system_params.rs       全局调参常量
+  system_params.rs      全局调参常量
   validation.rs         校验辅助
   tracking.rs           周期监控状态
   paper_trading.rs      模拟交易与持仓（可选）
+backtest/               包 `backtest` — 模拟交易 CSV 绩效命令行工具
 config/
   categories.toml
 docs/

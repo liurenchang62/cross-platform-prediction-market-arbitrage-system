@@ -1,3 +1,7 @@
+[workspace]
+members = [".", "backtest"]
+resolver = "2"
+
 [package]
 name = "arbitrage-monitor"
 version = "0.1.0"

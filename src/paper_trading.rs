@@ -47,6 +47,12 @@ pub struct PaperEngine {
     pub session_id: u64,
     /// 是否写入单一交易 CSV（见 `PAPER_WRITE_TRADE_LOG`）
     pub write_trade_log: bool,
+    /// 本会话内已见最大监控周期号（用于 `SESSION_END`）
+    max_cycle_seen: usize,
+    /// 避免重复写 `SESSION_END`（含 Drop）
+    session_end_logged: bool,
+    /// 进程启动墙钟（UTC），写入 `SESSION_START`
+    session_wall_started: DateTime<Utc>,
     positions: HashMap<String, PaperPosition>,
     cooldown_remaining: HashMap<String, u32>,
     fees: Fees,
@@ -64,11 +70,15 @@ impl PaperEngine {
         let session_id = next_session_id()?;
         let write_trade_log = PAPER_WRITE_TRADE_LOG;
 
-        let engine = Self {
+        let session_wall_started = Utc::now();
+        let mut engine = Self {
             cash: PAPER_INITIAL_CASH,
             initial_cash: PAPER_INITIAL_CASH,
             session_id,
             write_trade_log,
+            max_cycle_seen: 0,
+            session_end_logged: false,
+            session_wall_started,
             positions: HashMap::new(),
             cooldown_remaining: HashMap::new(),
             fees: Fees::default(),
@@ -76,6 +86,7 @@ impl PaperEngine {
 
         if write_trade_log {
             engine.ensure_csv_header()?;
+            engine.append_session_start()?;
         }
 
         println!(
@@ -266,7 +277,7 @@ impl PaperEngine {
     }
 
     fn append_no_close(
-        &self,
+        &mut self,
         pos: &PaperPosition,
         check_cycle: usize,
         check_time: DateTime<Utc>,
@@ -276,6 +287,7 @@ impl PaperEngine {
         if !self.write_trade_log {
             return Ok(());
         }
+        self.bump_cycle(check_cycle);
         PaperCsv {
             event: "NO_CLOSE",
             session_id: self.session_id,
@@ -311,7 +323,7 @@ impl PaperEngine {
     }
 
     fn append_close(
-        &self,
+        &mut self,
         pos: &PaperPosition,
         check_cycle: usize,
         check_time: DateTime<Utc>,
@@ -326,6 +338,7 @@ impl PaperEngine {
         if !self.write_trade_log {
             return Ok(());
         }
+        self.bump_cycle(check_cycle);
         PaperCsv {
             event: "CLOSE",
             session_id: self.session_id,
@@ -420,6 +433,7 @@ impl PaperEngine {
         .to_string();
 
         if self.write_trade_log {
+            self.bump_cycle(cycle);
             PaperCsv {
                 event: "OPEN",
                 session_id: self.session_id,
@@ -459,6 +473,107 @@ impl PaperEngine {
         );
 
         Ok(true)
+    }
+
+    fn append_session_start(&mut self) -> Result<()> {
+        let notes = format!(
+            "marker=session_start wall_utc={} initial_cash={:.2}",
+            self.session_wall_started.to_rfc3339(),
+            self.initial_cash
+        );
+        self.write_session_marker_row(
+            "SESSION_START",
+            0,
+            self.session_wall_started,
+            Some(self.session_wall_started),
+            "",
+            "-",
+            &notes,
+        )
+    }
+
+    /// 写入 `SESSION_END`（正常退出可显式调用；进程退出时 `Drop` 会再尽力写一次）。
+    pub fn write_session_end(&mut self, reason: &str) {
+        if self.session_end_logged || !self.write_trade_log {
+            return;
+        }
+        let wall = Utc::now();
+        let notes = format!(
+            "marker=session_end wall_utc_end={} last_cycle={} reason={}",
+            wall.to_rfc3339(),
+            self.max_cycle_seen,
+            reason
+        );
+        match self.write_session_marker_row(
+            "SESSION_END",
+            self.max_cycle_seen,
+            self.session_wall_started,
+            Some(wall),
+            reason,
+            "-",
+            &notes,
+        ) {
+            Ok(()) => self.session_end_logged = true,
+            Err(e) => eprintln!("📒 [Paper] SESSION_END 写入失败: {}", e),
+        }
+    }
+
+    fn write_session_marker_row(
+        &mut self,
+        event: &str,
+        cycle: usize,
+        simulated_wall: DateTime<Utc>,
+        check_wall: Option<DateTime<Utc>>,
+        exit_type: &str,
+        trade_id: &str,
+        notes: &str,
+    ) -> Result<()> {
+        if !self.write_trade_log {
+            return Ok(());
+        }
+        let sim_str = simulated_wall.to_rfc3339();
+        let notes = notes.to_string();
+        PaperCsv {
+            event,
+            session_id: self.session_id,
+            trade_id,
+            pair_label: "-",
+            cycle,
+            simulated_open_time_utc: &sim_str,
+            check_time_utc: check_wall,
+            pm_market_id: "",
+            kalshi_market_id: "",
+            pm_token_id: "",
+            pm_side: "",
+            kalshi_side: "",
+            n: 0.0,
+            entry_capital: 0.0,
+            pm_entry_avg: 0.0,
+            ks_entry_avg: 0.0,
+            fees_open: 0.0,
+            gas_open: 0.0,
+            exit_type,
+            pm_exit_avg: None,
+            ks_exit_avg: None,
+            proceeds_gross: None,
+            fees_close: None,
+            gas_close: None,
+            pnl_realized: None,
+            cash_after: self.cash,
+            no_close_reason: "",
+            notes: &notes,
+        }
+        .append()
+    }
+
+    fn bump_cycle(&mut self, cycle: usize) {
+        self.max_cycle_seen = self.max_cycle_seen.max(cycle);
+    }
+}
+
+impl Drop for PaperEngine {
+    fn drop(&mut self) {
+        self.write_session_end("drop");
     }
 }
 
