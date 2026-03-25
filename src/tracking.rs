@@ -4,6 +4,20 @@ use chrono::{DateTime, Utc};
 use crate::market::{Market, MarketPrices};
 use crate::market_filter::tracked_pair_exceeds_horizon;
 
+/// Polymarket / Kalshi 二元侧（YES/NO）取反，用于同一匹配对下「另一腿」方向（PM 买 YES+KS 买 NO 与 PM 买 NO+KS 买 YES）。
+pub fn flip_binary_side(side: &str) -> Option<&'static str> {
+    match side {
+        "YES" => Some("NO"),
+        "NO" => Some("YES"),
+        _ => None,
+    }
+}
+
+/// 追踪键 / 模拟盘持仓键：同一对市场 + 具体 PM 侧与 Kalshi 侧各唯一。
+pub fn oriented_track_id(pm_id: &str, ks_id: &str, pm_side: &str, kalshi_side: &str) -> String {
+    format!("{}:{}|{}|{}", pm_id, ks_id, pm_side, kalshi_side)
+}
+
 /// 追踪的套利对
 pub struct TrackedArbitrage {
     pub pair_id: String,
@@ -30,7 +44,12 @@ impl TrackedArbitrage {
         needs_inversion: bool,
     ) -> Self {
         Self {
-            pair_id: format!("{}:{}", pm_market.market_id, kalshi_market.market_id),
+            pair_id: oriented_track_id(
+                &pm_market.market_id,
+                &kalshi_market.market_id,
+                &pm_side,
+                &kalshi_side,
+            ),
             pm_market,
             kalshi_market,
             similarity,
@@ -80,7 +99,7 @@ impl MonitorState {
 
         // 添加新的匹配对
         for (pm, kalshi, similarity, pm_side, kalshi_side, needs_inversion) in new_matches {
-            let pair_id = format!("{}:{}", pm.market_id, kalshi.market_id);
+            let pair_id = oriented_track_id(&pm.market_id, &kalshi.market_id, &pm_side, &kalshi_side);
             if let Some(existing) = self.tracked_pairs.iter_mut().find(|p| p.pair_id == pair_id) {
                 existing.active = true;
                 existing.similarity = similarity;

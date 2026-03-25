@@ -1,6 +1,7 @@
 // src/main.rs
 use anyhow::{Context, Result};
 use std::cmp::Ordering;
+use std::collections::BTreeSet;
 use std::time::Duration;
 use tokio::time;
 use chrono::{DateTime, Utc, Local};
@@ -30,13 +31,42 @@ use clients::{PolymarketClient, KalshiClient};
 use market_matcher::{MarketMatcher, MarketMatcherConfig};
 use arbitrage_detector::{ArbitrageDetector, ArbitrageOpportunity};
 use monitor_logger::MonitorLogger;
-use crate::tracking::{MonitorState};
+use crate::tracking::{oriented_track_id, MonitorState};
 use crate::system_params::{
     FULL_FETCH_INTERVAL, PAPER_PER_LEG_CAP_USDT, SIMILARITY_THRESHOLD,
 };
 use crate::market_filter::filter_markets_by_resolution_horizon;
 use crate::arbitrage_detector::build_pair_orderbook_ladders;
 use crate::paper_trading::{validate_opportunity_from_ladders, PaperEngine};
+
+/// 同一 PM–Kalshi 匹配在验证器给出的腿向上，再增加「两侧同时取反」的另一腿（如 PM YES+KS NO 与 PM NO+KS YES），去重后用于追踪与验证。
+fn expand_dual_orientations(
+    matches: Vec<(Market, Market, f64, String, String, bool)>,
+) -> Vec<(Market, Market, f64, String, String, bool)> {
+    let mut out = Vec::new();
+    let mut seen: BTreeSet<(String, String, String, String)> = BTreeSet::new();
+    for (pm, ks, sim, pms, kss, inv) in matches {
+        let mut try_push = |ps: String, ks_: String| {
+            let key = (
+                pm.market_id.clone(),
+                ks.market_id.clone(),
+                ps.clone(),
+                ks_.clone(),
+            );
+            if seen.insert(key) {
+                out.push((pm.clone(), ks.clone(), sim, ps, ks_, inv));
+            }
+        };
+        try_push(pms.clone(), kss.clone());
+        if let (Some(a), Some(b)) = (
+            crate::tracking::flip_binary_side(&pms),
+            crate::tracking::flip_binary_side(&kss),
+        ) {
+            try_push(a.to_string(), b.to_string());
+        }
+    }
+    out
+}
 
 /// Top10 / 追踪共用的套利行（含双方解析日）
 type OpportunityRow = (
@@ -406,10 +436,16 @@ async fn run_full_match_cycle(
     matcher.build_polymarket_index(&polymarket_markets)?;
     
     println!("   🔍 匹配市场...");
-    let matches = matcher.find_matches_bidirectional(&polymarket_markets, &kalshi_markets).await;
-    println!("      ✅ 找到 {} 个匹配对", matches.len());
+    let raw_matches = matcher.find_matches_bidirectional(&polymarket_markets, &kalshi_markets).await;
+    let base_pairs = raw_matches.len();
+    let matches = expand_dual_orientations(raw_matches);
+    println!(
+        "      ✅ 基础匹配 {} 对，展开双向腿后 {} 条追踪配置",
+        base_pairs,
+        matches.len()
+    );
     
-    // 所有匹配对都加入追踪列表（带方向信息）
+    // 所有匹配对都加入追踪列表（带方向信息，每条腿独立键）
     let mut all_matches: Vec<(Market, Market, f64, String, String, bool)> = Vec::new();
     for (pm_market, kalshi_market, similarity, pm_side, kalshi_side, needs_inversion) in &matches {
         all_matches.push((
@@ -427,7 +463,12 @@ async fn run_full_match_cycle(
     let mut opportunities: Vec<OpportunityRow> = Vec::new();
 
     for (pm_market, kalshi_market, similarity, pm_side, kalshi_side, needs_inversion) in &matches {
-        let pair_label = format!("{}:{}", pm_market.market_id, kalshi_market.market_id);
+        let pair_label = oriented_track_id(
+            &pm_market.market_id,
+            &kalshi_market.market_id,
+            pm_side,
+            kalshi_side,
+        );
         if let Some((verified, pm_exp, ks_exp)) = validate_arbitrage_pair(
             polymarket,
             kalshi,

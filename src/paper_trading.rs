@@ -1,4 +1,5 @@
-//! 模拟交易与持仓跟踪：未平仓不加仓；平仓后冷却若干周期。
+//! 模拟交易与持仓跟踪：同一「市场对 + PM 侧 + Kalshi 侧」未平仓不加仓；平仓后该腿冷却若干周期。
+//! 相反腿（如 PM YES+KS NO 与 PM NO+KS YES）键不同，可同时持仓。
 //!
 //! 开关见 `system_params`：`PAPER_TRADING_ENABLED`、`PAPER_WRITE_TRADE_LOG`；
 //! 每个监控周期**开始**对全部持仓拉双边订单簿，在 bid 上按持仓份数真实吃单，计平仓手续费与 gas，并写一条 `NO_CLOSE` 或 `CLOSE` 记录。
