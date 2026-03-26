@@ -16,9 +16,11 @@
 - **智能匹配**：TF-IDF 风格文本向量与余弦相似度；结合 `config/categories.toml` 中的类别关键词做约束与加权。
 - **订单簿场景盈亏**：对每个候选配对，在双方**卖档深度**上按**固定本金上限**模拟吃单，得到占用资金、手续费、Gas 假设下的净利润等指标（见 **订单簿盈亏模型**）。
 - **状态追踪**：维护追踪列表，按参数进行全量重建与周期更新（`src/system_params.rs`）。
+- **周期统计**：在**不改变套利判定逻辑**的前提下，按**进程全局**或按**全量匹配大周期**累计套利命中次数与资金类汇总（`src/cycle_statistics.rs`）。
 - **日志**：周期输出与监控 CSV 写入 `logs/`；未匹配或低信号样本可记入 `logs/unclassified/`。
 - **模拟交易（可选）**：在 `system_params.rs` 将 **`PAPER_TRADING_ENABLED`** 设为 `true`；是否写 CSV 由 **`PAPER_WRITE_TRADE_LOG`** 控制；逻辑在 `paper_trading.rs`，说明见 `docs/PAPER_TRADING.md`。每次进程启动分配递增的 **`session_id`**；日志中写入**会话开始**与**会话结束**标记行（墙钟时间、最后见到的监控周期号、结束原因等），便于事后按会话切段，且**不会因跨自然日**而将同一会话拆成两段。
-- **模拟回测 CLI（`backtest`）**：按 **UTC 日历日**筛选时，仅以**会话启动时刻**所在日归类；选定会话后输出对齐的**资金**、**仓位笔数**、**利润**分解（已平仓实现盈亏 + 未平仓按持有到期估算），以及墙钟跨度与**监控周期数**跨度。详见下文 **模拟回测工具**。
+- **模拟回测 CLI（`backtest`）**：按 **UTC 日历日**筛选时，仅以**会话启动时刻**所在日归类；选定会话后在终端输出**管理报表式**摘要框：**资金与权益**、**成本归集**、**损益**（已实现损益、未平仓锁定、损益合计）、**对应成本口径的收益率**，以及墙钟跨度与**监控周期数**跨度。金额为常见**报表式负数列报**（负数以圆括号表示）。详见下文 **模拟回测工具**。
+- **Kalshi Demo 辅助**：`kalshi_demo.rs` 提供 Demo 环境 RSA-PSS 签名等逻辑，主程序在配置凭证时可调用；另提供可选二进制 **`kalshi_balance`**，用于对 Demo API **只读查询**账户余额（见 **可选：Kalshi Demo 余额探针**）。
 
 ## 订单簿盈亏模型
 
@@ -61,6 +63,17 @@ cargo run -p backtest
 - 默认读取 `logs/paper_trades.csv`；可通过环境变量 **`PAPER_TRADES_CSV`** 指定其他路径。
 - **会话与监控周期**：会话对应一次进程内模拟盘引擎的生命周期；与周期性**全量匹配**（每 **`FULL_FETCH_INTERVAL`** 个监控小周期一次）**相互独立**。一次会话通常会**连续跨越多次**全量匹配与追踪周期，直至进程结束。
 - **日历规则**：列表中只出现「**启动日**落在所选 UTC 日」的会话；绩效汇总始终使用该 **`session_id` 下全部记录**（跨日长跑不会在午夜被截断为两个会话）。
+- **版面说明**：指标分区展示（概览、时间跨度、资金、仓位、成本、损益、收益率等）；页脚注释说明选日规则、成本归因及分项收益率与合计收益率的关系。
+
+### 可选：Kalshi Demo 余额探针
+
+```bash
+cargo run --bin kalshi_balance
+```
+
+- 调用 Kalshi **演示环境** `GET /portfolio/balance`，使用 RSA-PSS-SHA256 鉴权。
+- 若项目根目录存在 **`.env`**，会通过 `dotenvy` 加载。
+- 需设置 **`KALSHI_DEMO_API_KEY_ID`** 与 **`KALSHI_DEMO_PRIVATE_KEY_PATH`**（PEM 私钥文件路径）；与 `system_params.rs` 中的 `KALSHI_DEMO_API_KEY_ID_ENV`、`KALSHI_DEMO_PRIVATE_KEY_PATH_ENV` 一致。
 
 ## 配置说明
 
@@ -82,13 +95,18 @@ src/                    包 `arbitrage-monitor`
   main.rs               入口与监控主循环
   clients.rs            Polymarket / Kalshi HTTP 客户端
   market_matcher.rs     匹配与索引构建
+  market_filter.rs      市场过滤辅助
   text_vectorizer.rs    文本向量化
   vector_index.rs       向量检索
   arbitrage_detector.rs 订单簿遍历、费用与盈亏辅助逻辑
   system_params.rs      全局调参常量
   validation.rs         校验辅助
   tracking.rs           周期监控状态
+  cycle_statistics.rs   周期累计统计（全局 / 全量大周期）
   paper_trading.rs      模拟交易与持仓（可选）
+  kalshi_demo.rs        Kalshi Demo 签名与接口辅助（库模块）
+  bin/
+    kalshi_balance.rs 可选 CLI：Demo 账户余额查询
 backtest/               包 `backtest` — 模拟交易 CSV 绩效命令行工具
 config/
   categories.toml

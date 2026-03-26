@@ -16,9 +16,11 @@ The repository is a **Cargo workspace**: the main binary is `arbitrage-monitor` 
 - **Matching**: TF-IDF-style text vectors and cosine similarity; optional category constraints and scoring from `config/categories.toml`.
 - **Execution-style PnL**: For each candidate pair, costs and net profit for a **notional-capped, depth-walked** buy scenario are derived from **parsed ask ladders** on both venues (see **Order-book PnL model**).
 - **Tracking**: Maintains a set of tracked pairs across cycles, with periodic full rebuilds and parameter-driven intervals (`src/system_params.rs`).
+- **Cycle statistics**: Global and per-big-period (full-match window) rollups of arbitrage hit counts and capital summaries, without changing detector logic (`src/cycle_statistics.rs`).
 - **Logging**: Cycle outputs and monitor CSVs under `logs/`; unmatched or low-signal items may be recorded under `logs/unclassified/`.
 - **Paper trading (optional)**: Set **`PAPER_TRADING_ENABLED`** to `true` in `src/system_params.rs`; CSV output is gated by **`PAPER_WRITE_TRADE_LOG`**. Logic in `src/paper_trading.rs`, details in `docs/PAPER_TRADING.md`. Each process run gets a monotonic **`session_id`**; the log includes **session start** and **session end** marker rows (with wall time, last seen monitor cycle, and end reason) so post-hoc tools can segment runs without splitting a session at calendar boundaries.
-- **Paper backtest CLI (`backtest`)**: After selecting a **UTC calendar day** (by **session start** time only), choose a session to print aligned **capital**, **position counts**, and **profit** breakdown (realized closes plus hold-to-maturity estimate for open legs), wall-clock span, and monitor **cycle count** span. See **Paper backtest tool** below.
+- **Paper backtest CLI (`backtest`)**: After selecting a **UTC calendar day** (by **session start** time only), choose a session to view a framed **management-style** summary: **capital & equity**, **cost rollup**, a short **P&L** block (realized vs open-leg hold-to-maturity estimate, then **total**), **yields vs the matching cost bases**, wall-clock span, and monitor **cycle count** span. Amounts use **parentheses for negatives** (common financial statement convention). See **Paper backtest tool** below.
+- **Kalshi Demo helpers (library + optional bin)**: `src/kalshi_demo.rs` implements RSA-PSS signing and demo API helpers used by the main crate when credentials are configured; `cargo run --bin kalshi_balance` is a small **read-only** probe for demo **portfolio balance** (see **Optional: Kalshi Demo balance probe**).
 
 ## Order-book PnL model
 
@@ -61,6 +63,17 @@ cargo run -p backtest
 - Defaults to `logs/paper_trades.csv`; override with environment variable **`PAPER_TRADES_CSV`** if needed.
 - **Session vs. monitor cycle**: A session follows one paper-engine lifetime (one process run). It is **independent** of the periodic **full-match** refresh (every `FULL_FETCH_INTERVAL` monitor cycles). A single session normally spans **many** full-match and tracking cycles until the process exits.
 - **Calendar rule**: Only sessions whose **start** timestamp falls on the chosen UTC day are listed; metrics always use **all** rows for that `session_id` (multi-day runs are not cut at midnight for reporting).
+- **Report layout**: Session metrics are grouped (overview, time span, balances, positions, costs, P&L, yields). Footnotes explain calendar rules, cost attribution, and why per-line yields need not sum to the headline yield.
+
+### Optional: Kalshi Demo balance probe
+
+```bash
+cargo run --bin kalshi_balance
+```
+
+- Queries Kalshi **demo** `GET /portfolio/balance` with RSA-PSS-SHA256 auth.
+- Reads a project-root **`.env`** if present (`dotenvy`).
+- Requires **`KALSHI_DEMO_API_KEY_ID`** and **`KALSHI_DEMO_PRIVATE_KEY_PATH`** (path to a PEM private key). Same names as in `src/system_params.rs` (`KALSHI_DEMO_API_KEY_ID_ENV`, `KALSHI_DEMO_PRIVATE_KEY_PATH_ENV`).
 
 ## Configuration
 
@@ -82,13 +95,18 @@ src/                    Package `arbitrage-monitor`
   main.rs               Entry point and monitor loop
   clients.rs            HTTP clients for Polymarket and Kalshi
   market_matcher.rs     Matching and index construction
+  market_filter.rs      Market filtering helpers
   text_vectorizer.rs    Text vectorization
   vector_index.rs       Vector search
   arbitrage_detector.rs Order-book traversal, fees, and PnL helpers
   system_params.rs      Shared tuning constants
   validation.rs         Validation helpers
   tracking.rs           Per-cycle monitor state
+  cycle_statistics.rs   Cumulative cycle stats (global / per big period)
   paper_trading.rs      Optional paper trading / positions
+  kalshi_demo.rs        Kalshi Demo API signing and related helpers (library)
+  bin/
+    kalshi_balance.rs   Optional CLI: demo portfolio balance
 backtest/               Package `backtest` — paper CSV performance CLI
 config/
   categories.toml
