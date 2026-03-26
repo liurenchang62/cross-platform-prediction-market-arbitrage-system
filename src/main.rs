@@ -23,17 +23,22 @@ mod category_vectorizer;  // 新增
 mod cycle_statistics;
 mod market_filter;
 mod paper_trading;
+mod kalshi_demo;
 
 use crate::category_mapper::CategoryMapper;
 use crate::unclassified_logger::UnclassifiedLogger;
 use crate::market::Market;
 use clients::{PolymarketClient, KalshiClient};
+use kalshi_demo::KalshiDemoConfig;
+use reqwest::Client as HttpClient;
 use market_matcher::{MarketMatcher, MarketMatcherConfig};
 use arbitrage_detector::{ArbitrageDetector, ArbitrageOpportunity};
 use monitor_logger::MonitorLogger;
 use crate::tracking::{oriented_track_id, MonitorState};
 use crate::system_params::{
-    FULL_FETCH_INTERVAL, PAPER_PER_LEG_CAP_USDT, SIMILARITY_THRESHOLD,
+    DEMO_REFERENCE_BUDGET_USD, FULL_FETCH_INTERVAL, KALSHI_DEMO_API_KEY_ID_ENV,
+    KALSHI_DEMO_BASE_URL, KALSHI_DEMO_PRIVATE_KEY_PATH_ENV, LOCAL_TOTAL_USD, MAX_RETRIES,
+    RETRY_INITIAL_DELAY_MS, SIMILARITY_THRESHOLD, paper_caps_demo, paper_caps_local,
 };
 use crate::market_filter::filter_markets_by_resolution_horizon;
 use crate::arbitrage_detector::build_pair_orderbook_ladders;
@@ -77,6 +82,33 @@ type OpportunityRow = (
     Option<DateTime<Utc>>,
 );
 
+/// 进程内未形成 `KalshiDemoConfig` 时打印原因（环境变量与磁盘无关，只看**当前进程**是否可见）。
+fn print_kalshi_demo_not_configured_hint() {
+    let has_id = std::env::var(KALSHI_DEMO_API_KEY_ID_ENV)
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
+    let has_path = std::env::var(KALSHI_DEMO_PRIVATE_KEY_PATH_ENV)
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
+    println!("   📘 Kalshi Demo 未启用：本进程未加载到可用凭证（将全部记 ks_exec=local）。");
+    if !has_id && !has_path {
+        println!(
+            "      → 需要同时设置 {} 与 {}",
+            KALSHI_DEMO_API_KEY_ID_ENV, KALSHI_DEMO_PRIVATE_KEY_PATH_ENV
+        );
+        println!("      → 环境变量与项目是否在「同一盘符」无关；须在**运行 cargo run 的终端/IDE**里可见。");
+        println!("      → 若在「系统环境变量」里修改过，请**关掉并重新打开**终端或 Cursor 再运行。");
+        println!("      → 可在项目根目录放 `.env`（已 gitignore 的常见做法），程序启动时会尝试自动加载。");
+    } else {
+        if !has_id {
+            println!("      → 缺少或为空: {}", KALSHI_DEMO_API_KEY_ID_ENV);
+        }
+        if !has_path {
+            println!("      → 缺少或为空: {}", KALSHI_DEMO_PRIVATE_KEY_PATH_ENV);
+        }
+    }
+}
+
 fn format_resolution_expiry(label: &str, dt: Option<DateTime<Utc>>) -> String {
     match dt {
         Some(t) => {
@@ -101,6 +133,9 @@ fn format_resolution_expiry(label: &str, dt: Option<DateTime<Utc>>) -> String {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // 从项目根目录加载 `.env`（若存在）；`std::env::var` 本身不读 .env，仅读进程环境。
+    let _ = dotenvy::dotenv();
+
     println!("🚀 启动跨平台套利监控系统");
     println!("📊 监控平台: Polymarket ↔ Kalshi");
     
@@ -117,8 +152,37 @@ async fn main() -> Result<()> {
     
     // 初始化客户端
     let polymarket = PolymarketClient::new();
-    let kalshi = KalshiClient::new();
-    
+
+    // Demo 凭证先于 KalshiClient：若启用 Demo 下单，行情/订单簿必须同一基址，否则生产 ticker 在 Demo 会 market_not_found。
+    let kalshi_demo_cfg: Option<KalshiDemoConfig> = KalshiDemoConfig::try_from_env()?;
+    // Kalshi Demo 限价下单是否仍允许（重试耗尽后为 false，纸面回退为纯本地新会话）。
+    let mut demo_trading_active = kalshi_demo_cfg.is_some();
+    let kalshi = if kalshi_demo_cfg.is_some() {
+        println!("   📗 Kalshi 市场与订单簿使用 Demo API（与 Demo 下单 ticker 一致）");
+        KalshiClient::new_with_base_url(KALSHI_DEMO_BASE_URL)
+    } else {
+        KalshiClient::new()
+    };
+    if kalshi_demo_cfg.is_some() {
+        let (pl, pp) = paper_caps_demo();
+        println!("   📗 Kalshi Demo 凭证已加载：IOC 限价单走官方 Demo API");
+        println!(
+            "   📗 标尺 [demo]：策略参考总盘子 ${} | 每腿探针 ${:.2} | 每对名义上限 ${:.2}",
+            DEMO_REFERENCE_BUDGET_USD as i32,
+            pl,
+            pp
+        );
+    } else {
+        print_kalshi_demo_not_configured_hint();
+        let (pl, pp) = paper_caps_local();
+        println!(
+            "   📒 标尺 [local]：纸面总资金 ${} | 每腿探针 ${:.2} | 每对名义上限 ${:.2}",
+            LOCAL_TOTAL_USD as i32,
+            pl,
+            pp
+        );
+    }
+
     // 初始化匹配器
     let matcher_config = MarketMatcherConfig {
         similarity_threshold: SIMILARITY_THRESHOLD,
@@ -128,15 +192,19 @@ async fn main() -> Result<()> {
         category_boost_factor: 0.03,
         ..Default::default()
     };
-    
+
     let mut matcher = MarketMatcher::new(matcher_config, category_mapper)
         .with_logger(unclassified_logger);
-    
+
     // 初始化套利检测器
     let arb_detector = ArbitrageDetector::new(0.02);
 
     // 模拟盘（可选）：见 `system_params::PAPER_TRADING_ENABLED`
     let mut paper_engine: Option<PaperEngine> = PaperEngine::try_new()?;
+    let demo_http = HttpClient::builder()
+        .timeout(Duration::from_secs(25))
+        .build()
+        .context("构建 Kalshi Demo HTTP 客户端")?;
     
     // 初始化监控状态
     let mut monitor_state = MonitorState::new(FULL_FETCH_INTERVAL, 10000);  // 改为10000
@@ -181,6 +249,9 @@ async fn main() -> Result<()> {
             &logger,
             &mut monitor_state,
             &mut paper_engine,
+            &demo_http,
+            kalshi_demo_cfg.as_ref(),
+            &mut demo_trading_active,
         ).await {
             Ok(stats) => {
                 println!("📊 周期统计: 新匹配 {} 对, 套利 {} 个, 追踪 {} 对", 
@@ -209,29 +280,48 @@ async fn validate_arbitrage_pair(
     kalshi_side: &str,
     needs_inversion: bool,
     capital_usdt: f64,
+    pair_cap_usdt: f64,
+    per_leg_cap_usd: f64,
     cycle_id: usize,
     cycle_phase: &str,
     logger: &MonitorLogger,
     pair_label: &str,
     paper: &mut Option<PaperEngine>,
-) -> Option<(ArbitrageOpportunity, Option<DateTime<Utc>>, Option<DateTime<Utc>>)> {
-    let tid = pm_market.token_ids.first()?;
-    let pm_book = polymarket.get_order_book(tid).await.ok()??;
-    let ks_book = kalshi
+    demo_http: &HttpClient,
+    kalshi_demo_cfg: Option<&KalshiDemoConfig>,
+    demo_trading_active: &mut bool,
+) -> Result<Option<(ArbitrageOpportunity, Option<DateTime<Utc>>, Option<DateTime<Utc>>)>> {
+    let Some(tid) = pm_market.token_ids.first() else {
+        return Ok(None);
+    };
+    let Some(pm_book) = polymarket.get_order_book(tid).await.ok().flatten() else {
+        return Ok(None);
+    };
+    let Some(ks_book) = kalshi
         .get_order_book(&kalshi_market.market_id)
         .await
-        .ok()??;
+        .ok()
+        .flatten()
+    else {
+        return Ok(None);
+    };
 
-    let ladders = build_pair_orderbook_ladders(&pm_book, &ks_book, pm_side, kalshi_side)?;
+    let Some(ladders) = build_pair_orderbook_ladders(&pm_book, &ks_book, pm_side, kalshi_side)
+    else {
+        return Ok(None);
+    };
 
-    let opp = validate_opportunity_from_ladders(
+    let Some(opp) = validate_opportunity_from_ladders(
         arb_detector,
         &ladders,
         pm_side,
         kalshi_side,
         needs_inversion,
         capital_usdt,
-    )?;
+        pair_cap_usdt,
+    ) else {
+        return Ok(None);
+    };
 
     let pm_orderbook_vec = &ladders.pm_asks;
     let kalshi_orderbook_vec = &ladders.ks_asks;
@@ -277,7 +367,7 @@ async fn validate_arbitrage_pair(
     println!("     📉 滑点后均价:   PM {:.4} ({:+.2}%)  |  Kalshi {:.4} ({:+.2}%)", 
         opp.pm_avg_slipped, pm_slip, opp.kalshi_avg_slipped, ks_slip);
     println!("     ─────────────────────────────────────────────────────────");
-    println!("     💰 投入 {} USDT 利润拆解:", capital_usdt as i32);
+    println!("     💰 投入 ${:.2}（每腿探针上限）利润拆解:", capital_usdt);
     println!("        毛利润(兑付): ${:.2}", opp.contracts);
     println!("        - 成本:        ${:.2}", opp.capital_used);
     println!("        - 手续费:      ${:.2}", opp.fees_amount);
@@ -305,6 +395,68 @@ async fn validate_arbitrage_pair(
     }
 
     if let Some(engine) = paper.as_mut() {
+        let mut ks_exec_notes = String::from("ks_exec=local");
+        if *demo_trading_active {
+            if let Some(cfg) = kalshi_demo_cfg {
+                let mut placed: Option<(String, String)> = None;
+                let mut last_err: Option<String> = None;
+                for attempt in 0..MAX_RETRIES {
+                    let client_order_id = uuid::Uuid::new_v4().to_string();
+                    match kalshi_demo::place_demo_buy_ioc(
+                        demo_http,
+                        cfg,
+                        &kalshi_market.market_id,
+                        kalshi_side,
+                        &opp,
+                        &client_order_id,
+                        per_leg_cap_usd,
+                    )
+                    .await
+                    {
+                        Ok(order_id) => {
+                            placed = Some((order_id, client_order_id));
+                            break;
+                        }
+                        Err(e) => {
+                            last_err = Some(format!("{}", e));
+                            eprintln!(
+                                "   ⚠️ [Kalshi Demo] 下单失败 (尝试 {}/{}): {}",
+                                attempt + 1,
+                                MAX_RETRIES,
+                                e
+                            );
+                            if attempt + 1 < MAX_RETRIES {
+                                let wait_ms =
+                                    RETRY_INITIAL_DELAY_MS.saturating_mul(attempt as u64 + 1);
+                                time::sleep(Duration::from_millis(wait_ms)).await;
+                            }
+                        }
+                    }
+                }
+                if let Some((order_id, client_order_id)) = placed {
+                    ks_exec_notes = format!(
+                        "ks_exec=demo kalshi_order_id={} kalshi_client_order_id={}",
+                        order_id, client_order_id
+                    );
+                    println!(
+                        "   📗 [Kalshi Demo] 已提交 IOC 限价买单 order_id={} ticker={}",
+                        order_id, kalshi_market.market_id
+                    );
+                } else {
+                    eprintln!(
+                        "   ❌ [Kalshi Demo] 重试耗尽，停止 Demo 下单；纸面切换为纯本地新会话。最后错误: {:?}",
+                        last_err
+                    );
+                    *demo_trading_active = false;
+                    engine.reset_to_pure_local_after_demo_failure(
+                        &format!(
+                            "kalshi_demo_order_failed_after_retries {}",
+                            last_err.unwrap_or_default()
+                        ),
+                    )?;
+                }
+            }
+        }
         if let Err(e) = engine.try_open(
             pair_label,
             &opp,
@@ -315,12 +467,13 @@ async fn validate_arbitrage_pair(
             &kalshi_market.market_id,
             tid.as_str(),
             Utc::now(),
+            &ks_exec_notes,
         ) {
             eprintln!("   ⚠️ [Paper] try_open 失败: {}", e);
         }
     }
 
-    Some((opp, pm_expiry, ks_expiry))
+    Ok(Some((opp, pm_expiry, ks_expiry)))
 }
 
 /// 周期开始：对已持仓逐对拉双边订单簿，按 bid 真实吃单评估平仓，写入同一交易 CSV（`CLOSE` / `NO_CLOSE`）。
@@ -412,7 +565,13 @@ async fn run_full_match_cycle(
     logger: &MonitorLogger,
     monitor_state: &mut MonitorState,
     trade_amount: f64,
+    pair_cap_usdt: f64,
+    per_leg_cap_usd: f64,
     paper: &mut Option<PaperEngine>,
+    demo_http: &HttpClient,
+    kalshi_demo_cfg: Option<&KalshiDemoConfig>,
+    demo_trading_active: &mut bool,
+    top10_mode_caption: &str,
 ) -> Result<(usize, usize, String, String)> {
     println!("   📡 执行全量匹配...");
     
@@ -480,13 +639,18 @@ async fn run_full_match_cycle(
             kalshi_side,
             *needs_inversion,
             trade_amount,
+            pair_cap_usdt,
+            per_leg_cap_usd,
             monitor_state.current_cycle,
             "full_match",
             logger,
             &pair_label,
             paper,
+            demo_http,
+            kalshi_demo_cfg,
+            demo_trading_active,
         )
-        .await
+        .await?
         {
             verified_count += 1;
             crate::cycle_statistics::record_opportunity(&verified);
@@ -501,7 +665,7 @@ async fn run_full_match_cycle(
     }
 
     // 全量匹配周期结束：输出 Top 10 利润（与文件报告同源字符串）
-    let top10_block = format_top10_opportunities(&opportunities);
+    let top10_block = format_top10_opportunities(&opportunities, top10_mode_caption);
     print!("{}", top10_block);
     let full_cycle_block = crate::cycle_statistics::on_full_cycle_completed(&opportunities);
 
@@ -521,7 +685,13 @@ async fn run_tracking_cycle(
     logger: &MonitorLogger,
     monitor_state: &mut MonitorState,
     trade_amount: f64,
+    pair_cap_usdt: f64,
+    per_leg_cap_usd: f64,
     paper: &mut Option<PaperEngine>,
+    demo_http: &HttpClient,
+    kalshi_demo_cfg: Option<&KalshiDemoConfig>,
+    demo_trading_active: &mut bool,
+    top10_mode_caption: &str,
 ) -> Result<(usize, String)> {
     println!("   📡 执行价格追踪...");
     println!("      追踪 {} 个匹配对", monitor_state.tracked_pairs.len());
@@ -568,13 +738,18 @@ async fn run_tracking_cycle(
             &pair.kalshi_side,
             pair.needs_inversion,
             trade_amount,
+            pair_cap_usdt,
+            per_leg_cap_usd,
             monitor_state.current_cycle,
             "price_track",
             logger,
             &pair.pair_id,
             paper,
+            demo_http,
+            kalshi_demo_cfg,
+            demo_trading_active,
         )
-        .await
+        .await?
         {
             opportunity_count += 1;
             crate::cycle_statistics::record_opportunity(&verified);
@@ -593,7 +768,7 @@ async fn run_tracking_cycle(
     }
 
     // 追踪周期结束：输出 Top 10 利润
-    let top10_block = format_top10_opportunities(&opportunities);
+    let top10_block = format_top10_opportunities(&opportunities, top10_mode_caption);
     print!("{}", top10_block);
 
     Ok((opportunity_count, top10_block))
@@ -607,6 +782,9 @@ async fn run_cycle(
     logger: &MonitorLogger,
     monitor_state: &mut MonitorState,
     paper: &mut Option<PaperEngine>,
+    demo_http: &HttpClient,
+    kalshi_demo_cfg: Option<&KalshiDemoConfig>,
+    demo_trading_active: &mut bool,
 ) -> Result<CycleStats> {
     let start_time = Local::now();
     println!("🔄 开始新周期 #{} - {}", monitor_state.current_cycle, start_time.format("%H:%M:%S"));
@@ -619,7 +797,27 @@ async fn run_cycle(
 
     paper_cycle_start_close_checks(polymarket, kalshi, paper, monitor_state.current_cycle).await?;
 
-    let trade_amount = PAPER_PER_LEG_CAP_USDT;
+    let (per_leg_cap, pair_cap) = if *demo_trading_active && kalshi_demo_cfg.is_some() {
+        paper_caps_demo()
+    } else {
+        paper_caps_local()
+    };
+    let trade_amount = per_leg_cap;
+    let top10_caption = if *demo_trading_active && kalshi_demo_cfg.is_some() {
+        format!(
+            "demo · 参考盘子 ${} · 每腿 ${:.2} · 每对 ${:.2}",
+            DEMO_REFERENCE_BUDGET_USD as i32,
+            per_leg_cap,
+            pair_cap
+        )
+    } else {
+        format!(
+            "local · 纸面 ${} · 每腿 ${:.2} · 每对 ${:.2}",
+            LOCAL_TOTAL_USD as i32,
+            per_leg_cap,
+            pair_cap
+        )
+    };
     let is_full_match_cycle = monitor_state.should_full_match();
 
     // 大周期边界：只重置累计器，不输出「上一大周期总绩效」（小周期结束时的报告仍保留）。
@@ -638,7 +836,13 @@ async fn run_cycle(
             logger,
             monitor_state,
             trade_amount,
+            pair_cap,
+            per_leg_cap,
             paper,
+            demo_http,
+            kalshi_demo_cfg,
+            demo_trading_active,
+            &top10_caption,
         )
         .await?;
         (m, v, top10, Some(full))
@@ -651,7 +855,13 @@ async fn run_cycle(
             logger,
             monitor_state,
             trade_amount,
+            pair_cap,
+            per_leg_cap,
             paper,
+            demo_http,
+            kalshi_demo_cfg,
+            demo_trading_active,
+            &top10_caption,
         )
         .await?;
         (0, c, top10, None)
@@ -697,7 +907,7 @@ struct CycleStats {
 }
 
 /// 本周期利润 Top 10 文本（终端用；不含订单簿，簿档在每次 `validate_arbitrage_pair` 中已打印）
-fn format_top10_opportunities(opportunities: &[OpportunityRow]) -> String {
+fn format_top10_opportunities(opportunities: &[OpportunityRow], mode_caption: &str) -> String {
     use std::fmt::Write as _;
 
     let mut out = String::new();
@@ -714,17 +924,13 @@ fn format_top10_opportunities(opportunities: &[OpportunityRow]) -> String {
     });
     writeln!(
         out,
-        "╔══════════════════════════════════════════════════════════════════════╗"
+        "🏆 本周期利润 Top 10（{}，含滑点/手续费/Gas）",
+        mode_caption
     )
     .unwrap();
     writeln!(
         out,
-        "║  🏆 本周期利润 Top 10（100 USDT 本金，含滑点/手续费/Gas）                 ║"
-    )
-    .unwrap();
-    writeln!(
-        out,
-        "╚══════════════════════════════════════════════════════════════════════╝"
+        "──────────────────────────────────────────────────────────────────────"
     )
     .unwrap();
     for (i, (opp, pm_title, kalshi_title, pm_dt, ks_dt)) in sorted.iter().take(10).enumerate() {

@@ -6,6 +6,7 @@ resolver = "2"
 name = "arbitrage-monitor"
 version = "0.1.0"
 edition = "2021"
+default-run = "arbitrage-monitor"
 
 [dependencies]
 
@@ -45,6 +46,11 @@ rayon = "1.10"
 toml = "0.8"
 once_cell = "1.19"
 uuid = { version = "1.10", features = ["v4"] }
+rsa = { version = "0.9", features = ["pem", "sha2"] }
+sha2 = "0.10"
+rand = "0.8"
+base64 = "0.22"
+dotenvy = "0.15.7"
 
 [dev-dependencies]
 rand = "0.8"

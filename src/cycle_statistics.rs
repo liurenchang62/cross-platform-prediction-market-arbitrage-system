@@ -100,7 +100,7 @@ pub fn format_full_cycle_roi_top10_only(rows: &[OpportunityTuple]) -> String {
     .unwrap();
     writeln!(
         out,
-        "║  📈 全量匹配周期 #{} · 利润率 Top 10（按 ROI%，100 USDT 腿资金口径）      ║",
+        "║  📈 全量匹配周期 #{} · 利润率 Top 10（按 ROI%，与当前每腿探针上限一致）        ║",
         n
     )
     .unwrap();

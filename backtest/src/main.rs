@@ -49,6 +49,9 @@ struct Row {
     entry_capital: f64,
     fees_open: f64,
     gas_open: f64,
+    /// CLOSE 行有效；其余事件为 0
+    fees_close: f64,
+    gas_close: f64,
     pnl_realized: f64,
     cash_after: f64,
     notes: String,
@@ -142,6 +145,8 @@ fn load_csv(path: &Path) -> Result<Vec<Row>> {
             entry_capital: parse_f64(&get(&record, &idx, "entry_capital")),
             fees_open: parse_f64(&get(&record, &idx, "fees_open")),
             gas_open: parse_f64(&get(&record, &idx, "gas_open")),
+            fees_close: parse_f64(&get(&record, &idx, "fees_close")),
+            gas_close: parse_f64(&get(&record, &idx, "gas_close")),
             pnl_realized: parse_f64(&get(&record, &idx, "pnl_realized")),
             cash_after: parse_f64(&get(&record, &idx, "cash_after")),
             notes: get(&record, &idx, "notes"),
@@ -176,6 +181,35 @@ struct OpenPosition {
     entry_capital: f64,
     fees_open: f64,
     gas_open: f64,
+}
+
+/// 会话级成本归因：已平仓按 CLOSE 行；未平仓按期末持仓（开仓侧）。
+#[derive(Debug, Clone, Default)]
+struct SessionCostRollup {
+    closed_entry_capital: f64,
+    closed_fees_open: f64,
+    closed_gas_open: f64,
+    closed_fees_close: f64,
+    closed_gas_close: f64,
+    open_entry_capital: f64,
+    open_fees_open: f64,
+    open_gas_open: f64,
+}
+
+impl SessionCostRollup {
+    fn closed_total(&self) -> f64 {
+        self.closed_entry_capital
+            + self.closed_fees_open
+            + self.closed_gas_open
+            + self.closed_fees_close
+            + self.closed_gas_close
+    }
+    fn open_total(&self) -> f64 {
+        self.open_entry_capital + self.open_fees_open + self.open_gas_open
+    }
+    fn grand_total(&self) -> f64 {
+        self.closed_total() + self.open_total()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -269,6 +303,7 @@ fn analyze_session(rows: &[Row], session_id: u64) {
     let mut opens: HashMap<String, OpenPosition> = HashMap::new();
     let mut initial_cash: Option<f64> = None;
     let mut last_cash: Option<f64> = None;
+    let mut costs = SessionCostRollup::default();
 
     for r in &session_rows {
         last_cash = Some(r.cash_after);
@@ -293,10 +328,21 @@ fn analyze_session(rows: &[Row], session_id: u64) {
             "CLOSE" if r.pair_label != "-" && !r.pair_label.is_empty() => {
                 close_count += 1;
                 close_realized_sum += r.pnl_realized;
+                costs.closed_entry_capital += r.entry_capital;
+                costs.closed_fees_open += r.fees_open;
+                costs.closed_gas_open += r.gas_open;
+                costs.closed_fees_close += r.fees_close;
+                costs.closed_gas_close += r.gas_close;
                 opens.remove(&r.pair_label);
             }
             _ => {}
         }
+    }
+
+    for p in opens.values() {
+        costs.open_entry_capital += p.entry_capital;
+        costs.open_fees_open += p.fees_open;
+        costs.open_gas_open += p.gas_open;
     }
 
     let locked_pnl_still_open: f64 = opens
@@ -317,18 +363,15 @@ fn analyze_session(rows: &[Row], session_id: u64) {
         opens.len(),
         close_realized_sum,
         locked_pnl_still_open,
+        &costs,
     );
 }
 
-/// 左栏（标签）显示宽度（终端里中文一般占 2 列）。
-const LABEL_DISP_W: usize = 18;
-/// 右栏（数值）显示宽度。
-const VALUE_DISP_W: usize = 44;
+/// 表体内字符显示宽度（不含左右 ║）。
+const REPORT_INNER_W: usize = 70;
+const LABEL_DISP_W: usize = 26;
+const VALUE_DISP_W: usize = 40;
 const COL_GAP: &str = "  ";
-const COL_GAP_DISP_W: usize = 2;
-/// 两竖线之间正文总显示宽度。
-const INNER_DISP_W: usize = LABEL_DISP_W + COL_GAP_DISP_W + VALUE_DISP_W;
-
 fn pad_fill_display(target: usize, used: usize) -> String {
     " ".repeat(target.saturating_sub(used))
 }
@@ -346,6 +389,17 @@ fn fit_display_width(s: &str, max: usize) -> String {
     }
     out.push_str(&pad_fill_display(max, used));
     out
+}
+
+fn center_in_width(s: &str, w: usize) -> String {
+    let sw = s.width();
+    if sw >= w {
+        return fit_display_width(s, w);
+    }
+    let pad = w - sw;
+    let l = pad / 2;
+    let r = pad - l;
+    format!("{}{}{}", " ".repeat(l), s, " ".repeat(r))
 }
 
 fn pad_label(label: &str) -> String {
@@ -366,23 +420,48 @@ fn pad_value(value: &str) -> String {
     }
 }
 
-fn print_outer_top() {
-    println!("  ┌{}┐", "─".repeat(INNER_DISP_W));
+fn report_frame_top() {
+    println!();
+    println!("  ╔{}╗", "═".repeat(REPORT_INNER_W));
+    println!(
+        "  ║{}║",
+        center_in_width("纸面交易 ｜ 会话绩效摘要", REPORT_INNER_W)
+    );
+    println!("  ╠{}╣", "═".repeat(REPORT_INNER_W));
 }
 
-fn print_outer_bottom() {
-    println!("  └{}┘", "─".repeat(INNER_DISP_W));
+fn report_frame_bottom() {
+    println!("  ╚{}╝", "═".repeat(REPORT_INNER_W));
 }
 
-fn print_inner_sep() {
-    println!("  ├{}┤", "─".repeat(INNER_DISP_W));
+fn report_sep_heavy() {
+    println!("  ╠{}╣", "═".repeat(REPORT_INNER_W));
 }
 
-fn row_line(label: &str, value: &str) {
+fn report_sep_light() {
+    println!("  ╟{}╢", "─".repeat(REPORT_INNER_W));
+}
+
+fn report_row(label: &str, value: &str) {
     let body = format!("{}{}{}", pad_label(label), COL_GAP, pad_value(value));
-    println!("  │{}│", body);
+    println!("  ║{}║", fit_display_width(&body, REPORT_INNER_W));
 }
 
+/// 分区标题：缩进式子标题，贴近简易管理报表版式。
+fn report_section(title: &str) {
+    let line = format!("    {}", title);
+    println!("  ║{}║", fit_display_width(&line, REPORT_INNER_W));
+}
+
+/// 利润 ÷ 成本；成本 ≤ 0 或非有限时返回「—」。
+fn fmt_profit_rate_vs_cost(profit_usd: f64, cost_usd: f64) -> String {
+    if !cost_usd.is_finite() || cost_usd <= 0.0 || !profit_usd.is_finite() {
+        return "—".to_string();
+    }
+    format!("{:.2}%", (profit_usd / cost_usd) * 100.0)
+}
+
+/// 金额列报：千分位 + 两位小数；负数以圆括号表示（常见对外报表式）。
 fn fmt_money(v: f64) -> String {
     if !v.is_finite() {
         return "—".to_string();
@@ -401,18 +480,11 @@ fn fmt_money(v: f64) -> String {
         with_commas.push(c);
     }
     s = with_commas.chars().rev().collect();
-    let sign = if neg { "-" } else { "" };
-    format!("{}{}.{:02} USD", sign, s, frac)
-}
-
-fn section_title(title: &str) {
-    let w = title.width();
-    let line = if w <= INNER_DISP_W {
-        format!("{}{}", title, pad_fill_display(INNER_DISP_W, w))
+    if neg {
+        format!("({}.{:02}) USD", s, frac)
     } else {
-        fit_display_width(title, INNER_DISP_W)
-    };
-    println!("  │{}│", line);
+        format!("{}.{:02} USD", s, frac)
+    }
 }
 
 fn print_performance_report(
@@ -427,8 +499,12 @@ fn print_performance_report(
     open_pairs_end: usize,
     close_realized_sum: f64,
     locked_pnl_still_open: f64,
+    costs: &SessionCostRollup,
 ) {
     let total_profit = close_realized_sum + locked_pnl_still_open;
+    let cost_closed = costs.closed_total();
+    let cost_open = costs.open_total();
+    let cost_grand = costs.grand_total();
     let equity = last_cash.map(|c| c + u_hold_open_sum);
     let delta_from_funds = initial_cash.zip(equity).map(|(ic, e)| e - ic);
     let reconcile_eps = 0.05_f64;
@@ -437,79 +513,121 @@ fn print_performance_report(
         .unwrap_or(true);
 
     println!();
-    print_outer_top();
-    row_line("会话编号", &session_id.to_string());
+    report_frame_top();
+    report_section("会话概览");
+    report_row("会话编号 (session_id)", &session_id.to_string());
     if let Some(d) = anchor_date {
-        row_line("归属 UTC 日", &d.to_string());
+        report_row("归属 UTC 日历日", &d.to_string());
     } else {
-        row_line("归属 UTC 日", "—");
+        report_row("归属 UTC 日历日", "—");
     }
-    print_inner_sep();
+    report_sep_heavy();
 
-    section_title("时间跨度");
+    report_section("时间跨度");
     match (span.start, span.end) {
         (Some(s), Some(e)) => {
-            row_line("启动", &fmt_dt_hm(s));
-            row_line("结束", &fmt_dt_hm(e));
-            row_line("墙钟跨度", &fmt_wall_span(s, e));
+            report_row("启动时间", &fmt_dt_hm(s));
+            report_row("结束时间", &fmt_dt_hm(e));
+            report_row("墙钟持续时间", &fmt_wall_span(s, e));
         }
         (Some(s), None) => {
-            row_line("启动", &fmt_dt_hm(s));
-            row_line("结束", "—");
-            row_line("墙钟跨度", "—");
+            report_row("启动时间", &fmt_dt_hm(s));
+            report_row("结束时间", "—");
+            report_row("墙钟持续时间", "—");
         }
         _ => {
-            row_line("启动", "—");
-            row_line("结束", "—");
-            row_line("墙钟跨度", "—");
+            report_row("启动时间", "—");
+            report_row("结束时间", "—");
+            report_row("墙钟持续时间", "—");
         }
     }
     match (span.cycle_min, span.cycle_max) {
         (Some(lo), Some(hi)) => {
             let n = hi.saturating_sub(lo).saturating_add(1);
-            row_line("监控周期数", &format!("{} 个", n));
+            report_row("监控周期数", &format!("{} 个", n));
         }
-        _ => row_line("监控周期数", "—"),
+        _ => report_row("监控周期数", "—"),
     }
-    print_inner_sep();
+    report_sep_heavy();
 
-    section_title("资金");
-    row_line(
+    report_section("资金与权益");
+    report_row(
         "初始资金",
         &initial_cash.map(fmt_money).unwrap_or_else(|| "—".to_string()),
     );
-    row_line(
+    report_row(
         "期末现金",
         &last_cash.map(fmt_money).unwrap_or_else(|| "—".to_string()),
     );
-    row_line(
+    report_row(
         "到期估算权益",
         &equity.map(fmt_money).unwrap_or_else(|| "—".to_string()),
     );
     match (initial_cash, delta_from_funds) {
-        (Some(_), Some(d)) => row_line("较初始变动", &fmt_money(d)),
-        _ => row_line("较初始变动", "—"),
+        (Some(_), Some(d)) => report_row("较初始变动 (Δ权益)", &fmt_money(d)),
+        _ => report_row("较初始变动 (Δ权益)", "—"),
     }
-    print_inner_sep();
+    report_sep_heavy();
 
-    section_title("仓位");
-    row_line("开仓笔数", &open_event_count.to_string());
-    row_line("平仓笔数", &close_count.to_string());
-    row_line("期末未平", &open_pairs_end.to_string());
-    print_inner_sep();
+    report_section("仓位统计");
+    report_row("开仓笔数", &open_event_count.to_string());
+    report_row("平仓笔数", &close_count.to_string());
+    report_row("期末未平仓对数", &open_pairs_end.to_string());
+    report_sep_heavy();
 
-    section_title("利润");
-    row_line("总利润", &fmt_money(total_profit));
-    row_line("未平仓锁定", &fmt_money(locked_pnl_still_open));
-    row_line("平仓利润", &fmt_money(close_realized_sum));
+    report_section("成本归集 · 本会话");
+    report_row("总成本", &fmt_money(cost_grand));
+    report_sep_light();
+    report_section("平仓成本");
+    report_row("小计", &fmt_money(cost_closed));
+    report_row("  买入净成本", &fmt_money(costs.closed_entry_capital));
+    report_row("  开仓手续费", &fmt_money(costs.closed_fees_open));
+    report_row("  开仓 Gas", &fmt_money(costs.closed_gas_open));
+    report_row("  平仓手续费", &fmt_money(costs.closed_fees_close));
+    report_row("  平仓 Gas", &fmt_money(costs.closed_gas_close));
+    report_sep_light();
+    report_section("未平仓成本");
+    report_row("小计", &fmt_money(cost_open));
+    report_row("  买入净成本", &fmt_money(costs.open_entry_capital));
+    report_row("  开仓手续费", &fmt_money(costs.open_fees_open));
+    report_row("  开仓 Gas", &fmt_money(costs.open_gas_open));
+    report_sep_heavy();
 
-    print_outer_bottom();
+    report_section("损益汇总");
+    report_row("已实现损益", &fmt_money(close_realized_sum));
+    report_row("未平仓锁定", &fmt_money(locked_pnl_still_open));
+    report_sep_light();
+    report_row("损益合计", &fmt_money(total_profit));
+    report_sep_heavy();
+
+    report_section("收益率 · 对应成本口径");
+    report_row("综合收益率", &fmt_profit_rate_vs_cost(total_profit, cost_grand));
+    report_row("已实现收益率", &fmt_profit_rate_vs_cost(close_realized_sum, cost_closed));
+    report_row("未平仓锁定收益率", &fmt_profit_rate_vs_cost(locked_pnl_still_open, cost_open));
+
+    report_frame_bottom();
 
     println!();
-    println!("* 选日规则：仅列出「会话启动时刻」落在该 UTC 日的会话；跨自然日不拆分会话，整段绩效仍按会话汇总。");
-    println!("* 平仓利润为已平仓实现盈亏加总；未平仓锁定按持有到期回款估计减开仓成本；总利润为二者之和，与较初始变动一致。");
-    println!("* 到期权益为期末现金加未平仓估算回款；结算侧费率按双边各百分之一估算。");
-    println!("* 初始资金来自会话启动记录；期末现金取时间序上最后一笔后的现金余额。");
+    println!(
+        "  {} 选日：仅列出「会话启动时刻」落在所选 UTC 日的会话；跨自然日不拆分。",
+        '\u{2022}'
+    );
+    println!(
+        "  {} 损益：已实现损益为已了结头寸之盈亏；未平仓锁定为持有至到期之估计；损益合计为二者之和，应与权益变动一致。",
+        '\u{2022}'
+    );
+    println!(
+        "  {} 成本：平仓来自 CLOSE 行（开仓侧 + 平仓费/Gas）；未平仓来自期末持仓；总成本 = 平仓 + 未平仓。",
+        '\u{2022}'
+    );
+    println!(
+        "  {} 收益率：合计损益÷总成本，已实现÷平仓成本，锁定÷未平仓成本；分母不同，分项收益率一般不可直接加总为合计收益率。",
+        '\u{2022}'
+    );
+    println!(
+        "  {} 权益：期末现金 + 未平仓估算回款；结算费率按双侧各 1% 近似。",
+        '\u{2022}'
+    );
     if !reconcile_ok {
         if let Some(d) = delta_from_funds {
             println!(
@@ -518,6 +636,49 @@ fn print_performance_report(
             );
         }
     }
+}
+
+/// `notes` 中形如 `ks_exec=demo` / `ks_exec=local`（空格或 `|` 分隔的 token）。
+fn ks_exec_from_notes(notes: &str) -> Option<&str> {
+    for token in notes.split_whitespace() {
+        if let Some(v) = token.strip_prefix("ks_exec=") {
+            let v = v.trim();
+            if !v.is_empty() {
+                return Some(v);
+            }
+        }
+    }
+    for part in notes.split('|') {
+        let p = part.trim();
+        if let Some(v) = p.strip_prefix("ks_exec=") {
+            let v = v.trim();
+            if !v.is_empty() {
+                return Some(v);
+            }
+        }
+    }
+    None
+}
+
+/// 本会话内 `OPEN` 事件中 Kalshi 腿走 Demo 真下单的比例（仅统计真实开仓行）。
+fn session_demo_open_ratio(rows: &[Row], session_id: u64) -> Option<(usize, usize)> {
+    let opens: Vec<&Row> = rows
+        .iter()
+        .filter(|r| {
+            r.session_id == session_id
+                && r.event == "OPEN"
+                && r.pair_label != "-"
+                && !r.pair_label.is_empty()
+        })
+        .collect();
+    if opens.is_empty() {
+        return None;
+    }
+    let demo = opens
+        .iter()
+        .filter(|r| ks_exec_from_notes(&r.notes) == Some("demo"))
+        .count();
+    Some((demo, opens.len()))
 }
 
 fn parse_initial_cash_from_notes(notes: &str) -> Option<f64> {
@@ -613,7 +774,13 @@ fn main() -> Result<()> {
         .iter()
         .map(|sid| {
             let n = rows.iter().filter(|r| r.session_id == *sid).count();
-            format!("编号 {} · {} 条记录", sid, n)
+            let demo_part = session_demo_open_ratio(&rows, *sid)
+                .map(|(d, t)| {
+                    let pct = 100.0 * (d as f64) / (t as f64);
+                    format!(" · Demo开仓占比 {:.0}%", pct)
+                })
+                .unwrap_or_default();
+            format!("编号 {} · {} 条记录{}", sid, n, demo_part)
         })
         .collect();
 

@@ -18,7 +18,7 @@ pub struct ArbitrageOpportunity {
     pub gas_fee: f64,
     pub final_profit: f64,
     pub final_roi_percent: f64,
-    /// 以下为 100 USDT 本金模式
+    /// 以下为「每腿探针 + 每对名义上限」收缩后的口径（原 net_profit_100 命名保留）
     pub pm_optimal: f64,
     pub kalshi_optimal: f64,
     pub pm_avg_slipped: f64,
@@ -80,6 +80,7 @@ impl ArbitrageDetector {
         kalshi_side: &str,
         needs_inversion: bool,
         capital_usdt: f64,
+        pair_cap_usdt: f64,
     ) -> Option<ArbitrageOpportunity> {
         let total_cost_opt = pm_optimal + kalshi_optimal;
         if total_cost_opt >= 1.0 || total_cost_opt <= 0.0 {
@@ -111,27 +112,49 @@ impl ArbitrageDetector {
             return None;
         };
 
-        let n = if contracts_pm > 0.0 && contracts_ks > 0.0 {
+        let mut n = if contracts_pm > 0.0 && contracts_ks > 0.0 {
             contracts_pm.min(contracts_ks)
         } else {
             return None;
         };
 
         // 以 n 为基准重算双腿真实成本（滑点已体现在成交价路径上）
-        let (c_pm, pm_avg) = if let Some(ob) = pm_orderbook {
+        let (mut c_pm, mut pm_avg) = if let Some(ob) = pm_orderbook {
             cost_for_exact_contracts(ob, n)?
         } else {
             let c = n * pm_optimal;
             (c, pm_optimal)
         };
-        let (c_ks, kalshi_avg) = if let Some(ob) = kalshi_orderbook {
+        let (mut c_ks, mut kalshi_avg) = if let Some(ob) = kalshi_orderbook {
             cost_for_exact_contracts(ob, n)?
         } else {
             let c = n * kalshi_optimal;
             (c, kalshi_optimal)
         };
 
-        let capital_used = c_pm + c_ks;
+        let mut capital_used = c_pm + c_ks;
+        if pair_cap_usdt > 0.0 && capital_used > pair_cap_usdt {
+            let scale = pair_cap_usdt / capital_used;
+            n *= scale;
+            if n <= 0.0 || !n.is_finite() {
+                return None;
+            }
+            let (c1, a1) = if let Some(ob) = pm_orderbook {
+                cost_for_exact_contracts(ob, n)?
+            } else {
+                (n * pm_optimal, pm_optimal)
+            };
+            let (c2, a2) = if let Some(ob) = kalshi_orderbook {
+                cost_for_exact_contracts(ob, n)?
+            } else {
+                (n * kalshi_optimal, kalshi_optimal)
+            };
+            c_pm = c1;
+            pm_avg = a1;
+            c_ks = c2;
+            kalshi_avg = a2;
+            capital_used = c_pm + c_ks;
+        }
         let gross = n * 1.0;
         let fees_amount =
             c_pm * self.fees.polymarket + c_ks * self.fees.kalshi;
@@ -748,6 +771,7 @@ mod arb_tests {
                 "YES",
                 false,
                 100.0,
+                1_000_000.0,
             )
             .expect("opp");
         assert!(opp.contracts > 0.0);

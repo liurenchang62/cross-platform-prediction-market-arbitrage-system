@@ -16,7 +16,8 @@ use crate::arbitrage_detector::{
     PairOrderbookLadders, proceeds_for_exact_contracts_sell,
 };
 use crate::system_params::{
-    paper_settlement_fee_estimate, PAPER_COOLDOWN_CYCLES, PAPER_INITIAL_CASH, PAPER_MAX_OPEN_POSITIONS,
+    paper_settlement_fee_estimate, CASH_UTILIZATION_MAX, KALSHI_DEMO_API_KEY_ID_ENV,
+    KALSHI_DEMO_PRIVATE_KEY_PATH_ENV, LOCAL_TOTAL_USD, PAPER_COOLDOWN_CYCLES, PAPER_INITIAL_CASH,
     PAPER_MIN_EDGE_EARLY_USD, PAPER_RUN_LABEL_ENV, PAPER_SESSION_COUNTER_FILE, PAPER_TRADES_CSV,
     PAPER_TRADING_ENABLED, PAPER_WRITE_TRADE_LOG,
 };
@@ -99,6 +100,47 @@ impl PaperEngine {
         );
 
         Ok(Some(engine))
+    }
+
+    /// Demo 下单彻底失败后：结束当前纸面会话，新建 session，现金与持仓按纯本地规则重置（`LOCAL_TOTAL_USD`）。
+    pub fn reset_to_pure_local_after_demo_failure(&mut self, reason: &str) -> Result<()> {
+        if self.write_trade_log && !self.session_end_logged {
+            self.write_session_end(reason);
+        }
+        self.session_end_logged = false;
+
+        self.session_id = next_session_id()?;
+        self.positions.clear();
+        self.cooldown_remaining.clear();
+        self.cash = LOCAL_TOTAL_USD;
+        self.initial_cash = LOCAL_TOTAL_USD;
+        self.max_cycle_seen = 0;
+        self.session_wall_started = Utc::now();
+
+        if self.write_trade_log {
+            self.ensure_csv_header()?;
+            let notes = format!(
+                "marker=session_start wall_utc={} initial_cash={:.2} local_fallback=1 prior_end_reason={}",
+                self.session_wall_started.to_rfc3339(),
+                self.initial_cash,
+                reason
+            );
+            self.write_session_marker_row(
+                "SESSION_START",
+                0,
+                self.session_wall_started,
+                Some(self.session_wall_started),
+                "",
+                "-",
+                &notes,
+            )?;
+        }
+
+        println!(
+            "   📒 [Paper] 已切换为纯本地模拟新会话 | session_id={} | 初始资金 ${:.2}（Kalshi Demo 下单已停止）",
+            self.session_id, LOCAL_TOTAL_USD
+        );
+        Ok(())
     }
 
     fn ensure_csv_header(&self) -> Result<()> {
@@ -385,15 +427,25 @@ impl PaperEngine {
         kalshi_market_id: &str,
         pm_token_id: &str,
         opened_at: DateTime<Utc>,
+        kalshi_exec_notes: &str,
     ) -> Result<bool> {
         if self.has_open(pair_label) || self.in_cooldown(pair_label) {
             return Ok(false);
         }
-        if self.open_count() >= PAPER_MAX_OPEN_POSITIONS {
-            return Ok(false);
-        }
 
         let total_open_outlay = opp.capital_used + opp.fees_amount + opp.gas_amount;
+        let max_commit = self.cash * CASH_UTILIZATION_MAX;
+        if total_open_outlay > max_commit {
+            println!(
+                "   📒 [Paper] 超过 {:.0}% 可用现金上限，跳过开仓 {} | 需要 ${:.2}（含费与 gas）| 当前现金 ${:.2} 可动用至多 ${:.2}",
+                CASH_UTILIZATION_MAX * 100.0,
+                pair_label,
+                total_open_outlay,
+                self.cash,
+                max_commit
+            );
+            return Ok(false);
+        }
         if self.cash < total_open_outlay {
             println!(
                 "   📒 [Paper] 资金不足，跳过开仓 {} | 需要 ${:.2}（含费与 gas）剩余 ${:.2}",
@@ -425,13 +477,14 @@ impl PaperEngine {
         self.cash -= total_open_outlay;
         self.positions.insert(pair_label.to_string(), pos.clone());
 
-        let notes = format!(
-            "open_session={} {}",
-            self.session_id,
-            std::env::var(PAPER_RUN_LABEL_ENV).unwrap_or_default()
-        )
-        .trim()
-        .to_string();
+        let run = std::env::var(PAPER_RUN_LABEL_ENV).unwrap_or_default();
+        let ks = kalshi_exec_notes.trim();
+        let notes = match (run.is_empty(), ks.is_empty()) {
+            (true, true) => format!("open_session={}", self.session_id),
+            (false, true) => format!("open_session={} {}", self.session_id, run),
+            (true, false) => format!("open_session={} {}", self.session_id, ks),
+            (false, false) => format!("open_session={} {} {}", self.session_id, run, ks),
+        };
 
         if self.write_trade_log {
             self.bump_cycle(cycle);
@@ -477,10 +530,24 @@ impl PaperEngine {
     }
 
     fn append_session_start(&mut self) -> Result<()> {
+        let demo_cfg = std::env::var(KALSHI_DEMO_API_KEY_ID_ENV)
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .is_some()
+            && std::env::var(KALSHI_DEMO_PRIVATE_KEY_PATH_ENV)
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .is_some();
+        let demo_tag = if demo_cfg {
+            " kalshi_demo_keys_configured=1"
+        } else {
+            ""
+        };
         let notes = format!(
-            "marker=session_start wall_utc={} initial_cash={:.2}",
+            "marker=session_start wall_utc={} initial_cash={:.2}{}",
             self.session_wall_started.to_rfc3339(),
-            self.initial_cash
+            self.initial_cash,
+            demo_tag
         );
         self.write_session_marker_row(
             "SESSION_START",
@@ -725,6 +792,7 @@ pub fn validate_opportunity_from_ladders(
     kalshi_side: &str,
     needs_inversion: bool,
     capital_usdt: f64,
+    pair_cap_usdt: f64,
 ) -> Option<ArbitrageOpportunity> {
     let pm_optimal = orderbook_best_ask_price(&ladders.pm_asks)?;
     let kalshi_optimal = orderbook_best_ask_price(&ladders.ks_asks)?;
@@ -738,5 +806,6 @@ pub fn validate_opportunity_from_ladders(
         kalshi_side,
         needs_inversion,
         capital_usdt,
+        pair_cap_usdt,
     )
 }

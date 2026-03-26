@@ -503,16 +503,24 @@ pub struct KalshiClient {
 
 impl KalshiClient {
     pub fn new() -> Self {
+        Self::new_with_base_url(KALSHI_DEFAULT_BASE)
+    }
+
+    /// 自定义 Trade API 根 URL（须含 `/trade-api/v2`，无末尾 `/`）。
+    /// Demo 真下单时需与 `KALSHI_DEMO_BASE_URL` 一致，否则生产 ticker 在 Demo 会 `market_not_found`。
+    pub fn new_with_base_url(base_url: impl AsRef<str>) -> Self {
         let http_client = Client::builder()
             .timeout(Duration::from_secs(10))
             .pool_max_idle_per_host(10)
             .pool_idle_timeout(Duration::from_secs(90))
             .build()
             .unwrap_or_else(|_| Client::new());
-        
+
+        let base = base_url.as_ref().trim_end_matches('/').to_string();
+
         Self {
             http_client,
-            base_url: KALSHI_DEFAULT_BASE.to_string(),
+            base_url: base,
             price_cache: Arc::new(PriceCache::new(60)),
         }
     }

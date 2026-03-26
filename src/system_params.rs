@@ -16,14 +16,23 @@ pub const RETRY_INITIAL_DELAY_MS: u64 = 1000;
 pub const POLYMARKET_PAGE_LIMIT: u32 = 200;
 
 /// Polymarket 最大获取市场数
-pub const POLYMARKET_MAX_MARKETS: usize = 50000;
+pub const POLYMARKET_MAX_MARKETS: usize = 30000;
 
 // ==================== Kalshi 参数 ====================
 /// Kalshi 每页市场数
 pub const KALSHI_PAGE_LIMIT: u32 = 1000;
 
 /// Kalshi 最大获取市场数
-pub const KALSHI_MAX_MARKETS: usize = 50000;
+pub const KALSHI_MAX_MARKETS: usize = 30000;
+
+/// Kalshi Demo API（启用 Demo 凭证时，`KalshiClient` 与下单均指向本 base，避免 ticker 环境不一致）
+pub const KALSHI_DEMO_BASE_URL: &str = "https://demo-api.kalshi.co/trade-api/v2";
+
+/// Demo API Key ID（UUID 形态）
+pub const KALSHI_DEMO_API_KEY_ID_ENV: &str = "KALSHI_DEMO_API_KEY_ID";
+
+/// Demo RSA 私钥 PEM 文件路径（`-----BEGIN RSA PRIVATE KEY-----` 或 PKCS#8 PEM）
+pub const KALSHI_DEMO_PRIVATE_KEY_PATH_ENV: &str = "KALSHI_DEMO_PRIVATE_KEY_PATH";
 
 // ==================== 向量化参数 ====================
 /// 最大词汇表大小（降维用）
@@ -64,17 +73,46 @@ pub const PAPER_SESSION_COUNTER_FILE: &str = "logs/paper_session_counter.txt";
 /// 模拟交易记录 CSV
 pub const PAPER_TRADES_CSV: &str = "logs/paper_trades.csv";
 
-/// 每腿探针本金上限（USDT），与监控套利验证一致
-pub const PAPER_PER_LEG_CAP_USDT: f64 = 100.0;
+/// 单笔开仓最多使用当前现金的比例（保留 5% 缓冲）
+pub const CASH_UTILIZATION_MAX: f64 = 0.95;
+
+/// Kalshi Demo 侧策略参考总盘子（美元）：用于与 Poly 纸面「日维度」对齐；每对/每腿上限按本值 × 比例计算（方案 A，与 API 余额独立）
+pub const DEMO_REFERENCE_BUDGET_USD: f64 = 500.0;
+
+/// 纯本地纸面会话总资金（美元）；Demo 失败后回退会话从此值重新开始
+pub const LOCAL_TOTAL_USD: f64 = 10_000.0;
+
+/// 一对开仓总名义成本上限 = 参考资金 × 本比例（Demo：500×4%=20；本地：10000×4%=400）
+pub const PAIR_CAP_FRAC_OF_REFERENCE: f64 = 0.04;
+
+/// 每腿探针 / 名义上限 = 参考资金 × 本比例（Demo：500×2%=10；本地：10000×2%=200）
+pub const PER_LEG_CAP_FRAC_OF_REFERENCE: f64 = 0.02;
+
+/// Demo 模式（与 `DEMO_REFERENCE_BUDGET_USD` 对齐）下 (每腿上限, 每对上限)，单位美元
+#[inline]
+pub fn paper_caps_demo() -> (f64, f64) {
+    let r = DEMO_REFERENCE_BUDGET_USD;
+    (
+        r * PER_LEG_CAP_FRAC_OF_REFERENCE,
+        r * PAIR_CAP_FRAC_OF_REFERENCE,
+    )
+}
+
+/// 纯本地模式（与 `LOCAL_TOTAL_USD` 对齐）下 (每腿上限, 每对上限)，单位美元
+#[inline]
+pub fn paper_caps_local() -> (f64, f64) {
+    let r = LOCAL_TOTAL_USD;
+    (
+        r * PER_LEG_CAP_FRAC_OF_REFERENCE,
+        r * PAIR_CAP_FRAC_OF_REFERENCE,
+    )
+}
 
 /// 平仓后同 pair 需等待的监控周期数方可再开仓
 pub const PAPER_COOLDOWN_CYCLES: u32 = 5;
 
-/// 模拟初始资金（USDT）
-pub const PAPER_INITIAL_CASH: f64 = 100_000.0;
-
-/// 同时最多持仓对数
-pub const PAPER_MAX_OPEN_POSITIONS: usize = 50;
+/// 模拟初始资金（USDT）：默认与本地总资金一致；进程启动时的纸面会话起点
+pub const PAPER_INITIAL_CASH: f64 = LOCAL_TOTAL_USD;
 
 /// 提前平仓相对「持有到期」估算回款的最小优势（美元），避免略优即平
 pub const PAPER_MIN_EDGE_EARLY_USD: f64 = 0.5;

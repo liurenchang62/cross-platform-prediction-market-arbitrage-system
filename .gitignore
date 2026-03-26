@@ -20,4 +20,7 @@ Thumbs.db
 .env
 .env.*
 
+# 本地密钥目录（Kalshi Demo PEM 等，勿提交）
+/secrets/
+
 *.zip
