@@ -158,6 +158,16 @@ impl VectorIndex {
             .collect()
     }
 
+    /// 堆叠后的索引矩阵 `(n, d)`，与 `items` 行序一致；未 build 时为 `None`。
+    pub fn data_matrix(&self) -> Option<&Array2<f64>> {
+        self.data_matrix.as_ref()
+    }
+
+    /// 与矩阵行对齐的项列表。
+    pub fn items(&self) -> &[IndexItem] {
+        &self.items
+    }
+
     /// 获取索引大小
     pub fn len(&self) -> usize {
         self.items.len()

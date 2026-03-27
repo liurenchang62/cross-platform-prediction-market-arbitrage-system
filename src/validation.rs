@@ -1788,14 +1788,8 @@ impl ValidationPipeline {
         Some(match_info)
     }
     
-    fn record_filter(&mut self, pm: &str, ks: &str, reason: &str) {
+    fn record_filter(&mut self, _pm: &str, _ks: &str, _reason: &str) {
         self.filtered_count += 1;
-        if self.filtered_count <= 3 {
-            self.filtered_samples.push((pm.to_string(), ks.to_string(), reason.to_string()));
-            println!("\n         🔍 二筛过滤 #{} [{}]:", self.filtered_count, reason);
-            println!("            PM: {}", pm);
-            println!("            Kalshi: {}", ks);
-        }
     }
     
     fn record_retained(&mut self, info: &MatchInfo) {
@@ -1822,30 +1816,35 @@ impl ValidationPipeline {
     }
     
     pub fn print_retained_samples(&self) {
-        println!("\n📊 二筛后各类别最高分样本 (每个类别最多3个):");
-        
+        if self.retained_samples.is_empty() {
+            return;
+        }
+        println!(
+            "\n📌 二筛留存样本（每类至多 1 行摘要 · 共 {} 类）",
+            self.retained_samples.len()
+        );
         let mut categories: Vec<_> = self.retained_samples.keys().collect();
         categories.sort();
-        
-        for category in categories.iter().take(5) {
+        for category in categories.iter().take(6) {
             if let Some(samples) = self.retained_samples.get(*category) {
                 let mut sorted = samples.clone();
                 sorted.sort_by(|a, b| b.similarity.partial_cmp(&a.similarity).unwrap());
-                
-                println!("\n  类别 [{}]: {} 个留存", category, samples.len());
-                for (i, sample) in sorted.iter().take(3).enumerate() {
-                    let inversion_note = if sample.needs_inversion { " [Y/N颠倒]" } else { "" };
-                    println!("    {}. 相似度: {:.3}{}", i+1, sample.similarity, inversion_note);
-                    println!("       PM {}: {}", sample.pm_side, sample.pm_title);
-                    println!("       Kalshi {}: {}", sample.kalshi_side, sample.kalshi_title);
-                }
-                if samples.len() > 3 {
-                    println!("       ... 还有 {} 个", samples.len() - 3);
+                if let Some(best) = sorted.first() {
+                    let inv = if best.needs_inversion { " · 颠倒" } else { "" };
+                    println!(
+                            "   · [{}] n={} · sim={:.3}{} · PM:{} / KS:{}",
+                            category,
+                            samples.len(),
+                            best.similarity,
+                            inv,
+                            best.pm_side,
+                            best.kalshi_side
+                        );
                 }
             }
         }
-        if categories.len() > 5 {
-            println!("   ... 以及其他 {} 个类别", categories.len() - 5);
+        if categories.len() > 6 {
+            println!("   · … 另有 {} 类（略）", categories.len() - 6);
         }
     }
 }

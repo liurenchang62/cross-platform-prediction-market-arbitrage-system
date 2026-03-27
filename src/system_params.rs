@@ -16,16 +16,21 @@ pub const RETRY_INITIAL_DELAY_MS: u64 = 1000;
 pub const POLYMARKET_PAGE_LIMIT: u32 = 200;
 
 /// Polymarket 最大获取市场数
-pub const POLYMARKET_MAX_MARKETS: usize = 30000;
+pub const POLYMARKET_MAX_MARKETS: usize = 40000;
 
 // ==================== Kalshi 参数 ====================
 /// Kalshi 每页市场数
 pub const KALSHI_PAGE_LIMIT: u32 = 1000;
 
 /// Kalshi 最大获取市场数
-pub const KALSHI_MAX_MARKETS: usize = 30000;
+pub const KALSHI_MAX_MARKETS: usize = 40000;
 
-/// Kalshi Demo API（启用 Demo 凭证时，`KalshiClient` 与下单均指向本 base，避免 ticker 环境不一致）
+/// **Kalshi Demo 总开关**（唯一控制，无需依赖其它操作）  
+/// - `true`：读取 `KALSHI_DEMO_*` 环境变量，使用 Demo API 基址与 Demo 下单能力；未配置则启动失败。  
+/// - `false`：始终使用生产 Trade API，**忽略** Demo 环境变量。
+pub const KALSHI_DEMO_MODE_ENABLED: bool = false;
+
+/// Kalshi Demo API（`KALSHI_DEMO_MODE_ENABLED=true` 且凭证有效时，`KalshiClient` 与下单均指向本 base）
 pub const KALSHI_DEMO_BASE_URL: &str = "https://demo-api.kalshi.co/trade-api/v2";
 
 /// Demo API Key ID（UUID 形态）
@@ -47,6 +52,9 @@ pub const SIMILARITY_THRESHOLD: f64 = 0.8;
 /// 仅当提高此值时才会扩大初筛候选集；降低可能影响召回，变更前应做审计对比。
 pub const SIMILARITY_TOP_K: usize = 15;
 
+/// 按大类批量计算 P·Kᵀ / K·Pᵀ 时，每次参与乘法的行块大小（行数）。
+pub const MATCH_MATMUL_CHUNK_ROWS: usize = 512;
+
 /// 全量获取周期（每 N 个追踪周期执行一次全量获取）
 pub const FULL_FETCH_INTERVAL: usize = 180;
 
@@ -59,7 +67,7 @@ pub const RESOLUTION_HORIZON_DAYS: i64 = 21;
 
 // ==================== 模拟交易（Paper）====================
 /// 是否启用模拟盘：仅当本常量为 `true` 时构造 `PaperEngine`（与运行环境变量无关）
-pub const PAPER_TRADING_ENABLED: bool = true;
+pub const PAPER_TRADING_ENABLED: bool = false;
 
 /// 是否写入模拟交易单一 CSV（`PAPER_TRADES_CSV`）；为 `false` 时仍做资金与持仓模拟，但不创建/追加文件
 pub const PAPER_WRITE_TRADE_LOG: bool = true;

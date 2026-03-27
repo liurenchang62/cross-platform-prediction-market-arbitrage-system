@@ -4,13 +4,16 @@
 use crate::market::Market;
 use crate::category_mapper::CategoryMapper;
 use crate::unclassified_logger::UnclassifiedLogger;
-use crate::system_params::{SIMILARITY_THRESHOLD, SIMILARITY_TOP_K};
+use crate::system_params::{
+    MATCH_MATMUL_CHUNK_ROWS, SIMILARITY_THRESHOLD, SIMILARITY_TOP_K,
+};
 use crate::category_vectorizer::{CategoryVectorizer, CategoryVectorizerManager};
-use crate::text_vectorizer::VectorizerConfig;
+use crate::text_vectorizer::{TextVectorizer, VectorizerConfig};
 use crate::validation::ValidationPipeline;
 use rayon::prelude::*;
 use tokio::task;
 
+use ndarray::s;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use anyhow::Result;
@@ -130,7 +133,7 @@ impl MarketMatcher {
     }
 
     pub fn fit_vectorizer(&mut self, kalshi_markets: &[Market], polymarket_markets: &[Market]) -> Result<()> {
-        println!("📚 按类别训练向量化器...");
+        println!("📚 按类别训练向量化器（每类合并 Poly + Kalshi 标题语料，词表与维度一致）...");
         
         let mut kalshi_by_category: HashMap<String, Vec<String>> = HashMap::new();
         for market in kalshi_markets {
@@ -154,15 +157,50 @@ impl MarketMatcher {
             }
         }
         
-        // 需要获取可变引用
+        let mut all_categories: HashSet<String> = kalshi_by_category.keys().cloned().collect();
+        for c in polymarket_by_category.keys() {
+            all_categories.insert(c.clone());
+        }
+
+        let mut pairs: Vec<(String, Vec<String>)> = Vec::new();
+        for cat in all_categories {
+            let mut docs = kalshi_by_category.get(&cat).cloned().unwrap_or_default();
+            docs.extend(polymarket_by_category.get(&cat).cloned().unwrap_or_default());
+            if docs.is_empty() {
+                continue;
+            }
+            pairs.push((cat, docs));
+        }
+        pairs.sort_by(|a, b| a.0.cmp(&b.0));
+
         let kalshi_vec = Arc::get_mut(&mut self.kalshi_vectorizers).unwrap();
         let polymarket_vec = Arc::get_mut(&mut self.polymarket_vectorizers).unwrap();
-        
-        println!("   📊 训练 Kalshi 类别向量化器...");
-        kalshi_vec.fit_all(kalshi_by_category);
-        
-        println!("   📊 训练 Polymarket 类别向量化器...");
-        polymarket_vec.fit_all(polymarket_by_category);
+        kalshi_vec.clear();
+        polymarket_vec.clear();
+
+        let n_cat = pairs.len();
+        if n_cat == 0 {
+            self.fitted = true;
+            return Ok(());
+        }
+
+        println!("   📊 并行拟合 {} 个类别（合并语料 TF-IDF）...", n_cat);
+        let vcfg = self.config.vectorizer_config.clone();
+        let fitted: Vec<(String, TextVectorizer)> = pairs
+            .into_par_iter()
+            .map(|(category, titles)| {
+                let mut vz = TextVectorizer::new(vcfg.clone());
+                vz.fit(&titles);
+                (category, vz)
+            })
+            .collect();
+
+        for (category, vz) in fitted {
+            let cv_k = CategoryVectorizer::with_fitted_vectorizer(category.clone(), vz.clone());
+            let cv_p = CategoryVectorizer::with_fitted_vectorizer(category.clone(), vz);
+            kalshi_vec.insert_built_category(category.clone(), cv_k);
+            polymarket_vec.insert_built_category(category, cv_p);
+        }
         
         self.fitted = true;
         Ok(())
@@ -275,13 +313,11 @@ impl MarketMatcher {
 
 
 
-    // 在 find_matches_bidirectional 函数中修改调用和合并逻辑
-
     pub async fn find_matches_bidirectional(
         &mut self,
-        pm_markets: &[Market],
-        kalshi_markets: &[Market],
-    ) -> Vec<(Market, Market, f64, String, String, bool)> {  // 修改返回类型
+        _pm_markets: &[Market],
+        _kalshi_markets: &[Market],
+    ) -> Vec<(Market, Market, f64, String, String, bool)> {
         if !self.fitted {
             println!("⚠️ 索引未构建");
             return Vec::new();
@@ -289,116 +325,54 @@ impl MarketMatcher {
 
         self.validation_pipeline.reset_filtered_count();
 
-        println!("\n🔍 ====== 开始双向匹配 ======");
-        
-        // 克隆需要的数据用于并行任务
+        println!("\n🔍 双向匹配：按大类 P·Kᵀ / K·Pᵀ 初筛（类内并行）→ 全类统一二筛");
+
         let kalshi_vec = self.kalshi_vectorizers.clone();
         let polymarket_vec = self.polymarket_vectorizers.clone();
-        
-        let category_mapper1 = self.category_mapper.clone();
-        let category_mapper2 = self.category_mapper.clone();
-        
-        let config1 = self.config.clone();
-        let config2 = self.config.clone();
-        
-        // 方向1（PM→Kalshi）查询 Kalshi 索引，必须用 Kalshi cache 才能用 item.id 命中目标市场
-        let market_cache1 = self.kalshi_market_cache.clone();
-        // 方向2（Kalshi→PM）查询 PM 索引，必须用 PM cache
-        let market_cache2 = self.polymarket_market_cache.clone();
-        
-        let pm_markets_vec = pm_markets.to_vec();
-        let kalshi_markets_vec = kalshi_markets.to_vec();
-        
+        let config = self.config.clone();
+        let market_cache_ks = self.kalshi_market_cache.clone();
+        let market_cache_pm = self.polymarket_market_cache.clone();
+
         let start_time = std::time::Instant::now();
-        
-        println!("\n📌 并行执行两个方向（spawn_blocking 确保 CPU 密集任务真并行）...");
-        
-        // 使用 spawn_blocking 保证 CPU 密集的匹配循环真并行，不阻塞 async worker
-        let handle1 = task::spawn_blocking(move || {
-            Self::find_matches_directional_sync(
-                &pm_markets_vec,
-                kalshi_vec.as_ref(),
-                &category_mapper1,
-                &config1,
-                market_cache1.as_ref(),
-                "PM→Kalshi",
-            )
-        });
 
-        let handle2 = task::spawn_blocking(move || {
-            Self::find_matches_directional_sync(
-                &kalshi_markets_vec,
+        let handle = task::spawn_blocking(move || {
+            Self::find_matches_batched_sync(
                 polymarket_vec.as_ref(),
-                &category_mapper2,
-                &config2,
-                market_cache2.as_ref(),
-                "Kalshi→PM",
+                kalshi_vec.as_ref(),
+                &config,
+                market_cache_pm.as_ref(),
+                market_cache_ks.as_ref(),
             )
         });
-        
-        let (res1, res2) = tokio::join!(handle1, handle2);
-        
-        let (matches1, pipeline1) = res1.unwrap();
-        let (matches2, pipeline2) = res2.unwrap();
-        
-        let initial_count = matches1.len() + matches2.len();
-        
-        let mut all_matches = Vec::new();
-        let mut seen_pairs = std::collections::HashSet::new();
-        
-        // 处理方向1的匹配 (PM→Kalshi)
-        for (m1, m2, score, pm_side, ks_side, needs_inversion) in matches1 {
-            let pair_key = format!("{}:{}", m1.market_id, m2.market_id);
-            let reverse_key = format!("{}:{}", m2.market_id, m1.market_id);
-            
-            if !seen_pairs.contains(&pair_key) && !seen_pairs.contains(&reverse_key) {
-                seen_pairs.insert(pair_key);
-                if m1.platform == "polymarket" && m2.platform == "kalshi" {
-                    all_matches.push((m1, m2, score, pm_side, ks_side, needs_inversion));
-                } else {
-                    // 如果方向反了，交换并保留方向信息
-                    all_matches.push((m2, m1, score, pm_side, ks_side, needs_inversion));
-                }
-            }
-        }
-        
-        // 处理方向2的匹配 (Kalshi→PM)
-        for (m1, m2, score, pm_side, ks_side, needs_inversion) in matches2 {
-            let pair_key = format!("{}:{}", m2.market_id, m1.market_id);
-            let reverse_key = format!("{}:{}", m1.market_id, m2.market_id);
-            
-            if !seen_pairs.contains(&pair_key) && !seen_pairs.contains(&reverse_key) {
-                seen_pairs.insert(pair_key);
-                // 方向2中，m1是Kalshi，m2是PM，需要交换并保留方向信息
-                all_matches.push((m2, m1, score, pm_side, ks_side, needs_inversion));
-            }
-        }
-        
-        all_matches.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
 
-        let final_count = all_matches.len();
-        let filtered_count = initial_count - final_count;
-        
-        self.validation_pipeline.filtered_count = filtered_count;
-        
-        // 合并留存样本
-        for (cat, samples) in pipeline1.retained_samples {
-            self.validation_pipeline.retained_samples.insert(cat, samples);
+        let (mut all_raw, pipeline) = handle.await.unwrap();
+
+        self.validation_pipeline = pipeline;
+
+        let initial_count = all_raw.len();
+        all_raw.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+
+        let mut deduped: Vec<(Market, Market, f64, String, String, bool)> = Vec::new();
+        let mut seen_m = HashSet::new();
+        for t in all_raw {
+            let key = (t.0.market_id.clone(), t.1.market_id.clone());
+            if seen_m.insert(key) {
+                deduped.push(t);
+            }
         }
-        for (cat, samples) in pipeline2.retained_samples {
-            self.validation_pipeline.retained_samples.insert(cat, samples);
-        }
+
+        let final_count = deduped.len();
+        let merge_deduped = initial_count.saturating_sub(final_count);
 
         let elapsed = start_time.elapsed();
-        println!("\n📊 ====== 匹配统计 ======");
-        println!("   并行匹配耗时: {:?}", elapsed);
-        println!("   初筛匹配对: {} 个", initial_count);
-        println!("   二筛过滤: {} 个", filtered_count);
-        println!("   二筛后待跟踪: {} 个", final_count);
-        
+        println!(
+            "\n📊 匹配：{:?} · 二筛后列表 {} 条 · 按 market_id 去重后 {} · 列表合并压掉 {}",
+            elapsed, initial_count, final_count, merge_deduped
+        );
+
         self.validation_pipeline.print_retained_samples();
-        
-        all_matches
+
+        deduped
     }
 
 
@@ -407,114 +381,220 @@ impl MarketMatcher {
 
 
 
-    /// 同步版本：供 spawn_blocking 使用。方向内顺序遍历（避免与另一方向的 `spawn_blocking` 叠加抢占全局 Rayon 池导致长时间无响应）。
-    fn find_matches_directional_sync(
-        query_markets: &[Market],
-        target_vectorizers: &CategoryVectorizerManager,
-        category_mapper: &CategoryMapper,
-        config: &MarketMatcherConfig,
-        target_market_cache: &HashMap<String, Arc<Market>>,
-        direction_label: &str,
-    ) -> (
-        Vec<(Market, Market, f64, String, String, bool)>,
-        ValidationPipeline,
-    ) {
-        Self::find_matches_directional_internal_impl(
-            query_markets,
-            target_vectorizers,
-            category_mapper,
-            config,
-            target_market_cache,
-            direction_label,
-        )
+    /// 类内对每个 `chunk` 行块的 `dot` 用 rayon 并行；块结果按 `r0` 排序后展平，再接 `K·Pᵀ` 侧——与同顺序串行双层循环在 `seen_pair` 上行为一致。
+    fn sweep_pm_to_ks_candidates_ordered(
+        p_mat: &ndarray::Array2<f64>,
+        k_mat: &ndarray::Array2<f64>,
+        pm_items: &[crate::vector_index::IndexItem],
+        ks_items: &[crate::vector_index::IndexItem],
+        chunk: usize,
+        threshold: f64,
+        top_k: usize,
+    ) -> Vec<(String, String, f64)> {
+        let n_p = p_mat.nrows();
+        if n_p == 0 {
+            return Vec::new();
+        }
+        let k_t = k_mat.t();
+        let chunk_starts: Vec<usize> = (0..n_p).step_by(chunk).collect();
+        let mut parts: Vec<(usize, Vec<(String, String, f64)>)> = chunk_starts
+            .par_iter()
+            .map(|&r0| {
+                let r1 = (r0 + chunk).min(n_p);
+                let p_sl = p_mat.slice(s![r0..r1, ..]);
+                let scores = p_sl.dot(&k_t);
+                let mut out = Vec::new();
+                for local in 0..scores.nrows() {
+                    let row_idx = r0 + local;
+                    let pm_id = pm_items[row_idx].id.clone();
+                    let hits = Self::top_k_similarities_for_row(
+                        scores.row(local),
+                        threshold,
+                        top_k,
+                    );
+                    for (j, sim) in hits {
+                        let ks_id = ks_items[j].id.clone();
+                        out.push((pm_id.clone(), ks_id, sim));
+                    }
+                }
+                (r0, out)
+            })
+            .collect();
+        parts.sort_by_key(|(r0, _)| *r0);
+        parts.into_iter().flat_map(|(_, v)| v).collect()
     }
 
-    fn find_matches_directional_internal_impl(
-        query_markets: &[Market],
-        target_vectorizers: &CategoryVectorizerManager,
-        category_mapper: &CategoryMapper,
+    fn sweep_ks_to_pm_candidates_ordered(
+        p_mat: &ndarray::Array2<f64>,
+        k_mat: &ndarray::Array2<f64>,
+        pm_items: &[crate::vector_index::IndexItem],
+        ks_items: &[crate::vector_index::IndexItem],
+        chunk: usize,
+        threshold: f64,
+        top_k: usize,
+    ) -> Vec<(String, String, f64)> {
+        let n_k = k_mat.nrows();
+        if n_k == 0 {
+            return Vec::new();
+        }
+        let p_t = p_mat.t();
+        let chunk_starts: Vec<usize> = (0..n_k).step_by(chunk).collect();
+        let mut parts: Vec<(usize, Vec<(String, String, f64)>)> = chunk_starts
+            .par_iter()
+            .map(|&r0| {
+                let r1 = (r0 + chunk).min(n_k);
+                let k_sl = k_mat.slice(s![r0..r1, ..]);
+                let scores = k_sl.dot(&p_t);
+                let mut out = Vec::new();
+                for local in 0..scores.nrows() {
+                    let row_idx = r0 + local;
+                    let ks_id = ks_items[row_idx].id.clone();
+                    let hits = Self::top_k_similarities_for_row(
+                        scores.row(local),
+                        threshold,
+                        top_k,
+                    );
+                    for (j, sim) in hits {
+                        let pm_id = pm_items[j].id.clone();
+                        out.push((pm_id, ks_id.clone(), sim));
+                    }
+                }
+                (r0, out)
+            })
+            .collect();
+        parts.sort_by_key(|(r0, _)| *r0);
+        parts.into_iter().flat_map(|(_, v)| v).collect()
+    }
+
+    fn fold_candidates_into_best(
+        best: &mut HashMap<(String, String), (f64, String)>,
+        pm: String,
+        ks: String,
+        sim: f64,
+        cat: &str,
+    ) {
+        best.entry((pm, ks))
+            .and_modify(|e| {
+                if sim > e.0 {
+                    *e = (sim, cat.to_string());
+                }
+            })
+            .or_insert_with(|| (sim, cat.to_string()));
+    }
+
+    /// 对每个大类：仅做矩阵初筛并把命中折叠进全局 `(pm,ks)→max(sim)`；全部类别结束后对去重结果统一跑二筛。
+    fn find_matches_batched_sync(
+        polymarket_vec: &CategoryVectorizerManager,
+        kalshi_vec: &CategoryVectorizerManager,
         config: &MarketMatcherConfig,
-        target_market_cache: &HashMap<String, Arc<Market>>,
-        direction_label: &str,
+        polymarket_cache: &HashMap<String, Arc<Market>>,
+        kalshi_cache: &HashMap<String, Arc<Market>>,
     ) -> (
         Vec<(Market, Market, f64, String, String, bool)>,
         ValidationPipeline,
     ) {
-        let total = query_markets.len();
-        println!("      🔍 匹配 {} 个市场 [{}]...", total, direction_label);
         let start_time = std::time::Instant::now();
-
-        let is_kalshi_pm = direction_label == "Kalshi→PM";
-
         let mut validation_pipeline = ValidationPipeline::new();
         let mut all_arc: Vec<(Arc<Market>, Arc<Market>, f64, String, String, bool)> = Vec::new();
 
-        for (idx, query_market) in query_markets.iter().enumerate() {
-            if idx > 0 && idx % 1000 == 0 {
-                let elapsed = start_time.elapsed();
-                let avg_time = elapsed.as_millis() as f64 / idx as f64;
-                let remaining = (total - idx) as f64 * avg_time;
-                println!(
-                    "        进度: {}/{} 个市场 [{}], 已用 {:?}, 预计剩余 {:?}",
-                    idx,
-                    total,
-                    direction_label,
-                    humantime::format_duration(elapsed),
-                    humantime::format_duration(std::time::Duration::from_millis(remaining as u64)),
+        let mut categories_used = 0usize;
+        let chunk = MATCH_MATMUL_CHUNK_ROWS.max(1);
+        let mut best_by_pair: HashMap<(String, String), (f64, String)> = HashMap::new();
+        let mut cumulative_raw_hits = 0usize;
+
+        let cats = polymarket_vec.get_all_categories();
+        for cat in cats {
+            let Some(pm_cv) = polymarket_vec.get(&cat) else {
+                continue;
+            };
+            let Some(ks_cv) = kalshi_vec.get(&cat) else {
+                continue;
+            };
+            let Some(p_mat) = pm_cv.index.data_matrix() else {
+                continue;
+            };
+            let Some(k_mat) = ks_cv.index.data_matrix() else {
+                continue;
+            };
+            if p_mat.nrows() == 0 || k_mat.nrows() == 0 {
+                continue;
+            }
+            if p_mat.ncols() != k_mat.ncols() {
+                eprintln!(
+                    "   ⚠️  类别 {:?} Poly 与 Kalshi 向量维不一致 ({} vs {})，跳过",
+                    cat,
+                    p_mat.ncols(),
+                    k_mat.ncols()
                 );
+                continue;
             }
 
-            let query_arc = Arc::new(query_market.clone());
-            let query_full_id = format!("{}:{}", query_market.platform, query_market.market_id);
-            let mut seen_qt: HashSet<(String, String)> = HashSet::new();
+            categories_used += 1;
+            let pm_items = pm_cv.index.items();
+            let ks_items = ks_cv.index.items();
+            let n_p = p_mat.nrows();
+            let n_k = k_mat.nrows();
+            let cat_started = std::time::Instant::now();
 
-            let query_categories = category_mapper.classify(&query_market.title);
-            for category in query_categories {
-                if let Some(vectorizer) = target_vectorizers.get(&category) {
-                    let similar = vectorizer.find_similar(
-                        &query_market.title,
-                        config.similarity_threshold,
-                        SIMILARITY_TOP_K,
-                    );
-
-                    for (item, similarity) in similar {
-                        if let Some(target_arc) = target_market_cache.get(&item.id) {
-                            if !seen_qt.insert((query_full_id.clone(), item.id.clone())) {
-                                continue;
-                            }
-                            let (pm_title, kalshi_title) = if is_kalshi_pm {
-                                (target_arc.title.as_str(), query_market.title.as_str())
-                            } else {
-                                (query_market.title.as_str(), target_arc.title.as_str())
-                            };
-                            if let Some(match_info) = validation_pipeline.validate(
-                                pm_title,
-                                kalshi_title,
-                                similarity,
-                                &category,
-                            ) {
-                                let confidence = Self::calculate_confidence(
-                                    query_arc.as_ref(),
-                                    target_arc.as_ref(),
-                                    similarity,
-                                    config,
-                                );
-
-                                if confidence.overall_score >= config.similarity_threshold {
-                                    all_arc.push((
-                                        Arc::clone(&query_arc),
-                                        Arc::clone(target_arc),
-                                        confidence.overall_score,
-                                        match_info.pm_side,
-                                        match_info.kalshi_side,
-                                        match_info.needs_inversion,
-                                    ));
-                                }
-                            }
-                        }
-                    }
-                }
+            let cand_pk = Self::sweep_pm_to_ks_candidates_ordered(
+                p_mat,
+                k_mat,
+                pm_items,
+                ks_items,
+                chunk,
+                config.similarity_threshold,
+                SIMILARITY_TOP_K,
+            );
+            let cand_kp = Self::sweep_ks_to_pm_candidates_ordered(
+                p_mat,
+                k_mat,
+                pm_items,
+                ks_items,
+                chunk,
+                config.similarity_threshold,
+                SIMILARITY_TOP_K,
+            );
+            let cat_raw = cand_pk.len() + cand_kp.len();
+            cumulative_raw_hits += cat_raw;
+            for (pm, ks, sim) in cand_pk {
+                Self::fold_candidates_into_best(&mut best_by_pair, pm, ks, sim, &cat);
             }
+            for (pm, ks, sim) in cand_kp {
+                Self::fold_candidates_into_best(&mut best_by_pair, pm, ks, sim, &cat);
+            }
+
+            println!(
+                "   ✓ #{} 「{}」Poly×Kalshi {}×{} · 本类初筛 {} 条 · 累计初筛 {} 条 · {:?}",
+                categories_used,
+                cat,
+                n_p,
+                n_k,
+                cat_raw,
+                cumulative_raw_hits,
+                cat_started.elapsed()
+            );
+        }
+
+        let n_unique_pairs = best_by_pair.len();
+        let mut merged: Vec<(String, String, f64, String)> = best_by_pair
+            .into_iter()
+            .map(|((pm, ks), (sim, cat))| (pm, ks, sim, cat))
+            .collect();
+        merged.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        let mut seen_accepted: HashSet<(String, String)> = HashSet::new();
+        for (pm_id, ks_id, sim, cat) in merged {
+            Self::try_push_pair_candidate(
+                &pm_id,
+                &ks_id,
+                sim,
+                &cat,
+                polymarket_cache,
+                kalshi_cache,
+                &mut seen_accepted,
+                &mut validation_pipeline,
+                config,
+                &mut all_arc,
+            );
         }
 
         let all_matches: Vec<(Market, Market, f64, String, String, bool)> = all_arc
@@ -522,18 +602,79 @@ impl MarketMatcher {
             .map(|(qa, ta, s, ps, ks, ni)| ((*qa).clone(), (*ta).clone(), s, ps, ks, ni))
             .collect();
 
-        let elapsed = start_time.elapsed();
         println!(
-            "        匹配完成 [{}], 耗时: {:?}, 找到 {} 个匹配",
-            direction_label,
-            elapsed,
+            "   ✅ 大类 {} 个 · {:?} · 初筛原始命中 {} 条 · 去重 {} 对 · 统一二筛保留 {} 条",
+            categories_used,
+            start_time.elapsed(),
+            cumulative_raw_hits,
+            n_unique_pairs,
             all_matches.len()
         );
 
         (all_matches, validation_pipeline)
     }
 
+    fn top_k_similarities_for_row(
+        row: ndarray::ArrayView1<f64>,
+        threshold: f64,
+        max_results: usize,
+    ) -> Vec<(usize, f64)> {
+        if max_results == 0 {
+            return Vec::new();
+        }
+        let mut hits: Vec<(usize, f64)> = row
+            .iter()
+            .enumerate()
+            .filter_map(|(j, &s)| (s >= threshold).then_some((j, s)))
+            .collect();
+        hits.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        hits.truncate(max_results);
+        hits
+    }
 
+    fn try_push_pair_candidate(
+        pm_id: &str,
+        ks_id: &str,
+        vector_sim: f64,
+        category: &str,
+        polymarket_cache: &HashMap<String, Arc<Market>>,
+        kalshi_cache: &HashMap<String, Arc<Market>>,
+        seen_accepted: &mut HashSet<(String, String)>,
+        validation_pipeline: &mut ValidationPipeline,
+        config: &MarketMatcherConfig,
+        out: &mut Vec<(Arc<Market>, Arc<Market>, f64, String, String, bool)>,
+    ) {
+        let key = (pm_id.to_string(), ks_id.to_string());
+        if seen_accepted.contains(&key) {
+            return;
+        }
+        let Some(pm_arc) = polymarket_cache.get(pm_id) else {
+            return;
+        };
+        let Some(ks_arc) = kalshi_cache.get(ks_id) else {
+            return;
+        };
+        if let Some(match_info) = validation_pipeline.validate(
+            pm_arc.title.as_str(),
+            ks_arc.title.as_str(),
+            vector_sim,
+            category,
+        ) {
+            let confidence =
+                Self::calculate_confidence(pm_arc.as_ref(), ks_arc.as_ref(), vector_sim, config);
+            if confidence.overall_score >= config.similarity_threshold {
+                seen_accepted.insert(key);
+                out.push((
+                    Arc::clone(pm_arc),
+                    Arc::clone(ks_arc),
+                    confidence.overall_score,
+                    match_info.pm_side,
+                    match_info.kalshi_side,
+                    match_info.needs_inversion,
+                ));
+            }
+        }
+    }
 
     fn calculate_confidence(
         market1: &Market,

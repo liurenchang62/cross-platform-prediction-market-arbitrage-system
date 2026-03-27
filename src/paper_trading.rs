@@ -16,10 +16,9 @@ use crate::arbitrage_detector::{
     PairOrderbookLadders, proceeds_for_exact_contracts_sell,
 };
 use crate::system_params::{
-    paper_settlement_fee_estimate, CASH_UTILIZATION_MAX, KALSHI_DEMO_API_KEY_ID_ENV,
-    KALSHI_DEMO_PRIVATE_KEY_PATH_ENV, LOCAL_TOTAL_USD, PAPER_COOLDOWN_CYCLES, PAPER_INITIAL_CASH,
-    PAPER_MIN_EDGE_EARLY_USD, PAPER_RUN_LABEL_ENV, PAPER_SESSION_COUNTER_FILE, PAPER_TRADES_CSV,
-    PAPER_TRADING_ENABLED, PAPER_WRITE_TRADE_LOG,
+    paper_settlement_fee_estimate, CASH_UTILIZATION_MAX, KALSHI_DEMO_MODE_ENABLED, LOCAL_TOTAL_USD,
+    PAPER_COOLDOWN_CYCLES, PAPER_INITIAL_CASH, PAPER_MIN_EDGE_EARLY_USD, PAPER_RUN_LABEL_ENV,
+    PAPER_SESSION_COUNTER_FILE, PAPER_TRADES_CSV, PAPER_TRADING_ENABLED, PAPER_WRITE_TRADE_LOG,
 };
 
 #[derive(Debug, Clone)]
@@ -530,16 +529,8 @@ impl PaperEngine {
     }
 
     fn append_session_start(&mut self) -> Result<()> {
-        let demo_cfg = std::env::var(KALSHI_DEMO_API_KEY_ID_ENV)
-            .ok()
-            .filter(|s| !s.trim().is_empty())
-            .is_some()
-            && std::env::var(KALSHI_DEMO_PRIVATE_KEY_PATH_ENV)
-                .ok()
-                .filter(|s| !s.trim().is_empty())
-                .is_some();
-        let demo_tag = if demo_cfg {
-            " kalshi_demo_keys_configured=1"
+        let demo_tag = if KALSHI_DEMO_MODE_ENABLED {
+            " kalshi_demo_mode_enabled=1"
         } else {
             ""
         };

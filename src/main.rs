@@ -1,5 +1,5 @@
 // src/main.rs
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
 use std::time::Duration;
@@ -37,8 +37,9 @@ use monitor_logger::MonitorLogger;
 use crate::tracking::{oriented_track_id, MonitorState};
 use crate::system_params::{
     DEMO_REFERENCE_BUDGET_USD, FULL_FETCH_INTERVAL, KALSHI_DEMO_API_KEY_ID_ENV,
-    KALSHI_DEMO_BASE_URL, KALSHI_DEMO_PRIVATE_KEY_PATH_ENV, LOCAL_TOTAL_USD, MAX_RETRIES,
-    RETRY_INITIAL_DELAY_MS, SIMILARITY_THRESHOLD, paper_caps_demo, paper_caps_local,
+    KALSHI_DEMO_BASE_URL, KALSHI_DEMO_MODE_ENABLED, KALSHI_DEMO_PRIVATE_KEY_PATH_ENV,
+    LOCAL_TOTAL_USD, MAX_RETRIES, RETRY_INITIAL_DELAY_MS, SIMILARITY_THRESHOLD, paper_caps_demo,
+    paper_caps_local,
 };
 use crate::market_filter::filter_markets_by_resolution_horizon;
 use crate::arbitrage_detector::build_pair_orderbook_ladders;
@@ -81,33 +82,6 @@ type OpportunityRow = (
     Option<DateTime<Utc>>,
     Option<DateTime<Utc>>,
 );
-
-/// 进程内未形成 `KalshiDemoConfig` 时打印原因（环境变量与磁盘无关，只看**当前进程**是否可见）。
-fn print_kalshi_demo_not_configured_hint() {
-    let has_id = std::env::var(KALSHI_DEMO_API_KEY_ID_ENV)
-        .map(|s| !s.trim().is_empty())
-        .unwrap_or(false);
-    let has_path = std::env::var(KALSHI_DEMO_PRIVATE_KEY_PATH_ENV)
-        .map(|s| !s.trim().is_empty())
-        .unwrap_or(false);
-    println!("   📘 Kalshi Demo 未启用：本进程未加载到可用凭证（将全部记 ks_exec=local）。");
-    if !has_id && !has_path {
-        println!(
-            "      → 需要同时设置 {} 与 {}",
-            KALSHI_DEMO_API_KEY_ID_ENV, KALSHI_DEMO_PRIVATE_KEY_PATH_ENV
-        );
-        println!("      → 环境变量与项目是否在「同一盘符」无关；须在**运行 cargo run 的终端/IDE**里可见。");
-        println!("      → 若在「系统环境变量」里修改过，请**关掉并重新打开**终端或 Cursor 再运行。");
-        println!("      → 可在项目根目录放 `.env`（已 gitignore 的常见做法），程序启动时会尝试自动加载。");
-    } else {
-        if !has_id {
-            println!("      → 缺少或为空: {}", KALSHI_DEMO_API_KEY_ID_ENV);
-        }
-        if !has_path {
-            println!("      → 缺少或为空: {}", KALSHI_DEMO_PRIVATE_KEY_PATH_ENV);
-        }
-    }
-}
 
 fn format_resolution_expiry(label: &str, dt: Option<DateTime<Utc>>) -> String {
     match dt {
@@ -153,27 +127,34 @@ async fn main() -> Result<()> {
     // 初始化客户端
     let polymarket = PolymarketClient::new();
 
-    // Demo 凭证先于 KalshiClient：若启用 Demo 下单，行情/订单簿必须同一基址，否则生产 ticker 在 Demo 会 market_not_found。
-    let kalshi_demo_cfg: Option<KalshiDemoConfig> = KalshiDemoConfig::try_from_env()?;
-    // Kalshi Demo 限价下单是否仍允许（重试耗尽后为 false，纸面回退为纯本地新会话）。
-    let mut demo_trading_active = kalshi_demo_cfg.is_some();
-    let kalshi = if kalshi_demo_cfg.is_some() {
-        println!("   📗 Kalshi 市场与订单簿使用 Demo API（与 Demo 下单 ticker 一致）");
-        KalshiClient::new_with_base_url(KALSHI_DEMO_BASE_URL)
-    } else {
-        KalshiClient::new()
-    };
-    if kalshi_demo_cfg.is_some() {
-        let (pl, pp) = paper_caps_demo();
+    // Kalshi Demo 仅由 `KALSHI_DEMO_MODE_ENABLED` 控制；为 true 时必须配置 `KALSHI_DEMO_*` 环境变量。
+    let (kalshi_demo_cfg, mut demo_trading_active, kalshi) = if KALSHI_DEMO_MODE_ENABLED {
+        let cfg = match KalshiDemoConfig::try_from_env()? {
+            Some(c) => c,
+            None => {
+                bail!(
+                    "KALSHI_DEMO_MODE_ENABLED=true，但未配置 {} 与 {}",
+                    KALSHI_DEMO_API_KEY_ID_ENV,
+                    KALSHI_DEMO_PRIVATE_KEY_PATH_ENV
+                );
+            }
+        };
+        println!("   📗 Kalshi Demo 已开启（system_params）：市场/订单簿使用 Demo API");
         println!("   📗 Kalshi Demo 凭证已加载：IOC 限价单走官方 Demo API");
+        let (pl, pp) = paper_caps_demo();
         println!(
             "   📗 标尺 [demo]：策略参考总盘子 ${} | 每腿探针 ${:.2} | 每对名义上限 ${:.2}",
             DEMO_REFERENCE_BUDGET_USD as i32,
             pl,
             pp
         );
+        (
+            Some(cfg),
+            true,
+            KalshiClient::new_with_base_url(KALSHI_DEMO_BASE_URL),
+        )
     } else {
-        print_kalshi_demo_not_configured_hint();
+        println!("   📒 Kalshi Demo 已关闭（KALSHI_DEMO_MODE_ENABLED=false），使用生产 Trade API");
         let (pl, pp) = paper_caps_local();
         println!(
             "   📒 标尺 [local]：纸面总资金 ${} | 每腿探针 ${:.2} | 每对名义上限 ${:.2}",
@@ -181,7 +162,8 @@ async fn main() -> Result<()> {
             pl,
             pp
         );
-    }
+        (None, false, KalshiClient::new())
+    };
 
     // 初始化匹配器
     let matcher_config = MarketMatcherConfig {
@@ -231,12 +213,60 @@ async fn main() -> Result<()> {
     
     println!("🌲 构建 Polymarket 市场索引...");
     matcher.build_polymarket_index(&polymarket_markets)?;
-    
-    println!("\n✅ 初始化完成");
+
+    println!("\n🔍 初始化 · 全量匹配（周期 #0，沿用本次拉取与索引，不重复请求、不重训）...");
+    let (per_leg_cap, pair_cap) = if demo_trading_active && kalshi_demo_cfg.is_some() {
+        paper_caps_demo()
+    } else {
+        paper_caps_local()
+    };
+    let top10_caption_init = if demo_trading_active && kalshi_demo_cfg.is_some() {
+        format!(
+            "demo · 参考盘子 ${} · 每腿 ${:.2} · 每对 ${:.2}",
+            DEMO_REFERENCE_BUDGET_USD as i32,
+            per_leg_cap,
+            pair_cap
+        )
+    } else {
+        format!(
+            "local · 纸面 ${} · 每腿 ${:.2} · 每对 ${:.2}",
+            LOCAL_TOTAL_USD as i32,
+            per_leg_cap,
+            pair_cap
+        )
+    };
+    run_full_match_work(
+        &polymarket,
+        &kalshi,
+        &mut matcher,
+        &arb_detector,
+        &logger,
+        &mut monitor_state,
+        &polymarket_markets,
+        &kalshi_markets,
+        per_leg_cap,
+        pair_cap,
+        per_leg_cap,
+        &mut paper_engine,
+        &demo_http,
+        kalshi_demo_cfg.as_ref(),
+        &mut demo_trading_active,
+        &top10_caption_init,
+        false,
+    )
+    .await?;
+
+    println!("\n✅ 初始化完成（全量匹配已作为周期 #0 完成）");
     println!("   📊 Kalshi 市场数: {}", kalshi_markets.len());
     println!("   📊 Polymarket 市场数: {}", polymarket_markets.len());
     println!("   📊 Kalshi 索引大小: {}", matcher.kalshi_index_size());
     println!("   📊 Polymarket 索引大小: {}", matcher.polymarket_index_size());
+    println!(
+        "   📌 监控从周期 #1 起为价格追踪；下一全量重建约在周期 #{}",
+        FULL_FETCH_INTERVAL
+    );
+    monitor_state.next_cycle();
+
     println!("\n🔄 开始监控循环 (间隔: 30秒)...\n");
     
     // 主循环
@@ -555,15 +585,16 @@ async fn paper_cycle_start_close_checks(
 
 
 
-/// 执行全量匹配周期
-/// 执行全量匹配周期
-async fn run_full_match_cycle(
+/// 全量匹配的主体：可选是否重训索引；市场切片由调用方提供。
+async fn run_full_match_work(
     polymarket: &PolymarketClient,
     kalshi: &KalshiClient,
     matcher: &mut MarketMatcher,
     arb_detector: &ArbitrageDetector,
     logger: &MonitorLogger,
     monitor_state: &mut MonitorState,
+    polymarket_markets: &[Market],
+    kalshi_markets: &[Market],
     trade_amount: f64,
     pair_cap_usdt: f64,
     per_leg_cap_usd: f64,
@@ -572,30 +603,17 @@ async fn run_full_match_cycle(
     kalshi_demo_cfg: Option<&KalshiDemoConfig>,
     demo_trading_active: &mut bool,
     top10_mode_caption: &str,
+    rebuild_index: bool,
 ) -> Result<(usize, usize, String, String)> {
-    println!("   📡 执行全量匹配...");
-    
-    // 获取全量市场
-    let polymarket_raw: Vec<Market> = polymarket.fetch_all_markets().await?;
-    let kalshi_raw: Vec<Market> = kalshi.fetch_all_markets().await?;
-    let now = Utc::now();
-    // 21d：`Market.resolution_date`（PM endDate 链 / Kalshi expected_expiration 优先），与终端「到期」一致
-    let polymarket_markets = filter_markets_by_resolution_horizon(polymarket_raw, now);
-    let kalshi_markets = filter_markets_by_resolution_horizon(kalshi_raw, now);
+    if rebuild_index {
+        println!("\n   🔄 重建索引...");
+        matcher.fit_vectorizer(kalshi_markets, polymarket_markets)?;
+        matcher.build_kalshi_index(kalshi_markets)?;
+        matcher.build_polymarket_index(polymarket_markets)?;
+    }
 
-    println!(
-        "      Polymarket: {} 个市场 (21d 窗口内), Kalshi: {} 个市场 (21d 窗口内)",
-        polymarket_markets.len(),
-        kalshi_markets.len()
-    );
-    
-    println!("\n   🔄 重建索引...");
-    matcher.fit_vectorizer(&kalshi_markets, &polymarket_markets)?;
-    matcher.build_kalshi_index(&kalshi_markets)?;
-    matcher.build_polymarket_index(&polymarket_markets)?;
-    
     println!("   🔍 匹配市场...");
-    let raw_matches = matcher.find_matches_bidirectional(&polymarket_markets, &kalshi_markets).await;
+    let raw_matches = matcher.find_matches_bidirectional(polymarket_markets, kalshi_markets).await;
     let base_pairs = raw_matches.len();
     let matches = expand_dual_orientations(raw_matches);
     println!(
@@ -675,6 +693,58 @@ async fn run_full_match_cycle(
     Ok((matches.len(), verified_count, top10_block, full_cycle_block))
 }
 
+/// 执行全量匹配周期（重新拉取市场并重训索引后匹配）
+async fn run_full_match_cycle(
+    polymarket: &PolymarketClient,
+    kalshi: &KalshiClient,
+    matcher: &mut MarketMatcher,
+    arb_detector: &ArbitrageDetector,
+    logger: &MonitorLogger,
+    monitor_state: &mut MonitorState,
+    trade_amount: f64,
+    pair_cap_usdt: f64,
+    per_leg_cap_usd: f64,
+    paper: &mut Option<PaperEngine>,
+    demo_http: &HttpClient,
+    kalshi_demo_cfg: Option<&KalshiDemoConfig>,
+    demo_trading_active: &mut bool,
+    top10_mode_caption: &str,
+) -> Result<(usize, usize, String, String)> {
+    println!("   📡 执行全量匹配（拉取最新市场并重建索引）...");
+
+    let polymarket_raw: Vec<Market> = polymarket.fetch_all_markets().await?;
+    let kalshi_raw: Vec<Market> = kalshi.fetch_all_markets().await?;
+    let now = Utc::now();
+    let polymarket_markets = filter_markets_by_resolution_horizon(polymarket_raw, now);
+    let kalshi_markets = filter_markets_by_resolution_horizon(kalshi_raw, now);
+
+    println!(
+        "      Polymarket: {} 个市场 (21d 窗口内), Kalshi: {} 个市场 (21d 窗口内)",
+        polymarket_markets.len(),
+        kalshi_markets.len()
+    );
+
+    run_full_match_work(
+        polymarket,
+        kalshi,
+        matcher,
+        arb_detector,
+        logger,
+        monitor_state,
+        &polymarket_markets,
+        &kalshi_markets,
+        trade_amount,
+        pair_cap_usdt,
+        per_leg_cap_usd,
+        paper,
+        demo_http,
+        kalshi_demo_cfg,
+        demo_trading_active,
+        top10_mode_caption,
+        true,
+    )
+    .await
+}
 
 /// 执行价格追踪周期
 /// 执行价格追踪周期
