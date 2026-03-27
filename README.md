@@ -14,6 +14,10 @@ The repository is a **Cargo workspace**: the main binary is `arbitrage-monitor` 
 
 - **Market data**: Loads open markets from the Polymarket Gamma API and the Kalshi Trade API, with configurable pagination and upper bounds.
 - **Matching**: TF-IDF-style text vectors and cosine similarity; optional category constraints and scoring from `config/categories.toml`.
+
+### Matching volume: raw hits vs. final pairs
+
+Full runs typically log three stages: **raw vector hits** (bidirectional Top-K rows, with duplicates), **deduped candidate pairs** `(Polymarket id, Kalshi id)` keeping the best cosine score, then **final pairs** after `ValidationPipeline` rules and the configurable confidence gate. A **small** final count together with a **large** deduped middle (e.g. thousands of candidates reduced to on the order of 10² pairs) usually means the **second pass is doing most of the filtering**, not that matrix matching failed to generate neighbours. Raising recall is a tuning problem (`SIMILARITY_TOP_K`, `SIMILARITY_THRESHOLD`, category coverage in `config/categories.toml`), not a sign the batched matmul path is dropping pairs after dedup.
 - **Execution-style PnL**: For each candidate pair, costs and net profit for a **notional-capped, depth-walked** buy scenario are derived from **parsed ask ladders** on both venues (see **Order-book PnL model**).
 - **Tracking**: Maintains a set of tracked pairs across cycles, with periodic full rebuilds and parameter-driven intervals (`src/system_params.rs`).
 - **Cycle statistics**: Global and per-big-period (full-match window) rollups of arbitrage hit counts and capital summaries, without changing detector logic (`src/cycle_statistics.rs`).
