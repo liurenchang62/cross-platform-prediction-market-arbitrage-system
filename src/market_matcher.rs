@@ -3,13 +3,12 @@
 
 use crate::market::Market;
 use crate::category_mapper::CategoryMapper;
-use crate::unclassified_logger::UnclassifiedLogger;
 use crate::system_params::{
     MATCH_MATMUL_CHUNK_ROWS, SIMILARITY_THRESHOLD, SIMILARITY_TOP_K,
 };
 use crate::category_vectorizer::{CategoryVectorizer, CategoryVectorizerManager};
 use crate::text_vectorizer::{TextVectorizer, VectorizerConfig};
-use crate::validation::ValidationPipeline;
+use crate::validation::{second_screen_try_match, ValidationPipeline};
 use rayon::prelude::*;
 use tokio::task;
 
@@ -66,7 +65,6 @@ impl Default for MarketMatcherConfig {
 pub struct MarketMatcher {
     pub config: MarketMatcherConfig,
     pub category_mapper: CategoryMapper,
-    pub unclassified_logger: Option<UnclassifiedLogger>,
     pub kalshi_vectorizers: Arc<CategoryVectorizerManager>,
     pub polymarket_vectorizers: Arc<CategoryVectorizerManager>,
     pub fitted: bool,
@@ -80,7 +78,6 @@ impl MarketMatcher {
         Self {
             config,
             category_mapper,
-            unclassified_logger: None,
             kalshi_vectorizers: Arc::new(CategoryVectorizerManager::new()),
             polymarket_vectorizers: Arc::new(CategoryVectorizerManager::new()),
             fitted: false,
@@ -88,11 +85,6 @@ impl MarketMatcher {
             polymarket_market_cache: Arc::new(HashMap::new()),
             validation_pipeline: ValidationPipeline::new(),
         }
-    }
-
-    pub fn with_logger(mut self, logger: UnclassifiedLogger) -> Self {
-        self.unclassified_logger = Some(logger);
-        self
     }
 
     /// 按类别并行建索引：与串行逐类 `add_markets_batch` 数学上等价，不改变近邻与匹配结果。
@@ -227,11 +219,6 @@ impl MarketMatcher {
             }));
             
             if categories.is_empty() {
-                if let Some(logger) = &mut self.unclassified_logger {
-                    if let Err(e) = logger.log_unclassified(market) {
-                        eprintln!("   ⚠️ 记录未分类市场失败: {}", e);
-                    }
-                }
                 by_category
                     .entry("unclassified".to_string())
                     .or_insert_with(Vec::new)
@@ -277,11 +264,6 @@ impl MarketMatcher {
             }));
             
             if categories.is_empty() {
-                if let Some(logger) = &mut self.unclassified_logger {
-                    if let Err(e) = logger.log_unclassified(market) {
-                        eprintln!("   ⚠️ 记录未分类市场失败: {}", e);
-                    }
-                }
                 by_category
                     .entry("unclassified".to_string())
                     .or_insert_with(Vec::new)
@@ -581,20 +563,69 @@ impl MarketMatcher {
             .map(|((pm, ks), (sim, cat))| (pm, ks, sim, cat))
             .collect();
         merged.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        let merged_len = merged.len();
+        let mut second_screen_outcomes: Vec<(usize, Option<Option<crate::validation::MatchInfo>>)> =
+            (0..merged_len)
+                .into_par_iter()
+                .map(|k| {
+                    let (pm_id, ks_id, sim, cat) = &merged[k];
+                    let Some(pm_arc) = polymarket_cache.get(pm_id.as_str()) else {
+                        return (k, None);
+                    };
+                    let Some(ks_arc) = kalshi_cache.get(ks_id.as_str()) else {
+                        return (k, None);
+                    };
+                    let mi = second_screen_try_match(
+                        pm_arc.title.as_str(),
+                        ks_arc.title.as_str(),
+                        *sim,
+                        cat.as_str(),
+                    );
+                    (k, Some(mi))
+                })
+                .collect();
+        second_screen_outcomes.sort_by_key(|(idx, _)| *idx);
+
         let mut seen_accepted: HashSet<(String, String)> = HashSet::new();
-        for (pm_id, ks_id, sim, cat) in merged {
-            Self::try_push_pair_candidate(
-                &pm_id,
-                &ks_id,
-                sim,
-                &cat,
-                polymarket_cache,
-                kalshi_cache,
-                &mut seen_accepted,
-                &mut validation_pipeline,
-                config,
-                &mut all_arc,
-            );
+        for k in 0..merged_len {
+            let (pm_id, ks_id, sim, _cat) = &merged[k];
+            let (_, outcome) = &second_screen_outcomes[k];
+            match outcome {
+                None => {}
+                Some(None) => {
+                    validation_pipeline.filtered_count += 1;
+                }
+                Some(Some(match_info)) => {
+                    let key = (pm_id.clone(), ks_id.clone());
+                    if seen_accepted.contains(&key) {
+                        continue;
+                    }
+                    let Some(pm_arc) = polymarket_cache.get(pm_id.as_str()) else {
+                        continue;
+                    };
+                    let Some(ks_arc) = kalshi_cache.get(ks_id.as_str()) else {
+                        continue;
+                    };
+                    validation_pipeline.record_retained(match_info);
+                    let confidence = Self::calculate_confidence(
+                        pm_arc.as_ref(),
+                        ks_arc.as_ref(),
+                        *sim,
+                        config,
+                    );
+                    if confidence.overall_score >= config.similarity_threshold {
+                        seen_accepted.insert(key);
+                        all_arc.push((
+                            Arc::clone(pm_arc),
+                            Arc::clone(ks_arc),
+                            confidence.overall_score,
+                            match_info.pm_side.clone(),
+                            match_info.kalshi_side.clone(),
+                            match_info.needs_inversion,
+                        ));
+                    }
+                }
+            }
         }
 
         let all_matches: Vec<(Market, Market, f64, String, String, bool)> = all_arc
@@ -630,50 +661,6 @@ impl MarketMatcher {
         hits.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         hits.truncate(max_results);
         hits
-    }
-
-    fn try_push_pair_candidate(
-        pm_id: &str,
-        ks_id: &str,
-        vector_sim: f64,
-        category: &str,
-        polymarket_cache: &HashMap<String, Arc<Market>>,
-        kalshi_cache: &HashMap<String, Arc<Market>>,
-        seen_accepted: &mut HashSet<(String, String)>,
-        validation_pipeline: &mut ValidationPipeline,
-        config: &MarketMatcherConfig,
-        out: &mut Vec<(Arc<Market>, Arc<Market>, f64, String, String, bool)>,
-    ) {
-        let key = (pm_id.to_string(), ks_id.to_string());
-        if seen_accepted.contains(&key) {
-            return;
-        }
-        let Some(pm_arc) = polymarket_cache.get(pm_id) else {
-            return;
-        };
-        let Some(ks_arc) = kalshi_cache.get(ks_id) else {
-            return;
-        };
-        if let Some(match_info) = validation_pipeline.validate(
-            pm_arc.title.as_str(),
-            ks_arc.title.as_str(),
-            vector_sim,
-            category,
-        ) {
-            let confidence =
-                Self::calculate_confidence(pm_arc.as_ref(), ks_arc.as_ref(), vector_sim, config);
-            if confidence.overall_score >= config.similarity_threshold {
-                seen_accepted.insert(key);
-                out.push((
-                    Arc::clone(pm_arc),
-                    Arc::clone(ks_arc),
-                    confidence.overall_score,
-                    match_info.pm_side,
-                    match_info.kalshi_side,
-                    match_info.needs_inversion,
-                ));
-            }
-        }
     }
 
     fn calculate_confidence(

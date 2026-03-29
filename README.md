@@ -4,11 +4,11 @@
 
 ## Overview
 
-`arbitrage-monitor` is a **Rust** application that discovers cross-venue relationships between **Polymarket** and **Kalshi** prediction markets, keeps a watchlist of high-confidence pairs, and evaluates executable economics from **live order-book data**. It performs **read-only analysis** and does not submit orders.
+`arbitrage-monitor` is a **Rust** application that discovers cross-venue relationships between **Polymarket** and **Kalshi** prediction markets, keeps a watchlist of high-confidence pairs, and evaluates executable economics from **live order-book data**. After strict validation it places **live orders** via official production APIs (Kalshi IOC, Polymarket CLOB FOK market buy), logging fills and request summaries to **`logs/live_trades.csv`**.
 
-The pipeline combines text-based market matching (vector similarity and category rules), scheduled full refreshes and incremental tracking cycles, and structured logging under `logs/`.
+The pipeline combines text-based market matching (vector similarity and category rules), scheduled full refreshes and incremental tracking cycles, console output, and that CSV.
 
-The repository is a **Cargo workspace**: the main binary is `arbitrage-monitor` (package root), and a separate **`backtest`** crate provides an interactive CLI to summarize paper-trading CSVs by session.
+The repository is a **Cargo workspace**: the main binary is `arbitrage-monitor` (package root), and a separate **`backtest`** crate summarizes **legacy paper-trading** sessions in `logs/paper_trades.csv` format (schema differs from the live CSV).
 
 ## Features
 
@@ -21,10 +21,9 @@ Full runs typically log three stages: **raw vector hits** (bidirectional Top-K r
 - **Execution-style PnL**: For each candidate pair, costs and net profit for a **notional-capped, depth-walked** buy scenario are derived from **parsed ask ladders** on both venues (see **Order-book PnL model**).
 - **Tracking**: Maintains a set of tracked pairs across cycles, with periodic full rebuilds and parameter-driven intervals (`src/system_params.rs`).
 - **Cycle statistics**: Global and per-big-period (full-match window) rollups of arbitrage hit counts and capital summaries, without changing detector logic (`src/cycle_statistics.rs`).
-- **Logging**: Cycle outputs and monitor CSVs under `logs/`; unmatched or low-signal items may be recorded under `logs/unclassified/`.
-- **Paper trading (optional)**: Set **`PAPER_TRADING_ENABLED`** to `true` in `src/system_params.rs`; CSV output is gated by **`PAPER_WRITE_TRADE_LOG`**. Logic in `src/paper_trading.rs`, details in `docs/PAPER_TRADING.md`. Each process run gets a monotonic **`session_id`**; the log includes **session start** and **session end** marker rows (with wall time, last seen monitor cycle, and end reason) so post-hoc tools can segment runs without splitting a session at calendar boundaries.
-- **Paper backtest CLI (`backtest`)**: After selecting a **UTC calendar day** (by **session start** time only), choose a session to view a framed **management-style** summary: **capital & equity**, **cost rollup**, a short **P&L** block (realized vs open-leg hold-to-maturity estimate, then **total**), **yields vs the matching cost bases**, wall-clock span, and monitor **cycle count** span. Amounts use **parentheses for negatives** (common financial statement convention). See **Paper backtest tool** below.
-- **Kalshi Demo helpers (library + optional bin)**: `src/kalshi_demo.rs` implements RSA-PSS signing and demo API helpers used by the main crate when credentials are configured; `cargo run --bin kalshi_balance` is a small **read-only** probe for demo **portfolio balance** (see **Optional: Kalshi Demo balance probe**).
+- **Live trade log**: The main loop persists **`logs/live_trades.csv`** only (no monitor or paper CSV).
+- **Paper backtest CLI (`backtest`)**: Still reads **`logs/paper_trades.csv`-style** historical logs (columns differ from the live CSV). See **Paper backtest tool** below.
+- **Kalshi balance probe**: `cargo run --bin kalshi_balance` queries **production** `GET /portfolio/balance`; credentials match the main binary (below).
 
 ## Order-book PnL model
 
@@ -33,8 +32,8 @@ The scenario used for reporting (e.g. Top-10 and `net_profit_100`) is defined as
 1. **Order-book snapshots**  
    For a matched pair, the program requests the **current** Polymarket and Kalshi **order books** over HTTP and parses resting liquidity into **ascending ask ladders** `(price, size)`.
 
-2. **Per-leg notional cap**  
-   Each leg is allocated a maximum spend of **100 USDT** (`PAPER_PER_LEG_CAP_USDT` in `src/system_params.rs`, used for monitoring and paper). The ladder is traversed level by level until that cap is reached or liquidity is exhausted (`calculate_slippage_with_fixed_usdt` in `src/arbitrage_detector.rs`), yielding a **fillable contract count** per venue.
+2. **Per-leg notional cap (probe)**  
+   **`TOTAL_CAPITAL_USD`** (default 1000 USD) × **`PER_LEG_CAP_FRAC_OF_CAPITAL`** (default 0.005 per leg) gives the per-leg cap (`arb_probe_caps()`). The ladder is traversed until that cap is reached or liquidity is exhausted (`calculate_slippage_with_fixed_usdt`), yielding a **fillable contract count** per venue.
 
 3. **Hedged size**  
    The scenario size **n** is the **minimum** of the two per-leg contract counts so that both legs can be notionally filled at the same size.
@@ -69,27 +68,28 @@ cargo run -p backtest
 - **Calendar rule**: Only sessions whose **start** timestamp falls on the chosen UTC day are listed; metrics always use **all** rows for that `session_id` (multi-day runs are not cut at midnight for reporting).
 - **Report layout**: Session metrics are grouped (overview, time span, balances, positions, costs, P&L, yields). Footnotes explain calendar rules, cost attribution, and why per-line yields need not sum to the headline yield.
 
-### Optional: Kalshi Demo balance probe
+### Kalshi production balance probe
 
 ```bash
 cargo run --bin kalshi_balance
 ```
 
-- Queries Kalshi **demo** `GET /portfolio/balance` with RSA-PSS-SHA256 auth.
-- Reads a project-root **`.env`** if present (`dotenvy`).
-- Requires **`KALSHI_DEMO_API_KEY_ID`** and **`KALSHI_DEMO_PRIVATE_KEY_PATH`** (path to a PEM private key). Same names as in `src/system_params.rs` (`KALSHI_DEMO_API_KEY_ID_ENV`, `KALSHI_DEMO_PRIVATE_KEY_PATH_ENV`).
+- Queries Kalshi **production** Trade API `GET /portfolio/balance` with RSA-PSS-SHA256 auth.
+- **No `.env`**: configure **system or user** environment variables (Windows: Environment Variables; Unix: `export` / shell rc).
+- **`KALSHI_API_KEY_ID`** and **`KALSHI_PRIVATE_KEY_PATH`** (PEM path); names in `src/system_params.rs`.
 
 ## Configuration
 
 | Path | Purpose |
 |------|---------|
 | `config/categories.toml` | Category names, weights, and keywords for classification and matching |
-| `src/system_params.rs` | HTTP/matching/window constants; paper switches (`PAPER_TRADING_ENABLED`, `PAPER_WRITE_TRADE_LOG`, …), CSV paths |
+| `src/system_params.rs` | HTTP/matching/window, reference capital and per-pair/per-leg fractions, live CSV path, env var name constants |
 
-### Optional environment variables
+### Environment variables
 
-- **`POLYMARKET_TAG_SLUG`**: When set, Polymarket market fetches may be restricted by tag (see `src/clients.rs`).
-- **`PAPER_RUN_LABEL`** (optional): appended to paper CSV `notes`; see `PAPER_RUN_LABEL_ENV` in `src/system_params.rs`.
+- **Live credentials (required)**: `KALSHI_API_KEY_ID`, `KALSHI_PRIVATE_KEY_PATH`; `POLYMARKET_PRIVATE_KEY` (hex, matches official SDK); optional `POLYMARKET_SIGNATURE_TYPE` (`0`/`1`/`2`).
+- **Data (optional)**: `POLYMARKET_TAG_SLUG` for Polymarket tag filtering (`src/clients.rs`).
+- **Backtest (optional)**: `PAPER_TRADES_CSV` path for paper session analysis.
 
 ## Repository layout
 
@@ -107,10 +107,11 @@ src/                    Package `arbitrage-monitor`
   validation.rs         Validation helpers
   tracking.rs           Per-cycle monitor state
   cycle_statistics.rs   Cumulative cycle stats (global / per big period)
-  paper_trading.rs      Optional paper trading / positions
-  kalshi_demo.rs        Kalshi Demo API signing and related helpers (library)
+  live_trades.rs        Live trade CSV logging
+  kalshi_trade.rs       Kalshi production orders
+  polymarket_trade.rs   Polymarket CLOB live orders
   bin/
-    kalshi_balance.rs   Optional CLI: demo portfolio balance
+    kalshi_balance.rs   Optional CLI: production portfolio balance
 backtest/               Package `backtest` — paper CSV performance CLI
 config/
   categories.toml

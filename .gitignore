@@ -16,6 +16,9 @@ Thumbs.db
 *.log
 /logs/
 
+# API 探针脚本输出（公开行情 JSON，勿入库）
+/tmp_api_probe/
+
 # 环境变量
 .env
 .env.*

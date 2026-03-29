@@ -1,13 +1,10 @@
-use crate::market::{Market, MarketPrices};
+use crate::market::Market;
 use crate::system_params::*;
 use anyhow::{Context, Result};
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 use reqwest::Client;
 use serde_json::Value;
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
-use tokio::sync::RwLock;
+use std::time::Duration;
 use tokio::time::sleep;
 
 /// Gamma `events[].markets[]` 或 `GET /markets` 单条：`endDate`（RFC3339）写入 `resolution_date`；与 Kalshi 展示对齐时见 `parse_kalshi_market_resolution_date`。
@@ -151,62 +148,6 @@ pub(crate) fn parse_kalshi_market_resolution_date(market_data: &Value) -> Option
 
 
 
-// PriceCache 结构体定义
-struct PriceCacheEntry {
-    prices: MarketPrices,
-    timestamp: Instant,
-}
-
-struct PriceCache {
-    entries: Arc<RwLock<HashMap<String, PriceCacheEntry>>>,
-    ttl: Duration,
-}
-
-impl PriceCache {
-    fn new(ttl_secs: u64) -> Self {
-        Self {
-            entries: Arc::new(RwLock::new(HashMap::new())),
-            ttl: Duration::from_secs(ttl_secs),
-        }
-    }
-
-    async fn get(&self, key: &str) -> Option<MarketPrices> {
-        let entries = self.entries.read().await;
-        if let Some(entry) = entries.get(key) {
-            if entry.timestamp.elapsed() < self.ttl {
-                return Some(entry.prices.clone());
-            }
-        }
-        None
-    }
-
-    async fn set(&self, key: String, prices: MarketPrices) {
-        let mut entries = self.entries.write().await;
-        entries.insert(key, PriceCacheEntry {
-            prices,
-            timestamp: Instant::now(),
-        });
-    }
-
-    /// 清空缓存（用于追踪周期边界：与 wall-clock TTL 解耦，每周期重新拉价）
-    async fn clear(&self) {
-        let mut entries = self.entries.write().await;
-        entries.clear();
-    }
-}
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 
@@ -218,8 +159,6 @@ impl PriceCache {
 #[derive(Clone)]
 pub struct PolymarketClient {
     http_client: Client,
-    base_url: String,
-    price_cache: Arc<PriceCache>,
 }
 
 
@@ -232,11 +171,7 @@ impl PolymarketClient {
             .build()
             .unwrap_or_else(|_| Client::new());
         
-        Self {
-            http_client,
-            base_url: "https://gamma-api.polymarket.com".to_string(),
-            price_cache: Arc::new(PriceCache::new(60)),
-        }
+        Self { http_client }
     }
 
     const GAMMA_API_BASE: &str = "https://gamma-api.polymarket.com";
@@ -381,44 +316,6 @@ impl PolymarketClient {
             Ok(markets)
         }
 
-
-
-
-
-    pub async fn fetch_prices(&self, market: &Market) -> Result<MarketPrices> {
-        if let Some(cached) = self.price_cache.get(&market.market_id).await {
-            return Ok(cached);
-        }
-
-        let (yes_price, no_price) = match market.outcome_prices {
-            Some((yes, no)) => (yes, no),
-            None => {
-                match (market.best_ask, market.best_bid, market.last_trade_price) {
-                    (Some(ask), Some(bid), _) => ((ask + bid) / 2.0, 1.0 - ((ask + bid) / 2.0)),
-                    (Some(ask), None, _) => (ask, 1.0 - ask),
-                    (None, Some(bid), _) => (bid, 1.0 - bid),
-                    (None, None, Some(last)) => (last, 1.0 - last),
-                    _ => return Err(anyhow::anyhow!("No price data available")),
-                }
-            }
-        };
-
-        let prices = MarketPrices::new(yes_price, no_price, 0.0)
-            .with_asks(
-                market.best_ask.unwrap_or(yes_price),
-                market.best_bid.map(|b| 1.0 - b).unwrap_or(no_price),
-                market.last_trade_price,
-            );
-
-        self.price_cache.set(market.market_id.clone(), prices.clone()).await;
-        Ok(prices)
-    }
-
-    /// 追踪周期边界：清空 Polymarket 价格内存缓存，使本周期内 `fetch_prices` 按周期重新计算（与 60s TTL 解耦）。
-    pub async fn clear_price_cache(&self) {
-        self.price_cache.clear().await;
-    }
-
     /// Gamma `GET /markets?id=...&limit=1`：拉取单市场快照（用于追踪周期刷新 outcome/bestAsk 等，与全量列表同源）。
     pub async fn fetch_market_snapshot_by_id(&self, market_id: &str) -> Result<Market> {
         if market_id.is_empty() {
@@ -498,7 +395,6 @@ const KALSHI_DEFAULT_BASE: &str = "https://api.elections.kalshi.com/trade-api/v2
 pub struct KalshiClient {
     http_client: Client,
     base_url: String,
-    price_cache: Arc<PriceCache>,
 }
 
 impl KalshiClient {
@@ -507,7 +403,6 @@ impl KalshiClient {
     }
 
     /// 自定义 Trade API 根 URL（须含 `/trade-api/v2`，无末尾 `/`）。
-    /// Demo 真下单时需与 `KALSHI_DEMO_BASE_URL` 一致，否则生产 ticker 在 Demo 会 `market_not_found`。
     pub fn new_with_base_url(base_url: impl AsRef<str>) -> Self {
         let http_client = Client::builder()
             .timeout(Duration::from_secs(10))
@@ -521,7 +416,6 @@ impl KalshiClient {
         Self {
             http_client,
             base_url: base,
-            price_cache: Arc::new(PriceCache::new(60)),
         }
     }
 
@@ -760,71 +654,6 @@ impl KalshiClient {
 
 
 
-
-
-
-
-
-
-    pub async fn get_market_prices(&self, ticker: &str) -> Result<Option<MarketPrices>> {
-        if let Some(cached) = self.price_cache.get(ticker).await {
-            return Ok(Some(cached));
-        }
-        
-        let url = format!("{}/markets/{}", self.base_url, ticker);
-        
-        let response = self
-            .http_client
-            .get(&url)
-            .send()
-            .await
-            .context("Failed to fetch Kalshi market")?;
-        
-        if !response.status().is_success() {
-            return Ok(None);
-        }
-        
-        let data: serde_json::Value = response.json().await?;
-        
-        if let Some(market) = data.get("market") {
-            let yes_ask_dollars_str = market["yes_ask_dollars"].as_str().unwrap_or("0");
-            let yes_bid_dollars_str = market["yes_bid_dollars"].as_str().unwrap_or("0");
-            
-            let yes_ask_dollars = yes_ask_dollars_str.parse::<f64>().unwrap_or(0.0);
-            let yes_bid_dollars = yes_bid_dollars_str.parse::<f64>().unwrap_or(0.0);
-            
-            let last_price_cents = market["last_price"]
-                .as_i64()
-                .or_else(|| {
-                    market["last_price_dollars"]
-                        .as_str()
-                        .and_then(|s| s.parse::<f64>().ok())
-                        .map(|v| (v * 100.0) as i64)
-                });
-            
-            let volume = market["volume_24h_fp"].as_f64().unwrap_or(0.0);
-            
-            let yes_price = (yes_ask_dollars + yes_bid_dollars) / 2.0;
-            let no_price = 1.0 - yes_price;
-            
-            let prices = MarketPrices::new(yes_price, no_price, volume)
-                .with_asks(
-                    yes_ask_dollars,
-                    1.0 - yes_bid_dollars,
-                    last_price_cents.map(|v| v as f64 / 100.0)
-                );
-            
-            self.price_cache.set(ticker.to_string(), prices.clone()).await;
-            return Ok(Some(prices));
-        }
-        
-        Ok(None)
-    }
-
-    /// 追踪周期边界：清空 Kalshi 价格内存缓存，使本周期内 `get_market_prices` 重新请求 API（与 60s TTL 解耦）。
-    pub async fn clear_price_cache(&self) {
-        self.price_cache.clear().await;
-    }
 
     /// `GET /markets/{ticker}`，从响应 `market` 对象解析到期日
     pub async fn fetch_resolution_by_ticker(&self, ticker: &str) -> Option<DateTime<Utc>> {

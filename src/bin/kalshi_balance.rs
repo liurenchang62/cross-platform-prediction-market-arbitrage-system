@@ -1,5 +1,8 @@
-//! 一次性查询 Kalshi Demo `GET /portfolio/balance`（读项目根 `.env`）。
-//! 运行：`cargo run --bin kalshi_balance`（须在含 `Cargo.toml` 的目录执行）
+//! 查询 Kalshi 生产环境 `GET /portfolio/balance`（凭证仅来自系统环境变量）。
+//! `KALSHI_API_KEY_ID`、`KALSHI_PRIVATE_KEY_PATH`；运行：`cargo run --bin kalshi_balance`
+
+#[path = "../system_params.rs"]
+mod system_params;
 
 use anyhow::{Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
@@ -12,9 +15,10 @@ use rsa::RsaPrivateKey;
 use serde_json::Value;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const KEY_ID_ENV: &str = "KALSHI_DEMO_API_KEY_ID";
-const KEY_PATH_ENV: &str = "KALSHI_DEMO_PRIVATE_KEY_PATH";
-const DEMO_BASE: &str = "https://demo-api.kalshi.co/trade-api/v2";
+/// 与 `system_params::KALSHI_*` 一致
+const KEY_ID_ENV: &str = "KALSHI_API_KEY_ID";
+const KEY_PATH_ENV: &str = "KALSHI_PRIVATE_KEY_PATH";
+const PROD_BASE: &str = "https://api.elections.kalshi.com/trade-api/v2";
 const SIGN_PATH: &str = "/trade-api/v2/portfolio/balance";
 
 fn sign(key: &RsaPrivateKey, ts: &str) -> Result<String> {
@@ -34,16 +38,19 @@ fn ts_ms() -> String {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let _ = dotenvy::dotenv();
     let key_id = std::env::var(KEY_ID_ENV).context(KEY_ID_ENV)?;
-    let pem_path = std::env::var(KEY_PATH_ENV).context(KEY_PATH_ENV)?;
+    let pem_path_raw = std::env::var(KEY_PATH_ENV).context(KEY_PATH_ENV)?;
+    let pem_path = system_params::normalize_env_file_path(&pem_path_raw);
+    if pem_path.is_empty() {
+        anyhow::bail!("{KEY_PATH_ENV} 去掉空白与引号后为空");
+    }
     let mut pem = std::fs::read_to_string(&pem_path).context("read pem")?;
     if pem.starts_with('\u{FEFF}') {
         pem.remove(0);
     }
     let pk = RsaPrivateKey::from_pkcs1_pem(pem.trim()).context("PEM PKCS#1")?;
 
-    let url = format!("{}/portfolio/balance", DEMO_BASE.trim_end_matches('/'));
+    let url = format!("{}/portfolio/balance", PROD_BASE.trim_end_matches('/'));
     let t = ts_ms();
     let sig = sign(&pk, &t)?;
 

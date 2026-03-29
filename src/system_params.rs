@@ -1,134 +1,213 @@
-// system_params.rs
-//! 系统级常量：HTTP/分页、匹配与索引、市场窗口、模拟交易（Paper）等。
+//! 实盘套利监控：HTTP/分页、匹配与索引、资金标尺、Kalshi/Polymarket 环境变量名。
 
-// ==================== 通用参数 ====================
-/// 请求间隔（毫秒）
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use anyhow::{bail, Context, Result};
+
+// ==================== 仅跟踪 vs 实盘：下单安全锁 ====================
+/// 仅当用户在启动时选择**实盘**并输入 `YES` 后为 `true`；**仅跟踪**恒为 `false`。  
+/// 任何可能改变资金/仓位的请求入口处必须 [`require_live_orders_allowed`]，防止误调用。
+static LIVE_ARBITRAGE_ORDERS_ALLOWED: AtomicBool = AtomicBool::new(false);
+
+/// 在 `main` 解析交互选项后立即调用一次（早于加载秘钥亦无妨，但须与 `live_trading` 一致）。
+pub fn set_live_arbitrage_orders_allowed(allowed: bool) {
+    LIVE_ARBITRAGE_ORDERS_ALLOWED.store(allowed, Ordering::SeqCst);
+}
+
+#[inline]
+pub fn live_arbitrage_orders_allowed() -> bool {
+    LIVE_ARBITRAGE_ORDERS_ALLOWED.load(Ordering::SeqCst)
+}
+
+/// Kalshi IOC、PM FOK、止损卖平/对冲等路径的硬门槛：仅跟踪下直接返回 Err，不发起 HTTP 下单。
+pub fn require_live_orders_allowed() -> Result<()> {
+    if !live_arbitrage_orders_allowed() {
+        bail!(
+            "安全锁：当前为仅跟踪模式，禁止执行下单/卖平等任何可能改变资金或仓位的请求；\
+             秘钥在本进程中仅用于鉴权 API（如订单簿、fee_changes、fee-rate）。\
+             若需真实下单请重启并选择实盘模式。"
+        );
+    }
+    Ok(())
+}
+
+// ==================== 通用 HTTP ====================
 pub const REQUEST_INTERVAL_MS: u64 = 200;
-
-/// 最大重试次数
 pub const MAX_RETRIES: u32 = 3;
-
-/// 重试初始等待时间（毫秒）
 pub const RETRY_INITIAL_DELAY_MS: u64 = 1000;
 
-// ==================== Polymarket 参数 ====================
-/// Polymarket 单次请求最大事件数
+// ==================== Polymarket（Gamma / CLOB 读） ====================
 pub const POLYMARKET_PAGE_LIMIT: u32 = 200;
-
-/// Polymarket 最大获取市场数
 pub const POLYMARKET_MAX_MARKETS: usize = 40000;
 
-// ==================== Kalshi 参数 ====================
-/// Kalshi 每页市场数
+// ==================== Kalshi（行情） ====================
 pub const KALSHI_PAGE_LIMIT: u32 = 1000;
-
-/// Kalshi 最大获取市场数
 pub const KALSHI_MAX_MARKETS: usize = 40000;
 
-/// **Kalshi Demo 总开关**（唯一控制，无需依赖其它操作）  
-/// - `true`：读取 `KALSHI_DEMO_*` 环境变量，使用 Demo API 基址与 Demo 下单能力；未配置则启动失败。  
-/// - `false`：始终使用生产 Trade API，**忽略** Demo 环境变量。
-pub const KALSHI_DEMO_MODE_ENABLED: bool = false;
+/// 生产环境 Trade API 根（无末尾 `/`）。与官方文档一致。
+pub const KALSHI_TRADE_API_BASE: &str = "https://api.elections.kalshi.com/trade-api/v2";
 
-/// Kalshi Demo API（`KALSHI_DEMO_MODE_ENABLED=true` 且凭证有效时，`KalshiClient` 与下单均指向本 base）
-pub const KALSHI_DEMO_BASE_URL: &str = "https://demo-api.kalshi.co/trade-api/v2";
-
-/// Demo API Key ID（UUID 形态）
-pub const KALSHI_DEMO_API_KEY_ID_ENV: &str = "KALSHI_DEMO_API_KEY_ID";
-
-/// Demo RSA 私钥 PEM 文件路径（`-----BEGIN RSA PRIVATE KEY-----` 或 PKCS#8 PEM）
-pub const KALSHI_DEMO_PRIVATE_KEY_PATH_ENV: &str = "KALSHI_DEMO_PRIVATE_KEY_PATH";
-
-// ==================== 向量化参数 ====================
-/// 最大词汇表大小（降维用）
-/// Some(500) 表示限制到500维，None 表示无上限
+// ==================== 向量化 / 匹配（与原版一致） ====================
 pub const MAX_VOCAB_SIZE: Option<usize> = None;
-
-// ==================== 匹配参数 ====================
-/// 相似度阈值
 pub const SIMILARITY_THRESHOLD: f64 = 0.8;
-
-/// 每个 (query, 类别) 在索引中保留的候选条数（精确按余弦排序后截断）。
-/// 仅当提高此值时才会扩大初筛候选集；降低可能影响召回，变更前应做审计对比。
 pub const SIMILARITY_TOP_K: usize = 15;
-
-/// 按大类批量计算 P·Kᵀ / K·Pᵀ 时，每次参与乘法的行块大小（行数）。
 pub const MATCH_MATMUL_CHUNK_ROWS: usize = 512;
-
-/// 全量获取周期（每 N 个追踪周期执行一次全量获取）
 pub const FULL_FETCH_INTERVAL: usize = 180;
-
-// ==================== 市场时间窗口 ====================
-/// 21 天窗口：按每条 `Market.resolution_date` 与「当前 UTC + 本天数」比较（**与终端 PM/Kalshi「到期」展示同源**）。
-/// - Polymarket：由 `clients::parse_polymarket_market_resolution_date` 写入，主字段 **`endDate`**（及既定备用链）。
-/// - Kalshi：由 `clients::parse_kalshi_market_resolution_date` 写入，优先 **`expected_expiration_time`**，再 `close_time` 等。
-/// 无 `resolution_date` 的市场保留；任一侧日期 **严格晚于** 截止则在全量筛选中剔除，追踪对见 `market_filter::tracked_pair_exceeds_horizon`。
 pub const RESOLUTION_HORIZON_DAYS: i64 = 21;
 
-// ==================== 模拟交易（Paper）====================
-/// 是否启用模拟盘：仅当本常量为 `true` 时构造 `PaperEngine`（与运行环境变量无关）
-pub const PAPER_TRADING_ENABLED: bool = false;
+// ==================== 实盘资金标尺（美元） ====================
+/// 策略参考总盘子（用于探针名义上限，与交易所余额无关）。
+pub const TOTAL_CAPITAL_USD: f64 = 1_000.0;
 
-/// 是否写入模拟交易单一 CSV（`PAPER_TRADES_CSV`）；为 `false` 时仍做资金与持仓模拟，但不创建/追加文件
-pub const PAPER_WRITE_TRADE_LOG: bool = true;
+/// 单市场对最大名义占参考总盘子比例（两腿合计上限因子）。
+pub const PAIR_CAP_FRAC_OF_CAPITAL: f64 = 0.01;
 
-/// 环境变量名：可选，写入交易 CSV 的 `notes` 列，区分测试轮次
-pub const PAPER_RUN_LABEL_ENV: &str = "PAPER_RUN_LABEL";
+/// 单腿探针名义占参考总盘子比例（PM 或 Kalshi 各一腿）。
+pub const PER_LEG_CAP_FRAC_OF_CAPITAL: f64 = 0.005;
 
-/// 每进程启动递增，用于 CSV `session_id`
-pub const PAPER_SESSION_COUNTER_FILE: &str = "logs/paper_session_counter.txt";
+/// 缓冲资金比例：仅允许动用 (1 − 此值) × 可用余额 参与 Kalshi 侧收缩（与原先纸面「可用比例」语义一致，此处为 30% 缓冲 → 最多用 70%）。
+pub const KALSHI_BALANCE_DEPLOYABLE_FRAC: f64 = 0.70;
 
-/// 模拟交易记录 CSV
-pub const PAPER_TRADES_CSV: &str = "logs/paper_trades.csv";
+// ==================== 止损（Kalshi 先、PM 第二腿失败后） ====================
+/// Kalshi IOC **卖出**平仓：最低可接受限价（美分/份）。`1` 表示尽量按可见 bid 撮合（最激进卖平）。
+pub const STOP_LOSS_KALSHI_SELL_MIN_PRICE_CENTS: i64 = 1;
 
-/// 单笔开仓最多使用当前现金的比例（保留 5% 缓冲）
-pub const CASH_UTILIZATION_MAX: f64 = 0.95;
+// ==================== 费用模型：非交易摩擦（HTTP 主路径：极小 Gas 绝对值 + 按每对上限比例缓冲） ====================
+/// HTTP/CLOB 下单时链上 Gas 近似为 0；仍留极小美元上界作保守杂项。
+pub const LIVE_ARBIT_GAS_ASSUMED_USD: f64 = 0.005;
+/// 盈余缓冲：按 [`arb_probe_caps`] 第二项「每对名义上限」`pair_cap` 收取 `pair_cap × 本比例`（当前 **0.1%**）。
+pub const LIVE_ARBIT_SURPLUS_BUFFER_FRAC_OF_PAIR_CAP: f64 = 0.001;
 
-/// Kalshi Demo 侧策略参考总盘子（美元）：用于与 Poly 纸面「日维度」对齐；每对/每腿上限按本值 × 比例计算（方案 A，与 API 余额独立）
-pub const DEMO_REFERENCE_BUDGET_USD: f64 = 500.0;
+/// 可接受最小净利润：同锚定 `pair_cap`，`pair_cap × 本比例`（当前 **0.2%**）。  
+/// 与缓冲相同参考系，便于随资金标尺缩放。
+pub const LIVE_ARBIT_MIN_NET_PROFIT_FRAC_OF_PAIR_CAP: f64 = 0.002;
 
-/// 纯本地纸面会话总资金（美元）；Demo 失败后回退会话从此值重新开始
-pub const LOCAL_TOTAL_USD: f64 = 10_000.0;
-
-/// 一对开仓总名义成本上限 = 参考资金 × 本比例（Demo：500×4%=20；本地：10000×4%=400）
-pub const PAIR_CAP_FRAC_OF_REFERENCE: f64 = 0.04;
-
-/// 每腿探针 / 名义上限 = 参考资金 × 本比例（Demo：500×2%=10；本地：10000×2%=200）
-pub const PER_LEG_CAP_FRAC_OF_REFERENCE: f64 = 0.02;
-
-/// Demo 模式（与 `DEMO_REFERENCE_BUDGET_USD` 对齐）下 (每腿上限, 每对上限)，单位美元
 #[inline]
-pub fn paper_caps_demo() -> (f64, f64) {
-    let r = DEMO_REFERENCE_BUDGET_USD;
+pub fn live_arbit_surplus_buffer_usd(pair_cap_usdt: f64) -> f64 {
+    pair_cap_usdt.max(0.0) * LIVE_ARBIT_SURPLUS_BUFFER_FRAC_OF_PAIR_CAP
+}
+
+#[inline]
+pub fn live_arbit_min_net_profit_usd(pair_cap_usdt: f64) -> f64 {
+    pair_cap_usdt.max(0.0) * LIVE_ARBIT_MIN_NET_PROFIT_FRAC_OF_PAIR_CAP
+}
+
+#[inline]
+pub fn arb_probe_caps() -> (f64, f64) {
+    let r = TOTAL_CAPITAL_USD;
     (
-        r * PER_LEG_CAP_FRAC_OF_REFERENCE,
-        r * PAIR_CAP_FRAC_OF_REFERENCE,
+        r * PER_LEG_CAP_FRAC_OF_CAPITAL,
+        r * PAIR_CAP_FRAC_OF_CAPITAL,
     )
 }
 
-/// 纯本地模式（与 `LOCAL_TOTAL_USD` 对齐）下 (每腿上限, 每对上限)，单位美元
-#[inline]
-pub fn paper_caps_local() -> (f64, f64) {
-    let r = LOCAL_TOTAL_USD;
-    (
-        r * PER_LEG_CAP_FRAC_OF_REFERENCE,
-        r * PAIR_CAP_FRAC_OF_REFERENCE,
+// ==================== 秘钥环境变量（不设默认值，由系统/用户态注入） ====================
+/// Kalshi API Key ID（UUID）
+pub const KALSHI_API_KEY_ID_ENV: &str = "KALSHI_API_KEY_ID";
+/// Kalshi RSA 私钥 PEM 文件路径
+pub const KALSHI_PRIVATE_KEY_PATH_ENV: &str = "KALSHI_PRIVATE_KEY_PATH";
+
+/// Polymarket CLOB 私钥：见官方 SDK 常量 `PRIVATE_KEY_VAR`（环境变量名 **`POLYMARKET_PRIVATE_KEY`**）。  
+/// `0` = EOA，`1` = Proxy，`2` = GnosisSafe（与官方文档一致）
+pub const POLYMARKET_SIGNATURE_TYPE_ENV: &str = "POLYMARKET_SIGNATURE_TYPE";
+/// Polymarket 私钥（与 `polymarket-client-sdk` 的 `PRIVATE_KEY_VAR` 一致）：可直接为 hex 字符串。
+pub const POLYMARKET_PRIVATE_KEY_ENV: &str = "POLYMARKET_PRIVATE_KEY";
+/// 文本文件路径，文件内容为 hex 私钥（可带 `0x`、单行即可）；**非空时优先于** `POLYMARKET_PRIVATE_KEY`。
+pub const POLYMARKET_PRIVATE_KEY_PATH_ENV: &str = "POLYMARKET_PRIVATE_KEY_PATH";
+
+/// 去掉空白与成对引号（用户在「环境变量」GUI 里有时会误加 `"..."`）。
+pub fn normalize_env_file_path(raw: &str) -> String {
+    raw.trim()
+        .trim_matches(|c| c == '"' || c == '\'' || c == '\u{201c}' || c == '\u{201d}')
+        .to_string()
+}
+
+/// 便于排障：不向日志打印秘钥，只描述「是否设置 / 长度」。
+pub fn polymarket_private_key_env_diag() -> String {
+    let p = std::env::var_os(POLYMARKET_PRIVATE_KEY_PATH_ENV);
+    let k = std::env::var_os(POLYMARKET_PRIVATE_KEY_ENV);
+    let p_s = p.as_ref().and_then(|v| v.to_str());
+    let k_s = k.as_ref().and_then(|v| v.to_str());
+    let p_len = p_s.map(|s| s.trim().len()).unwrap_or(0);
+    let k_len = k_s.map(|s| s.trim().len()).unwrap_or(0);
+    format!(
+        "{POLYMARKET_PRIVATE_KEY_PATH_ENV}: {} | {POLYMARKET_PRIVATE_KEY_ENV}: {}（长度分别为 path={} inline={}；non-UTF8 则长度记 0）",
+        if p.is_some() { "已设置" } else { "未设置" },
+        if k.is_some() { "已设置" } else { "未设置" },
+        p_len,
+        k_len
     )
 }
 
-/// 平仓后同 pair 需等待的监控周期数方可再开仓
-pub const PAPER_COOLDOWN_CYCLES: u32 = 5;
-
-/// 模拟初始资金（USDT）：默认与本地总资金一致；进程启动时的纸面会话起点
-pub const PAPER_INITIAL_CASH: f64 = LOCAL_TOTAL_USD;
-
-/// 提前平仓相对「持有到期」估算回款的最小优势（美元），避免略优即平
-pub const PAPER_MIN_EDGE_EARLY_USD: f64 = 0.5;
-
-/// 到期结算时按名义 n 估算的额外手续费（与两腿费率之和 × n 对齐）
-pub fn paper_settlement_fee_estimate(n: f64, fee_pm: f64, fee_ks: f64) -> f64 {
-    if n <= 0.0 || !n.is_finite() {
-        return 0.0;
+/// 优先读 `POLYMARKET_PRIVATE_KEY_PATH`；否则读 `POLYMARKET_PRIVATE_KEY`。内容为 EVM 私钥 hex（可选 `0x`），取首条非空非 `#` 行。
+pub fn load_polymarket_private_key_hex() -> Result<String> {
+    if let Some(os) = std::env::var_os(POLYMARKET_PRIVATE_KEY_PATH_ENV) {
+        let p = os.to_str().with_context(|| {
+            format!(
+                "{POLYMARKET_PRIVATE_KEY_PATH_ENV} 须为 UTF-8 字符串（路径请不要含非法编码）；可改用 {POLYMARKET_PRIVATE_KEY_ENV} 内联 hex"
+            )
+        })?;
+        let path_norm = normalize_env_file_path(p);
+        if path_norm.is_empty() {
+            bail!(
+                "{POLYMARKET_PRIVATE_KEY_PATH_ENV} 已定义但去掉空白与引号后为空；请填入 txt 的绝对路径，或删除该变量并改用 {POLYMARKET_PRIVATE_KEY_ENV}"
+            );
+        }
+        let mut contents = std::fs::read_to_string(&path_norm).with_context(|| {
+            format!(
+                "无法读取 {POLYMARKET_PRIVATE_KEY_PATH_ENV} 文件（路径字符数 {}）。请确认磁盘路径存在且当前进程有读权限",
+                path_norm.len()
+            )
+        })?;
+        if contents.starts_with('\u{FEFF}') {
+            contents.remove(0);
+        }
+        let hex = extract_hex_private_key_line(contents.as_str())
+            .context("解析私钥文件内容（需为 hex）")?;
+        if hex.is_empty() {
+            bail!("{POLYMARKET_PRIVATE_KEY_PATH_ENV} 文件解析后无有效 hex");
+        }
+        return Ok(hex);
     }
-    n * (fee_pm + fee_ks)
+
+    let inline = std::env::var(POLYMARKET_PRIVATE_KEY_ENV).with_context(|| {
+        format!(
+            "未设置 {POLYMARKET_PRIVATE_KEY_PATH_ENV} 且未设置 {POLYMARKET_PRIVATE_KEY_ENV}。\n\
+             若在系统里已配置，请**完全关闭并重启 Cursor/终端**后再运行。\n\
+             当前诊断：{}",
+            polymarket_private_key_env_diag()
+        )
+    })?;
+    let hex = extract_hex_private_key_line(normalize_env_file_path(&inline).as_str())
+        .context("解析 POLYMARKET_PRIVATE_KEY")?;
+    if hex.is_empty() {
+        bail!("{POLYMARKET_PRIVATE_KEY_ENV} 为空");
+    }
+    Ok(hex)
 }
+
+fn extract_hex_private_key_line(text: &str) -> Result<String> {
+    let line = text
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty() && !l.starts_with('#'))
+        .unwrap_or_else(|| text.trim());
+    if line.is_empty() {
+        bail!("私钥文本为空");
+    }
+    let raw = line
+        .strip_prefix("0x")
+        .or_else(|| line.strip_prefix("0X"))
+        .unwrap_or(line)
+        .trim();
+    if raw.is_empty() {
+        bail!("私钥 hex 为空");
+    }
+    Ok(raw.to_string())
+}
+
+// ==================== 实盘成交日志 ====================
+pub const LIVE_TRADES_CSV: &str = "logs/live_trades.csv";
+
+/// 价格追踪周期内并行校验的匹配对数量（固定值，不再通过环境变量调试）。
+pub const ARB_TRACK_CONCURRENCY: usize = 12;

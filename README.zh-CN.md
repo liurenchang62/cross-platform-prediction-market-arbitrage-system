@@ -4,11 +4,11 @@
 
 ## 项目简介
 
-`arbitrage-monitor` 是一款 **Rust** 实现的监控程序：在 **Polymarket** 与 **Kalshi** 之间基于文本相似度与类别规则发现可对齐的预测市场，维护高置信配对并周期性评估其**可执行层面的经济结果**。定价与盈亏以**实时订单簿**解析结果为依据；程序**只读分析**，不发起下单。
+`arbitrage-monitor` 是一款 **Rust** 实现的程序：在 **Polymarket** 与 **Kalshi** 之间基于文本相似度与类别规则发现可对齐的预测市场，维护高置信配对并周期性评估其**可执行层面的经济结果**。定价与盈亏以**实时订单簿**解析结果为依据；在严格校验通过后会按官方生产接口**实盘下单**（Kalshi IOC，Polymarket CLOB FOK 市价买），成交与请求摘要写入 **`logs/live_trades.csv`**。
 
-整体流程包括：市场列表拉取、向量匹配与索引、全量刷新与增量追踪、以及将结果写入 `logs/` 等结构化日志。
+整体流程包括：市场列表拉取、向量匹配与索引、全量刷新与增量追踪、以及控制台输出与上述 CSV。
 
-本仓库为 **Cargo 工作区**：根目录包为监控主程序 **`arbitrage-monitor`**，另含独立 crate **`backtest`**，用于在事后对模拟交易 CSV 按会话做交互式绩效汇总。
+本仓库为 **Cargo 工作区**：根目录包为 **`arbitrage-monitor`**（实盘主程序），另含独立 crate **`backtest`**，用于在事后对**历史模拟交易** CSV（`logs/paper_trades.csv` 格式）按会话做交互式绩效汇总。
 
 ## 功能概览
 
@@ -21,10 +21,9 @@
 - **订单簿场景盈亏**：对每个候选配对，在双方**卖档深度**上按**固定本金上限**模拟吃单，得到占用资金、手续费、Gas 假设下的净利润等指标（见 **订单簿盈亏模型**）。
 - **状态追踪**：维护追踪列表，按参数进行全量重建与周期更新（`src/system_params.rs`）。
 - **周期统计**：在**不改变套利判定逻辑**的前提下，按**进程全局**或按**全量匹配大周期**累计套利命中次数与资金类汇总（`src/cycle_statistics.rs`）。
-- **日志**：周期输出与监控 CSV 写入 `logs/`；未匹配或低信号样本可记入 `logs/unclassified/`。
-- **模拟交易（可选）**：在 `system_params.rs` 将 **`PAPER_TRADING_ENABLED`** 设为 `true`；是否写 CSV 由 **`PAPER_WRITE_TRADE_LOG`** 控制；逻辑在 `paper_trading.rs`，说明见 `docs/PAPER_TRADING.md`。每次进程启动分配递增的 **`session_id`**；日志中写入**会话开始**与**会话结束**标记行（墙钟时间、最后见到的监控周期号、结束原因等），便于事后按会话切段，且**不会因跨自然日**而将同一会话拆成两段。
-- **模拟回测 CLI（`backtest`）**：按 **UTC 日历日**筛选时，仅以**会话启动时刻**所在日归类；选定会话后在终端输出**管理报表式**摘要框：**资金与权益**、**成本归集**、**损益**（已实现损益、未平仓锁定、损益合计）、**对应成本口径的收益率**，以及墙钟跨度与**监控周期数**跨度。金额为常见**报表式负数列报**（负数以圆括号表示）。详见下文 **模拟回测工具**。
-- **Kalshi Demo 辅助**：`kalshi_demo.rs` 提供 Demo 环境 RSA-PSS 签名等逻辑，主程序在配置凭证时可调用；另提供可选二进制 **`kalshi_balance`**，用于对 Demo API **只读查询**账户余额（见 **可选：Kalshi Demo 余额探针**）。
+- **实盘日志**：主循环仅持久化 **`logs/live_trades.csv`**（不再写 monitor / 模拟盘 CSV）。
+- **模拟回测 CLI（`backtest`）**：仍用于读取 **`logs/paper_trades.csv`** 格式的历史会话数据（与实盘 CSV 列结构不同）。按 **UTC 日历日**筛选时，仅以**会话启动时刻**所在日归类；选定会话后在终端输出**管理报表式**摘要。详见下文 **模拟回测工具**。
+- **Kalshi 余额探针**：`cargo run --bin kalshi_balance` 对**生产** Trade API **只读查询**余额；凭证见下文环境变量（与主程序一致）。
 
 ## 订单簿盈亏模型
 
@@ -33,8 +32,8 @@
 1. **订单簿快照**  
    对每个已匹配市场对，程序通过 HTTP 获取双方**当前订单簿**，将可买流动性解析为按价格**升序排列的卖档** `(价格, 数量)`。
 
-2. **单腿本金上限**  
-   每条腿最多使用 **100 USDT**（`src/system_params.rs` 中的 `PAPER_PER_LEG_CAP_USDT`）。在对应卖档上**逐档累加**直至达到该上限或档位耗尽（`src/arbitrage_detector.rs` 中的 `calculate_slippage_with_fixed_usdt`），得到该腿在给定本金下**可成交的合约份数**。
+2. **单腿本金上限（探针名义）**  
+   参考总盘子 **`TOTAL_CAPITAL_USD`（默认 1000 USD）** 与 **`PER_LEG_CAP_FRAC_OF_CAPITAL`（默认 0.005，即每腿 0.5%）** 得到单腿名义上限（`arb_probe_caps()`）。在对应卖档上**逐档累加**直至达到该上限或档位耗尽（`calculate_slippage_with_fixed_usdt`），得到该腿**可成交的合约份数**。
 
 3. **对冲规模**  
    取两腿可成交份数的**较小值**作为统一成交规模 **n**，以保证两腿可按相同份数同时建仓。
@@ -69,27 +68,28 @@ cargo run -p backtest
 - **日历规则**：列表中只出现「**启动日**落在所选 UTC 日」的会话；绩效汇总始终使用该 **`session_id` 下全部记录**（跨日长跑不会在午夜被截断为两个会话）。
 - **版面说明**：指标分区展示（概览、时间跨度、资金、仓位、成本、损益、收益率等）；页脚注释说明选日规则、成本归因及分项收益率与合计收益率的关系。
 
-### 可选：Kalshi Demo 余额探针
+### Kalshi 生产余额探针
 
 ```bash
 cargo run --bin kalshi_balance
 ```
 
-- 调用 Kalshi **演示环境** `GET /portfolio/balance`，使用 RSA-PSS-SHA256 鉴权。
-- 若项目根目录存在 **`.env`**，会通过 `dotenvy` 加载。
-- 需设置 **`KALSHI_DEMO_API_KEY_ID`** 与 **`KALSHI_DEMO_PRIVATE_KEY_PATH`**（PEM 私钥文件路径）；与 `system_params.rs` 中的 `KALSHI_DEMO_API_KEY_ID_ENV`、`KALSHI_DEMO_PRIVATE_KEY_PATH_ENV` 一致。
+- 调用 Kalshi **生产** Trade API `GET /portfolio/balance`，RSA-PSS-SHA256 鉴权。
+- **不设 `.env`**：请在系统或用户环境变量中配置（Windows：「环境变量」；Linux/macOS：`export` / shell 配置）。
+- **`KALSHI_API_KEY_ID`**、**`KALSHI_PRIVATE_KEY_PATH`**（PEM 私钥文件路径），名称见 `src/system_params.rs`。
 
 ## 配置说明
 
 | 路径 | 说明 |
 |------|------|
 | `config/categories.toml` | 类别名称、权重、关键词，用于分类与匹配 |
-| `src/system_params.rs` | HTTP/匹配/时间窗口常量；模拟盘开关（`PAPER_TRADING_ENABLED`、`PAPER_WRITE_TRADE_LOG` 等）、CSV 路径 |
+| `src/system_params.rs` | HTTP/匹配/时间窗口、参考总盘子与单市场对/单腿比例、实盘 CSV 路径、环境变量名常量 |
 
-### 环境变量（可选）
+### 环境变量
 
-- **`POLYMARKET_TAG_SLUG`**：设置后 Polymarket 拉取可按 tag 过滤（见 `src/clients.rs`）。
-- **`PAPER_RUN_LABEL`**（可选）：写入模拟交易 CSV 的 `notes`，见 `PAPER_RUN_LABEL_ENV`。
+- **实盘凭据（必选）**：`KALSHI_API_KEY_ID`、`KALSHI_PRIVATE_KEY_PATH`；`POLYMARKET_PRIVATE_KEY`（十六进制私钥，与官方 SDK 一致）；可选 `POLYMARKET_SIGNATURE_TYPE`（`0`/`1`/`2`）。
+- **数据（可选）**：`POLYMARKET_TAG_SLUG`：Polymarket 拉取按 tag 过滤（见 `src/clients.rs`）。
+- **回测（可选）**：`PAPER_TRADES_CSV` 指向待分析的模拟交易日志路径。
 
 ## 仓库结构
 
@@ -107,10 +107,11 @@ src/                    包 `arbitrage-monitor`
   validation.rs         校验辅助
   tracking.rs           周期监控状态
   cycle_statistics.rs   周期累计统计（全局 / 全量大周期）
-  paper_trading.rs      模拟交易与持仓（可选）
-  kalshi_demo.rs        Kalshi Demo 签名与接口辅助（库模块）
+  live_trades.rs        实盘成交 CSV
+  kalshi_trade.rs       Kalshi 生产下单
+  polymarket_trade.rs   Polymarket CLOB 实盘下单
   bin/
-    kalshi_balance.rs 可选 CLI：Demo 账户余额查询
+    kalshi_balance.rs   可选 CLI：生产账户余额查询
 backtest/               包 `backtest` — 模拟交易 CSV 绩效命令行工具
 config/
   categories.toml

@@ -1557,6 +1557,174 @@ impl ElectoralPropositionValidator {
     }
 }
 
+/// 无二筛统计副作用（不写 `filtered_count` / `retained_samples`）；与 [`ValidationPipeline::validate`] 判定逻辑一致，  
+/// 供统一二筛阶段 **并行** 批处理后按序回写统计。
+pub(crate) fn second_screen_try_match(
+    pm_title: &str,
+    kalshi_title: &str,
+    similarity: f64,
+    category: &str,
+) -> Option<MatchInfo> {
+    let date_validator = DateValidator::new();
+
+    if GarbageMarketDetector::is_garbage_sports_market(pm_title)
+        || GarbageMarketDetector::is_garbage_sports_market(kalshi_title)
+    {
+        return None;
+    }
+
+    if !date_validator.validate(pm_title, kalshi_title) {
+        return None;
+    }
+
+    if !WeatherValidator::regions_match(pm_title, kalshi_title) {
+        return None;
+    }
+    if !WeatherValidator::fahrenheit_or_below_buckets_match(pm_title, kalshi_title) {
+        return None;
+    }
+
+    if EntertainmentChartValidator::is_billboard_spotify_cross(pm_title, kalshi_title) {
+        return None;
+    }
+    if !EntertainmentChartValidator::allows_pair(pm_title, kalshi_title) {
+        return None;
+    }
+
+    if !EsportsGameValidator::game_numbers_match(pm_title, kalshi_title) {
+        return None;
+    }
+    if !EsportsGameValidator::single_vs_total_match(pm_title, kalshi_title) {
+        return None;
+    }
+    if !EsportsGameValidator::handicap_vs_total_maps_match(pm_title, kalshi_title) {
+        return None;
+    }
+    if !EsportsGameValidator::single_vs_series_match(pm_title, kalshi_title) {
+        return None;
+    }
+    if !EsportsGameValidator::map_winner_vs_whole_match_match(pm_title, kalshi_title) {
+        return None;
+    }
+
+    if !SportsSingleVsFinalsValidator::single_vs_finals_match(pm_title, kalshi_title) {
+        return None;
+    }
+
+    if !HandicapVsSingleWinnerValidator::handicap_vs_single_winner_match(pm_title, kalshi_title) {
+        return None;
+    }
+
+    if !ExactScoreVsGoalsTotalsValidator::allows_pair(pm_title, kalshi_title) {
+        return None;
+    }
+
+    if !EsportsTournamentWinnerVsSportsGoalsValidator::allows_pair(pm_title, kalshi_title) {
+        return None;
+    }
+
+    if !TournamentOutrightVsMatchValidator::allows_pair(pm_title, kalshi_title) {
+        return None;
+    }
+
+    if !TeamSidePropVsMatchWinnerValidator::allows_pair(pm_title, kalshi_title) {
+        return None;
+    }
+
+    if !FinalsConsistencyValidator::finals_consistency_match(pm_title, kalshi_title) {
+        return None;
+    }
+
+    if !DrawVsWinnerValidator::allows_pair(pm_title, kalshi_title) {
+        return None;
+    }
+
+    if !BracketAdvanceVsSingleGameValidator::allows_pair(pm_title, kalshi_title) {
+        return None;
+    }
+
+    if !TossVsMatchMarketValidator::allows_pair(pm_title, kalshi_title) {
+        return None;
+    }
+
+    if !ElectoralPropositionValidator::allows_pair(pm_title, kalshi_title) {
+        return None;
+    }
+
+    if let Some((pm_side, kalshi_side, needs_inversion)) =
+        WinnerMarketValidator::validate(pm_title, kalshi_title)
+    {
+        return Some(MatchInfo {
+            pm_title: pm_title.to_string(),
+            kalshi_title: kalshi_title.to_string(),
+            similarity,
+            category: category.to_string(),
+            pm_side,
+            kalshi_side,
+            needs_inversion,
+        });
+    }
+
+    if let Some((pm_side, kalshi_side, needs_inversion)) =
+        ScoreMarketValidator::validate(pm_title, kalshi_title)
+    {
+        return Some(MatchInfo {
+            pm_title: pm_title.to_string(),
+            kalshi_title: kalshi_title.to_string(),
+            similarity,
+            category: category.to_string(),
+            pm_side,
+            kalshi_side,
+            needs_inversion,
+        });
+    }
+
+    if StatMarketValidator::is_stat_market_pair(pm_title, kalshi_title) {
+        if let Some((pm_side, kalshi_side, needs_inversion)) =
+            StatMarketValidator::validate(pm_title, kalshi_title)
+        {
+            return Some(MatchInfo {
+                pm_title: pm_title.to_string(),
+                kalshi_title: kalshi_title.to_string(),
+                similarity,
+                category: category.to_string(),
+                pm_side,
+                kalshi_side,
+                needs_inversion,
+            });
+        }
+        return None;
+    }
+
+    let pm_map_winner_line = EsportsGameValidator::is_single_map_winner(pm_title)
+        || EsportsGameValidator::is_single_game_winner(pm_title);
+    let ks_map_winner_line = EsportsGameValidator::is_single_map_winner(kalshi_title);
+    if pm_map_winner_line && ks_map_winner_line {
+        return None;
+    }
+
+    let pm_numbers = NumberComparator::extract_numbers(pm_title);
+    let kalshi_numbers = NumberComparator::extract_numbers(kalshi_title);
+
+    if pm_numbers.is_empty() && kalshi_numbers.is_empty() {
+        return None;
+    }
+
+    if !NumberComparator::compare_numbers(&pm_numbers, &kalshi_numbers) {
+        return None;
+    }
+
+    Some(MatchInfo {
+        pm_title: pm_title.to_string(),
+        kalshi_title: kalshi_title.to_string(),
+        similarity,
+        category: category.to_string(),
+        pm_side: "YES".to_string(),
+        kalshi_side: "NO".to_string(),
+        needs_inversion: false,
+    })
+}
+
 /// ==================== 主验证管道 ====================
 pub struct ValidationPipeline {
     date_validator: DateValidator,
@@ -1576,223 +1744,15 @@ impl ValidationPipeline {
     }
 
     pub fn validate(&mut self, pm_title: &str, kalshi_title: &str, similarity: f64, category: &str) -> Option<MatchInfo> {
-        // 0. 垃圾市场检测
-        if GarbageMarketDetector::is_garbage_sports_market(pm_title) ||
-           GarbageMarketDetector::is_garbage_sports_market(kalshi_title) {
-            self.record_filter(pm_title, kalshi_title, "垃圾市场");
-            return None;
+        let r = second_screen_try_match(pm_title, kalshi_title, similarity, category);
+        match &r {
+            None => self.filtered_count += 1,
+            Some(m) => self.record_retained(m),
         }
-        
-        // 1. 日期验证
-        if !self.date_validator.validate(pm_title, kalshi_title) {
-            self.record_filter(pm_title, kalshi_title, "日期不匹配");
-            return None;
-        }
-
-        // 1.1 温度市场：地区必须一致，maximum（无地区）不能与 特定地区 匹配
-        if !WeatherValidator::regions_match(pm_title, kalshi_title) {
-            self.record_filter(pm_title, kalshi_title, "天气地区不匹配");
-            return None;
-        }
-        if !WeatherValidator::fahrenheit_or_below_buckets_match(pm_title, kalshi_title) {
-            self.record_filter(pm_title, kalshi_title, "温度档位(°For below)不一致");
-            return None;
-        }
-
-        // 1.1b 娱乐榜单：Billboard #1 与 Top 10 不能匹配
-        if EntertainmentChartValidator::is_billboard_spotify_cross(pm_title, kalshi_title) {
-            self.record_filter(pm_title, kalshi_title, "娱乐榜单来源不一致(Billboard与Spotify)");
-            return None;
-        }
-        if !EntertainmentChartValidator::allows_pair(pm_title, kalshi_title) {
-            self.record_filter(pm_title, kalshi_title, "娱乐榜单#1与Top10不能匹配");
-            return None;
-        }
-
-        // 1.2 电竞对局：局数必须一致；单局胜者与总局数市场不能匹配
-        if !EsportsGameValidator::game_numbers_match(pm_title, kalshi_title) {
-            self.record_filter(pm_title, kalshi_title, "电竞局数不匹配");
-            return None;
-        }
-        if !EsportsGameValidator::single_vs_total_match(pm_title, kalshi_title) {
-            self.record_filter(pm_title, kalshi_title, "电竞单局与总局数不能匹配");
-            return None;
-        }
-        if !EsportsGameValidator::handicap_vs_total_maps_match(pm_title, kalshi_title) {
-            self.record_filter(pm_title, kalshi_title, "让分盘与总局maps盘不能匹配");
-            return None;
-        }
-        if !EsportsGameValidator::single_vs_series_match(pm_title, kalshi_title) {
-            self.record_filter(pm_title, kalshi_title, "电竞单局与BO5/系列赛不能匹配");
-            return None;
-        }
-        if !EsportsGameValidator::map_winner_vs_whole_match_match(pm_title, kalshi_title) {
-            self.record_filter(pm_title, kalshi_title, "电竞Map局胜者与整场赛果不能匹配");
-            return None;
-        }
-
-        // 1.3 体育：单场比赛与决赛不能匹配
-        if !SportsSingleVsFinalsValidator::single_vs_finals_match(pm_title, kalshi_title) {
-            self.record_filter(pm_title, kalshi_title, "体育单场与决赛不能匹配");
-            return None;
-        }
-
-        // 1.4 让分盘口与某局胜者不能匹配
-        if !HandicapVsSingleWinnerValidator::handicap_vs_single_winner_match(pm_title, kalshi_title) {
-            self.record_filter(pm_title, kalshi_title, "让分盘口与某局胜者不能匹配");
-            return None;
-        }
-
-        // 1.4b 确切比分 vs 总进球数 Totals
-        if !ExactScoreVsGoalsTotalsValidator::allows_pair(pm_title, kalshi_title) {
-            self.record_filter(pm_title, kalshi_title, "确切比分与总进球数不能匹配");
-            return None;
-        }
-
-        // 1.4b2 电竞 Will X win 系列赛事 vs 传统体育进球 O/U（队名相似易误配）
-        if !EsportsTournamentWinnerVsSportsGoalsValidator::allows_pair(pm_title, kalshi_title) {
-            self.record_filter(
-                pm_title,
-                kalshi_title,
-                "电竞赛事夺冠命题与体育进球Totals/净胜分Points盘不能匹配",
-            );
-            return None;
-        }
-
-        // 1.4c 公开赛/巡回赛总冠军 vs 带赛事前缀的单场对阵
-        if !TournamentOutrightVsMatchValidator::allows_pair(pm_title, kalshi_title) {
-            self.record_filter(pm_title, kalshi_title, "公开赛总冠军与单场对阵不能匹配");
-            return None;
-        }
-
-        // 1.4d Team Top Batter 等与全场胜负盘
-        if !TeamSidePropVsMatchWinnerValidator::allows_pair(pm_title, kalshi_title) {
-            self.record_filter(pm_title, kalshi_title, "队内最佳击球员等与全场胜负盘不能匹配");
-            return None;
-        }
-
-        // 1.5 决赛一致性：一方有 Finals 另一方没有时，必须双方都含相同两队，否则剔除
-        if !FinalsConsistencyValidator::finals_consistency_match(pm_title, kalshi_title) {
-            self.record_filter(pm_title, kalshi_title, "决赛不一致（一方有Finals另一方无且非同一两队）");
-            return None;
-        }
-
-        // 1.6 平局与胜负盘不能匹配（避免落入默认数值比较误配）
-        if !DrawVsWinnerValidator::allows_pair(pm_title, kalshi_title) {
-            self.record_filter(pm_title, kalshi_title, "平局市场与胜负盘不能匹配");
-            return None;
-        }
-
-        // 1.7 锦标赛「打进某轮」vs 单场 A at B Winner 不能匹配
-        if !BracketAdvanceVsSingleGameValidator::allows_pair(pm_title, kalshi_title) {
-            self.record_filter(pm_title, kalshi_title, "锦标赛晋级命题与单场胜负不能匹配");
-            return None;
-        }
-
-        // 1.8 抛硬币/掷币 vs 非掷币赛果不能混配
-        if !TossVsMatchMarketValidator::allows_pair(pm_title, kalshi_title) {
-            self.record_filter(pm_title, kalshi_title, "抛硬币/掷币与赛果命题不一致");
-            return None;
-        }
-
-        // 1.9 选举命题：政党赢席 vs 初选提名；名次(如第二名) vs 单纯获胜
-        if !ElectoralPropositionValidator::allows_pair(pm_title, kalshi_title) {
-            self.record_filter(pm_title, kalshi_title, "选举命题类型不一致(党席/提名或名次/获胜)");
-            return None;
-        }
-
-        // 2. 尝试胜负市场匹配
-        if let Some((pm_side, kalshi_side, needs_inversion)) = WinnerMarketValidator::validate(pm_title, kalshi_title) {
-            let match_info = MatchInfo {
-                pm_title: pm_title.to_string(),
-                kalshi_title: kalshi_title.to_string(),
-                similarity,
-                category: category.to_string(),
-                pm_side,
-                kalshi_side,
-                needs_inversion,
-            };
-            self.record_retained(&match_info);
-            return Some(match_info);
-        }
-        
-        // 3. 尝试得分市场匹配
-        if let Some((pm_side, kalshi_side, needs_inversion)) = ScoreMarketValidator::validate(pm_title, kalshi_title) {
-            let match_info = MatchInfo {
-                pm_title: pm_title.to_string(),
-                kalshi_title: kalshi_title.to_string(),
-                similarity,
-                category: category.to_string(),
-                pm_side,
-                kalshi_side,
-                needs_inversion,
-            };
-            self.record_retained(&match_info);
-            return Some(match_info);
-        }
-
-        // 3.5 技术统计市场：双方均为 Stat 时，必须类型一致且阈值严格匹配（O/U 5.5 Over ↔ 6+）
-        if StatMarketValidator::is_stat_market_pair(pm_title, kalshi_title) {
-            if let Some((pm_side, kalshi_side, needs_inversion)) = StatMarketValidator::validate(pm_title, kalshi_title) {
-                let match_info = MatchInfo {
-                    pm_title: pm_title.to_string(),
-                    kalshi_title: kalshi_title.to_string(),
-                    similarity,
-                    category: category.to_string(),
-                    pm_side,
-                    kalshi_side,
-                    needs_inversion,
-                };
-                self.record_retained(&match_info);
-                return Some(match_info);
-            } else {
-                self.record_filter(pm_title, kalshi_title, "技术统计类型或阈值不匹配");
-                return None;
-            }
-        }
-
-        // 4. 默认数值比较（禁止：双方均为电竞 Map/局胜者却未通过胜负校验时走 1Y1N）
-        let pm_map_winner_line = EsportsGameValidator::is_single_map_winner(pm_title)
-            || EsportsGameValidator::is_single_game_winner(pm_title);
-        let ks_map_winner_line = EsportsGameValidator::is_single_map_winner(kalshi_title);
-        if pm_map_winner_line && ks_map_winner_line {
-            self.record_filter(pm_title, kalshi_title, "电竞Map局胜者须通过胜负与两队校验");
-            return None;
-        }
-
-        let pm_numbers = NumberComparator::extract_numbers(pm_title);
-        let kalshi_numbers = NumberComparator::extract_numbers(kalshi_title);
-
-        // 双侧都无数字锚点时不再放行默认 YES/NO（易误配晋级命题等）
-        if pm_numbers.is_empty() && kalshi_numbers.is_empty() {
-            self.record_filter(pm_title, kalshi_title, "默认路径需至少一侧有锚点数字");
-            return None;
-        }
-        
-        if !NumberComparator::compare_numbers(&pm_numbers, &kalshi_numbers) {
-            self.record_filter(pm_title, kalshi_title, "数值不匹配");
-            return None;
-        }
-        
-        // 默认：无法确定时采用 1Y1N（同问法则买相反边），非颠倒市场不应出现双 YES
-        let match_info = MatchInfo {
-            pm_title: pm_title.to_string(),
-            kalshi_title: kalshi_title.to_string(),
-            similarity,
-            category: category.to_string(),
-            pm_side: "YES".to_string(),
-            kalshi_side: "NO".to_string(),
-            needs_inversion: false,
-        };
-        self.record_retained(&match_info);
-        Some(match_info)
+        r
     }
     
-    fn record_filter(&mut self, _pm: &str, _ks: &str, _reason: &str) {
-        self.filtered_count += 1;
-    }
-    
-    fn record_retained(&mut self, info: &MatchInfo) {
+    pub(crate) fn record_retained(&mut self, info: &MatchInfo) {
         let sample = RetainedSample {
             pm_title: info.pm_title.clone(),
             kalshi_title: info.kalshi_title.clone(),

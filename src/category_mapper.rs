@@ -8,9 +8,6 @@ use std::fs;
 use std::path::Path;
 use anyhow::{Result, Context};
 use serde::{Deserialize, Serialize};
-use once_cell::sync::Lazy;
-use std::sync::RwLock;
-
 /// 类别配置
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CategoryConfig {
@@ -204,19 +201,6 @@ impl CategoryMapper {
         keywords.truncate(10); // 最多保留10个关键词
         keywords
     }
-}
-
-/// 全局单例类别映射器（可选，用于需要全局访问的场景）
-pub static GLOBAL_CATEGORY_MAPPER: Lazy<RwLock<Option<CategoryMapper>>> = Lazy::new(|| {
-    RwLock::new(None)
-});
-
-/// 初始化全局类别映射器
-pub fn init_global_mapper<P: AsRef<Path>>(path: P) -> Result<()> {
-    let mapper = CategoryMapper::from_file(path)?;
-    let mut global = GLOBAL_CATEGORY_MAPPER.write().unwrap();
-    *global = Some(mapper);
-    Ok(())
 }
 
 #[cfg(test)]
