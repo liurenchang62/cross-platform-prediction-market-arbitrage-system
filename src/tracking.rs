@@ -67,6 +67,10 @@ pub struct MonitorState {
     pub tracked_pairs: Vec<TrackedArbitrage>,
     pub current_cycle: usize,
     pub full_match_interval: usize,
+    /// 最近一次全量拉取并过滤后的 PM 池大小（追踪周期沿用，供 CSV 参数列）
+    pub last_pm_pool: usize,
+    /// 最近一次全量拉取并过滤后的 Kalshi 池大小
+    pub last_ks_pool: usize,
 }
 
 impl MonitorState {
@@ -75,6 +79,8 @@ impl MonitorState {
             tracked_pairs: Vec::new(),
             current_cycle: 0,
             full_match_interval,
+            last_pm_pool: 0,
+            last_ks_pool: 0,
         }
     }
 

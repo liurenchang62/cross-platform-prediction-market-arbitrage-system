@@ -19,6 +19,9 @@ Thumbs.db
 # API 探针脚本输出（公开行情 JSON，勿入库）
 /tmp_api_probe/
 
+# portfolio_monitor 制图输出
+/portfolio_monitor/out/
+
 # 环境变量
 .env
 .env.*

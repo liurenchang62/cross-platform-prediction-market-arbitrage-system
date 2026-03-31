@@ -643,6 +643,18 @@ impl ArbitrageDetector {
 
 // ==================== 滑点计算相关函数（需要公开导出）====================
 
+/// 买盘 ask 阶梯各档可成交量之和。
+#[inline]
+pub fn total_size_buy_ladder(levels: &[(f64, f64)]) -> f64 {
+    levels.iter().map(|(_, q)| *q).sum()
+}
+
+/// 卖盘 bid 阶梯各档可成交量之和。
+#[inline]
+pub fn total_size_sell_ladder(levels: &[(f64, f64)]) -> f64 {
+    levels.iter().map(|(_, q)| *q).sum()
+}
+
 /// 从卖盘（价格升序）吃进**恰好** `n` 份合约。`n` 可为分数（与探针一致）。
 /// 流动性不足则返回 `None`。返回 `(总成本, 成交量加权均价)`。
 pub fn cost_for_exact_contracts(asks: &[(f64, f64)], n: f64) -> Option<(f64, f64)> {
@@ -762,6 +774,18 @@ pub enum PairLadderBuildFail {
     KsNoAskLiquidityEmptySide,
     /// Kalshi：有 ≥1 条档位且解析成功，但 implied ask 均不满足 [`ladder_level_ok`]。
     KsNoAskLiquidityAllRowsFiltered,
+}
+
+/// Kalshi 腿阶梯构建失败时的短标签（仅 KS 相关原因），用于调试样本行。
+pub fn kalshi_ladder_fail_tag(r: PairLadderBuildFail) -> Option<&'static str> {
+    Some(match r {
+        PairLadderBuildFail::KsMissingOrderbookBody => "ks_missing_orderbook_body",
+        PairLadderBuildFail::KsInvalidBuySide => "ks_invalid_buy_side",
+        PairLadderBuildFail::KsMalformedQuote => "ks_malformed_quote",
+        PairLadderBuildFail::KsNoAskLiquidityEmptySide => "ks_empty_levels",
+        PairLadderBuildFail::KsNoAskLiquidityAllRowsFiltered => "ks_all_levels_filtered",
+        _ => return None,
+    })
 }
 
 fn json_num_field(v: &Value) -> Option<f64> {
@@ -1034,6 +1058,48 @@ pub fn try_parse_kalshi_sell_bids(
     Ok(result)
 }
 
+/// Kalshi 二元市场订单簿：`outcome_side` 为 **`YES`/`NO`（你持有的净头寸方向）**。  
+/// 中间价 =（该结果最佳 bid + 由对手盘 dollars 行推出的最佳 ask）/2，价域与簿一致为 **美元概率 (0,1)**。
+pub fn kalshi_orderbook_mid_dollars_for_outcome(book: &Value, outcome_side: &str) -> Option<f64> {
+    let orderbook = book
+        .get("orderbook_fp")
+        .or_else(|| book.get("orderbook"))?;
+    let (bid_key, ask_src_key) = match outcome_side {
+        "YES" => ("yes_dollars", "no_dollars"),
+        "NO" => ("no_dollars", "yes_dollars"),
+        _ => return None,
+    };
+    let bids_arr = orderbook.get(bid_key)?.as_array()?;
+    let ask_src_arr = orderbook.get(ask_src_key)?.as_array()?;
+
+    let mut best_bid: Option<f64> = None;
+    for entry in bids_arr {
+        let Some(p0) = entry.get(0) else { continue };
+        let Some(p1) = entry.get(1) else { continue };
+        let Some(p) = json_num_field(p0) else { continue };
+        let Some(s) = json_num_field(p1) else { continue };
+        if ladder_level_ok(p, s) {
+            best_bid = Some(best_bid.map_or(p, |b| b.max(p)));
+        }
+    }
+
+    let mut best_ask: Option<f64> = None;
+    for entry in ask_src_arr {
+        let Some(p0) = entry.get(0) else { continue };
+        let Some(p1) = entry.get(1) else { continue };
+        let Some(p) = json_num_field(p0) else { continue };
+        let Some(s) = json_num_field(p1) else { continue };
+        let ask_p = 1.0 - p;
+        if ladder_level_ok(ask_p, s) {
+            best_ask = Some(best_ask.map_or(ask_p, |a| a.min(ask_p)));
+        }
+    }
+
+    let b = best_bid?;
+    let a = best_ask?;
+    Some(0.5 * (b + a))
+}
+
 /// 双腿 ask 阶梯（开仓）。
 #[derive(Debug, Clone)]
 pub struct PairOrderbookLadders {
@@ -1125,6 +1191,8 @@ mod arb_tests {
         let pm = [(0.001, 1_000_000.0), (0.01, 1_000_000.0)];
         let ks = [(0.05, 100.0), (0.1, 10000.0)];
         let cost = ArbCostParams::default();
+        // `pair_cap` 参与盈余缓冲与最小净利：`1e6` 会使缓冲远超单笔探针利润，识别恒为 None。
+        let pair_cap = 100.0_f64;
         let opp = det
             .calculate_arbitrage_100usdt(
                 0.001,
@@ -1135,7 +1203,7 @@ mod arb_tests {
                 "YES",
                 false,
                 100.0,
-                1_000_000.0,
+                pair_cap,
                 &cost,
             )
             .expect("opp");
@@ -1151,5 +1219,29 @@ mod arb_tests {
         let (p, avg) = proceeds_for_exact_contracts_sell(&bids, 5.0).unwrap();
         assert!((p - 3.0).abs() < 1e-9);
         assert!((avg - 0.6).abs() < 1e-9);
+    }
+
+    #[test]
+    fn kalshi_mid_yes_matches_bid_and_implied_ask() {
+        let book = serde_json::json!({
+            "orderbook": {
+                "yes_dollars": [[0.4, 10.0]],
+                "no_dollars": [[0.55, 10.0]]
+            }
+        });
+        let mid = kalshi_orderbook_mid_dollars_for_outcome(&book, "YES").unwrap();
+        assert!((mid - 0.5 * (0.4 + (1.0 - 0.55))).abs() < 1e-9);
+    }
+
+    #[test]
+    fn kalshi_mid_no_matches_bid_and_implied_ask() {
+        let book = serde_json::json!({
+            "orderbook": {
+                "no_dollars": [[0.35, 5.0]],
+                "yes_dollars": [[0.5, 5.0]]
+            }
+        });
+        let mid = kalshi_orderbook_mid_dollars_for_outcome(&book, "NO").unwrap();
+        assert!((mid - 0.5 * (0.35 + (1.0 - 0.5))).abs() < 1e-9);
     }
 }

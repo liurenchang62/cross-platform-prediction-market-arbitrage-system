@@ -220,6 +220,6 @@ fn main() -> Result<()> {
     if !ok {
         std::process::exit(1);
     }
-    println!("\n全部通过。可与 `cargo run --bin kalshi_balance` 进一步联调 Kalshi 网络。");
+    println!("\n全部通过。可运行主程序或 `cargo run -p portfolio-monitor --bin portfolio-overview` 等做进一步联调。");
     Ok(())
 }

@@ -1,0 +1,12 @@
+# 复制为 `config/arb_pairs.toml`（可自行 gitignore）通过 `--config` 指定。
+# 每一行映射 = 「同一真实事件」在 Kalshi 与 Polymarket 上的可对齐腿（由你人工确认）。
+#
+# pm_buy_token_id：执行策略时 **在 Polymarket CLOB 买的那条 outcome 的 token_id**（Gamma 的 clobTokenIds 中长整数字符串）。
+# 必须与主程序里 `polymarket_clob_token_id_for_buy(pm_market, pm_side)` 一致。
+
+[[pairs]]
+id = "example-cooper-flagg-20"
+kalshi_ticker = "KXNBAPTS-26MAR30MINDAL-DALCFLAGG32-20"
+pm_market_id = "1263672"
+pm_buy_token_id = "PASTE_YES_OR_NO_CLOB_TOKEN_ID_HERE"
+strategy = { pm_buy_leg = "YES", kalshi_buy_leg = "NO" }

@@ -341,6 +341,29 @@ impl PolymarketClient {
         })
     }
 
+    /// Gamma `GET /markets?clob_token_ids=...&limit=1`：由 CLOB outcome `token_id` 反查 **Gamma 市场 id**（持仓「市场」去重）。
+    pub async fn try_gamma_market_id_for_clob_token(&self, token_id: &str) -> Option<String> {
+        if token_id.is_empty() {
+            return None;
+        }
+        let url = format!("{}/markets", Self::GAMMA_API_BASE);
+        let response = self
+            .http_client
+            .get(&url)
+            .query(&[("clob_token_ids", token_id), ("limit", "1")])
+            .send()
+            .await
+            .ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
+        let arr: Vec<Value> = response.json().await.ok()?;
+        arr.first()
+            .and_then(|m| m.get("id"))
+            .and_then(|x| x.as_str())
+            .map(|s| s.to_string())
+    }
+
     /// Gamma `GET /markets?id=...&limit=1`：补全 `Market.resolution_date`（线上响应为 JSON 数组）
     pub async fn fetch_resolution_by_market_id(&self, market_id: &str) -> Option<DateTime<Utc>> {
         if market_id.is_empty() {
@@ -670,23 +693,86 @@ impl KalshiClient {
             .and_then(|m| parse_kalshi_market_resolution_date(m))
     }
 
-    pub async fn get_order_book(&self, ticker: &str) -> Result<Option<serde_json::Value>> {
-        let url = format!("{}/markets/{}/orderbook", self.base_url, ticker);
-        
-        let response = self
-            .http_client
-            .get(&url)
-            .send()
-            .await
-            .context("Failed to fetch Kalshi order book")?;
-
-        if !response.status().is_success() {
-            return Ok(None);
+    /// Trade API：`GET /markets/{ticker}/orderbook`。  
+    /// 非 2xx 或网络错误时见 [`KalshiOrderbookFetchReport::outcome`]，原用 `get_order_book` 仍返回 `None` 不变。
+    pub async fn fetch_order_book_raw(&self, ticker: &str) -> KalshiOrderbookFetchReport {
+        fn snip(s: &str, max: usize) -> String {
+            let t = s.trim();
+            if t.len() <= max {
+                t.to_string()
+            } else {
+                format!("{}…(+{}B)", &t[..max], t.len() - max)
+            }
         }
 
-        let data: serde_json::Value = response.json().await?;
-        Ok(Some(data))
+        let url = format!("{}/markets/{}/orderbook", self.base_url, ticker);
+        let response = match self.http_client.get(&url).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                return KalshiOrderbookFetchReport {
+                    json: None,
+                    outcome: KalshiOrderbookFetchOutcome::Transport(snip(&e.to_string(), 120)),
+                };
+            }
+        };
+
+        let status = response.status();
+        let code = status.as_u16();
+        let body_text = match response.text().await {
+            Ok(t) => t,
+            Err(e) => {
+                return KalshiOrderbookFetchReport {
+                    json: None,
+                    outcome: KalshiOrderbookFetchOutcome::Transport(format!(
+                        "read_body:{}",
+                        snip(&e.to_string(), 80)
+                    )),
+                };
+            }
+        };
+
+        if !status.is_success() {
+            return KalshiOrderbookFetchReport {
+                json: None,
+                outcome: KalshiOrderbookFetchOutcome::Http {
+                    status: code,
+                    body_preview: snip(&body_text, 200),
+                },
+            };
+        }
+
+        match serde_json::from_str::<serde_json::Value>(&body_text) {
+            Ok(v) => KalshiOrderbookFetchReport {
+                json: Some(v),
+                outcome: KalshiOrderbookFetchOutcome::Ok,
+            },
+            Err(e) => KalshiOrderbookFetchReport {
+                json: None,
+                outcome: KalshiOrderbookFetchOutcome::JsonError(snip(&e.to_string(), 120)),
+            },
+        }
     }
+
+    pub async fn get_order_book(&self, ticker: &str) -> Result<Option<serde_json::Value>> {
+        let r = self.fetch_order_book_raw(ticker).await;
+        Ok(r.json)
+    }
+}
+
+// ---------- Kalshi 订单簿拉取原始结果（排障用） ----------
+
+#[derive(Debug, Clone)]
+pub enum KalshiOrderbookFetchOutcome {
+    Ok,
+    Transport(String),
+    Http { status: u16, body_preview: String },
+    JsonError(String),
+}
+
+#[derive(Debug, Clone)]
+pub struct KalshiOrderbookFetchReport {
+    pub outcome: KalshiOrderbookFetchOutcome,
+    pub json: Option<serde_json::Value>,
 }
 
 impl Default for KalshiClient {

@@ -38,6 +38,19 @@ const STAT_TYPES: [&str; 8] = [
     "blocks", "threes", "double", "triple"
 ];
 
+/// PM「比赛是否结束/已赛完」类命题 vs Kalshi「谁赢」胜负盘：向量再像也不是同一合约。
+fn reject_match_completion_vs_winner_moneyline(pm_title: &str, kalshi_title: &str) -> bool {
+    let pm = pm_title.to_lowercase();
+    let ks = kalshi_title.to_lowercase();
+    if !pm.contains("completed match") && !pm.contains("match completed") {
+        return false;
+    }
+    if !ks.contains("winner") {
+        return false;
+    }
+    ks.contains(" vs ") || ks.contains(" vs. ")
+}
+
 /// 月份名称映射
 const MONTH_MAP: [(&str, u32); 24] = [
     ("jan", 1), ("january", 1),
@@ -1096,6 +1109,9 @@ impl WinnerMarketValidator {
         if pm_title.to_lowercase().contains("o/u") {
             return None;
         }
+        if reject_match_completion_vs_winner_moneyline(pm_title, kalshi_title) {
+            return None;
+        }
         // 平手 Draw/Tie 与胜负 Winner 不能匹配
         let pm_lower = pm_title.to_lowercase();
         if pm_lower.contains("draw") || pm_lower.contains("end in a draw") || pm_lower.contains(" tie ") {
@@ -1162,6 +1178,9 @@ fn normalize_stat_type(s: &str) -> Option<&'static str> {
     }
     if lower.contains("assists") {
         return Some("assists");
+    }
+    if lower.contains("block") {
+        return Some("blocks");
     }
     if lower.contains("three") || lower.contains("threes") {
         return Some("threes");
@@ -1262,6 +1281,12 @@ impl ScoreMarketValidator {
         // 若双方均为技术统计市场，交给 StatMarketValidator（避免 rebounds 与 assists 误配）
         if StatMarketValidator::is_stat_market_pair(pm_title, kalshi_title) {
             return None;
+        }
+        // 双方都能归到具体 stat 且类型不同：禁止只比阈值数字（如 assists O/U vs blocks N+）
+        if let (Some(a), Some(b)) = (normalize_stat_type(pm_title), normalize_stat_type(kalshi_title)) {
+            if a != b {
+                return None;
+            }
         }
         // 检查是否都是得分市场（Points）
         let pm_is_score = pm_title.contains("O/U") || pm_title.contains("Points");
@@ -2307,6 +2332,37 @@ mod tests {
             "Paolo Banchero: Assists O/U 5.5",
             "Paolo Banchero: 5+ threes - Paolo Banchero: 5+"
         ).is_none());
+        // Assists O/U vs Blocks N+（曾落入党 Score 只比数字误配）
+        assert!(StatMarketValidator::validate(
+            "Donovan Clingan: Assists O/U 2.5",
+            "Donovan Clingan: 2+ blocks - Donovan Clingan: 2+"
+        ).is_none());
+    }
+
+    #[test]
+    fn test_second_screen_rejects_completed_match_vs_winner() {
+        assert!(
+            second_screen_try_match(
+                "Indian Premier League: Mumbai Indians vs Kolkata Knight Riders - Completed match?",
+                "Mumbai Indians vs Kolkata Knight Riders Winner? - Kolkata Knight Riders",
+                0.99,
+                "sports_cricket",
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn test_second_screen_rejects_assists_ou_vs_blocks_plus() {
+        assert!(
+            second_screen_try_match(
+                "Donovan Clingan: Assists O/U 2.5",
+                "Donovan Clingan: 2+ blocks - Donovan Clingan: 2+",
+                0.99,
+                "sports_basketball",
+            )
+            .is_none()
+        );
     }
 
     #[test]

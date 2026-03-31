@@ -4,9 +4,9 @@
 
 ## Overview
 
-`arbitrage-monitor` is a **Rust** application that discovers cross-venue relationships between **Polymarket** and **Kalshi** prediction markets, keeps a watchlist of high-confidence pairs, and evaluates executable economics from **live order-book data**. After strict validation it can place **live orders** via official production APIs (**Kalshi IOC** buy, **Polymarket CLOB FOK**), logging fills and request summaries to **`logs/live_trades.csv`**.
+`arbitrage-monitor` is a **Rust** application that discovers cross-venue relationships between **Polymarket** and **Kalshi** prediction markets, keeps a watchlist of high-confidence pairs, and evaluates executable economics from **live order-book data**. After strict validation it can place **live orders** via official production APIs (**Kalshi IOC** buy, **Polymarket CLOB FOK**), logging fills and request summaries to **`logs/desk_events.jsonl`** (JSON Lines; chart/reconcile via **`portfolio_monitor`** binaries).
 
-The pipeline combines text-based market matching (vector similarity and category rules), scheduled full refreshes and incremental tracking cycles, console output, and that CSV.
+The pipeline combines text-based market matching (vector similarity and category rules), scheduled full refreshes and incremental tracking cycles, console output, and that JSONL trade log.
 
 Secrets are **not** stored in the repo: Kalshi and Polymarket credentials are read from **environment variables** (and PEM / optional key files on your machine). See **Environment variables** and `.gitignore` (`.env`, `secrets/`).
 
@@ -21,9 +21,9 @@ Full runs typically log three stages: **raw vector hits** (bidirectional Top-K r
 
 - **Execution-style PnL**: For each candidate pair, costs and net profit for a **notional-capped, depth-walked** buy scenario are derived from **parsed ask ladders** on both venues, plus **venue-accurate taker fees** and **auxiliary friction** (see **Order-book PnL & cost model**).
 - **Tracking**: Maintains a set of tracked pairs across cycles, with periodic full rebuilds and parameter-driven intervals (`src/system_params.rs`).
-- **Live trade log**: The main loop persists **`logs/live_trades.csv`** when live trading is enabled.
+- **Live trade log**: The main loop persists **`logs/desk_events.jsonl`** when live trading is enabled.
 - **Live execution**: First leg Kalshi IOC, second leg Polymarket FOK; second leg re-fetches books and re-checks net profit (business attempts capped in `main.rs`). Optional stop-loss path compares relaxed PM hedge vs. Kalshi IOC sell.
-- **Auxiliary CLIs**: `kalshi_balance` (production balance), `check_env` (mask/verify credentials setup), `live_account_positions`, `smoke_live_orders` (see **Optional binaries**).
+- **Auxiliary tools**: `check_env`, `track_backtest`, and workspace crate **`portfolio_monitor`** (`portfolio-overview`, `portfolio-pairs`, `portfolio-settled`, `portfolio-charts`) for TOML-mapped KS/PM views and charts from `logs/desk_events.jsonl`.
 
 ## Order-book PnL & cost model
 
@@ -67,14 +67,14 @@ cargo run --release    # recommended for long runs
 
 On startup, choose **track-only** vs **live**; live mode requires the environment variables below and confirmation. Ensure **`config/categories.toml`** exists (included in the repository).
 
-## Optional binaries
+## Optional binaries / workspace tools
 
 | Command | Purpose |
 |--------|---------|
-| `cargo run --bin kalshi_balance` | Production `GET /portfolio/balance` (Kalshi RSA auth). |
 | `cargo run --bin check_env` | Sanity-check env vars and key loading (masked output). |
-| `cargo run --bin live_account_positions` | Account/position style diagnostics (see bin docs). |
-| `cargo run --bin smoke_live_orders` | Controlled smoke tests for live paths (use with care). |
+| `cargo run --bin track_backtest` | Replay / analyze `logs/tracking_*.csv` (see bin docs). |
+| `cargo run -p portfolio-monitor --bin portfolio-overview` | Account / mapping overview (see `--help`). |
+| `cargo run -p portfolio-monitor --bin portfolio-charts` | PNG charts from `desk_events.jsonl` + Kalshi settlements. |
 
 ## API probe script (Windows)
 
@@ -89,7 +89,7 @@ Public read-only checks; writes JSON under `tmp_api_probe/` (ignored by git).
 | Path | Purpose |
 |------|---------|
 | `config/categories.toml` | Category names, weights, and keywords for classification and matching |
-| `src/system_params.rs` | HTTP/matching/window, reference `TOTAL_CAPITAL_USD`, per-leg/per-pair fractions, gas, friction & min-profit fractions, CSV path, env var name constants |
+| `src/system_params.rs` | HTTP/matching/window, reference `TOTAL_CAPITAL_USD`, per-leg/per-pair fractions, gas, friction & min-profit fractions, `desk_events.jsonl` path, env var name constants |
 | `src/fee_model.rs` | Taker fee formulas, `ArbCostParams`, PM exponent table |
 
 ### Environment variables
@@ -103,7 +103,7 @@ Do **not** commit `.env` files or `secrets/`; configure system/user environment 
 ## Repository layout
 
 ```
-Cargo.toml              Package manifest (single crate; workspace root is this package)
+Cargo.toml              Workspace (`arbitrage-monitor` + `portfolio-monitor`)
 scripts/
   verify_apis.ps1       Optional public API shape checks (Windows)
 src/
@@ -119,15 +119,16 @@ src/
   system_params.rs      Shared tuning constants and env names
   validation.rs         Validation helpers
   tracking.rs           Per-cycle monitor state
-  live_trades.rs        Live trade CSV logging
+  desk_events.rs        Live trade JSONL (`DeskEventsLog`)
+  feishu_push.rs        Feishu summary (bound to main program)
+  trade_reconciliation.rs Live fill reconciliation
   kalshi_trade.rs       Kalshi production orders
   polymarket_trade.rs   Polymarket CLOB live orders
   category_mapper.rs    categories.toml-backed classification
   bin/
-    kalshi_balance.rs
     check_env.rs
-    live_account_positions.rs
-    smoke_live_orders.rs
+    track_backtest.rs
+portfolio_monitor/      Lib + `portfolio-overview` / `-pairs` / `-settled` / `-charts`
 config/
   categories.toml
 docs/

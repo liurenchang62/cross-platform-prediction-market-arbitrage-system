@@ -1,7 +1,6 @@
 // src/main.rs
 use anyhow::{Context, Result};
 use futures::stream::{self, StreamExt};
-use std::cmp::Ordering;
 use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 use tokio::time;
@@ -19,47 +18,61 @@ mod tracking;
 mod system_params;
 mod category_vectorizer;
 mod market_filter;
-mod live_trades;
+mod desk_events;
+mod feishu_push;
+mod trade_reconciliation;
+mod tracking_log;
 mod kalshi_trade;
 mod polymarket_trade;
 mod fee_model;
 mod kalshi_fee_schedule;
+mod session_risk;
 
 use std::collections::HashSet;
+use std::sync::Mutex;
 use std::io::{self, BufRead, Write};
 use std::sync::Arc;
 
 use crate::category_mapper::CategoryMapper;
+use crate::desk_events::DeskEventsLog;
 use crate::fee_model::{kalshi_series_from_ticker, pm_exponent_for_pm_market, ArbCostParams};
 use crate::kalshi_fee_schedule::{fetch_kalshi_fee_schedule, KalshiFeeScheduleState};
-use crate::live_trades::LiveTradesLog;
 use crate::market::Market;
-use clients::{PolymarketClient, KalshiClient};
+use clients::{KalshiOrderbookFetchOutcome, KalshiClient, PolymarketClient};
 use kalshi_trade::{
+    get_balance_cents as kalshi_get_balance_cents,
     place_buy_ioc as kalshi_place_buy_ioc, place_sell_ioc as kalshi_place_sell_ioc,
     KalshiIocResult, KalshiTradeConfig,
 };
-use polymarket_trade::PolymarketClobTrader;
+use polymarket_trade::{PolymarketClobTrader, PostOrderResponse};
+use polymarket_client_sdk::types::Decimal;
 use reqwest::Client as HttpClient;
 use market_matcher::{MarketMatcher, MarketMatcherConfig};
 use arbitrage_detector::{ArbitrageDetector, ArbitrageOpportunity};
 use crate::tracking::{oriented_track_id, MonitorState, TrackedArbitrage};
 use crate::system_params::{
     ARB_TRACK_CONCURRENCY, FULL_FETCH_INTERVAL, LIVE_ARBIT_MIN_NET_PROFIT_FRAC_OF_PAIR_CAP,
-    LIVE_TRADES_CSV, MAX_RETRIES,
+    LIVE_HEDGE_VS_UNWIND_MARGIN_FRAC_OF_PAIR_CAP, LIVE_SECOND_LEG_DEADLINE_SECS,
+    DESK_EVENTS_JSONL, MAX_RETRIES, PAIR_CAP_FRAC_OF_CAPITAL, PER_LEG_CAP_FRAC_OF_CAPITAL,
+    PM_TAKER_FEE_BPS_WHEN_FETCH_FAILS, RESOLUTION_HORIZON_DAYS,
     RETRY_INITIAL_DELAY_MS,
-    SIMILARITY_THRESHOLD, STOP_LOSS_KALSHI_SELL_MIN_PRICE_CENTS, TOTAL_CAPITAL_USD,
-    arb_probe_caps, require_live_orders_allowed, set_live_arbitrage_orders_allowed,
+    SIMILARITY_THRESHOLD, STOP_LOSS_KALSHI_SELL_MIN_PRICE_CENTS,
+    TRACKING_ARB_EVENTS_CSV, TRACKING_PAIRS_CSV,
+    arb_probe_caps, kalshi_orderbook_debug_enabled, require_live_orders_allowed,
+    session_reference_capital_usd, set_live_arbitrage_orders_allowed,
+    POLYMARKET_SIGNATURE_TYPE_ENV,
 };
+use crate::tracking_log::{
+    print_arbitrage_detection_books, TrackingArbEventsLog, TrackingPairsLog, TrackingParamsSnapshot,
+};
+use crate::session_risk::SessionRiskHandle;
 use crate::market_filter::filter_markets_by_resolution_horizon;
 use crate::arbitrage_detector::{
-    build_pair_orderbook_ladders_result, cost_for_exact_contracts, orderbook_best_ask_price,
-    pm_buy_no_uses_yes_token_complement, polymarket_clob_token_id_for_buy,
+    build_pair_orderbook_ladders_result, cost_for_exact_contracts, kalshi_ladder_fail_tag,
+    orderbook_best_ask_price, pm_buy_no_uses_yes_token_complement,
+    polymarket_clob_token_id_for_buy, total_size_buy_ladder, total_size_sell_ladder,
     try_parse_kalshi_sell_bids, validate_opportunity_from_ladders, PairLadderBuildFail,
 };
-
-/// 第二腿（Polymarket）：在已成功拉到订单簿的前提下，**业务上**最多尝试次数（含首次），失败可重算净利后再试；与网络层重试无关。
-const LIVE_SECOND_LEG_BUSINESS_ATTEMPTS: usize = 3;
 
 /// 同一 PM–Kalshi 匹配在验证器给出的腿向上，再增加「两侧同时取反」的另一腿（如 PM YES+KS NO 与 PM NO+KS YES），去重后用于追踪与验证。
 fn expand_dual_orientations(
@@ -90,60 +103,49 @@ fn expand_dual_orientations(
     out
 }
 
-/// 启动时在终端选择：实盘需二次输入 `YES` 确认；否则仅跟踪（无 stdin 则报错）。
-fn prompt_run_mode() -> Result<bool> {
-    println!("\n请选择运行模式：");
-    println!(
-        "  [1] 实盘交易 (live_trading) — 真实下单，并写入 {}",
-        LIVE_TRADES_CSV
-    );
-    println!("  [2] 仅跟踪 (tracking_only) — 只校验机会，不下单、不写 CSV");
+/// 启动时必须完整输入 `CONFIRM`（全大写），否则退出进程。
+fn prompt_confirm_live() -> Result<()> {
+    println!("\n⚠️  本进程为实盘交易：将使用真实资金在 Kalshi / Polymarket 下单，并写入 {}", DESK_EVENTS_JSONL);
+    println!("   若确认，请完整输入 CONFIRM（全大写）后回车；其他任何输入均视为放弃并退出程序。");
 
     let stdin = io::stdin();
     let mut stdout = io::stdout();
-    let eof = || anyhow::anyhow!("标准输入不可用（无法交互选择模式）");
+    let eof = || anyhow::anyhow!("标准输入不可用（无法交互确认）");
 
-    loop {
-        print!("请输入 1 或 2 后回车: ");
-        stdout.flush().ok();
-        let mut line = String::new();
-        if stdin.lock().read_line(&mut line).context("读取 stdin 失败")? == 0 {
-            return Err(eof());
-        }
-        match line.trim() {
-            "1" => {
-                println!("\n⚠️  实盘将使用真实资金在 Kalshi / Polymarket 下单，并写入 {}。", LIVE_TRADES_CSV);
-                println!("   若确认，请完整输入 YES（三个大写字母）后回车；其他任何输入均视为放弃并退出程序。");
-                print!("确认实盘: ");
-                stdout.flush().ok();
-                let mut confirm = String::new();
-                if stdin.lock().read_line(&mut confirm).context("读取 stdin 失败")? == 0 {
-                    return Err(eof());
-                }
-                if confirm.trim() == "YES" {
-                    println!("✅ 已确认进入实盘模式。\n");
-                    return Ok(true);
-                }
-                println!("已取消：未确认实盘，程序退出。");
-                std::process::exit(0);
-            }
-            "2" => {
-                println!("✅ 已选择仅跟踪模式（不下单、不写 CSV）。\n");
-                return Ok(false);
-            }
-            _ => println!("无效输入，请只输入 1 或 2。"),
-        }
+    print!("确认实盘: ");
+    stdout.flush().ok();
+    let mut confirm = String::new();
+    if stdin.lock().read_line(&mut confirm).context("读取 stdin 失败")? == 0 {
+        return Err(eof());
     }
+    if confirm.trim() == "CONFIRM" {
+        println!("✅ 已确认进入实盘模式。\n");
+        return Ok(());
+    }
+    println!("已取消：未确认实盘，程序退出。");
+    std::process::exit(0);
 }
 
-/// Top10 / 追踪共用的套利行（含双方解析日）
-type OpportunityRow = (
-    ArbitrageOpportunity,
-    String,
-    String,
-    Option<DateTime<Utc>>,
-    Option<DateTime<Utc>>,
-);
+fn build_tracking_params_snapshot(
+    monitor: &MonitorState,
+    per_leg_cap: f64,
+    pair_cap: f64,
+) -> TrackingParamsSnapshot {
+    TrackingParamsSnapshot {
+        total_capital_usd: session_reference_capital_usd(),
+        per_leg_cap_usd: per_leg_cap,
+        pair_cap_usd: pair_cap,
+        per_leg_cap_frac: PER_LEG_CAP_FRAC_OF_CAPITAL,
+        pair_cap_frac: PAIR_CAP_FRAC_OF_CAPITAL,
+        resolution_horizon_days: RESOLUTION_HORIZON_DAYS,
+        polymarket_markets_n: monitor.last_pm_pool,
+        kalshi_markets_n: monitor.last_ks_pool,
+        similarity_threshold: SIMILARITY_THRESHOLD,
+        full_fetch_interval_cycles: FULL_FETCH_INTERVAL,
+        arb_track_concurrency: ARB_TRACK_CONCURRENCY,
+        min_net_profit_frac_of_pair_cap: LIVE_ARBIT_MIN_NET_PROFIT_FRAC_OF_PAIR_CAP,
+    }
+}
 
 fn format_resolution_expiry(label: &str, dt: Option<DateTime<Utc>>) -> String {
     match dt {
@@ -200,10 +202,81 @@ struct TrackingArbDiag {
     /// 和 < 1 放宽后仍无（流动性/缩放/n 为 0 / cost_for_exact 等）
     loose_still_fail: usize,
     accepted: usize,
+    /// Kalshi 订单簿：`get_order_book` 等价于 json 缺失时的细分（需 `KALSHI_ORDERBOOK_DEBUG` 才打印样本）
+    ks_ob_transport: usize,
+    ks_ob_http_429: usize,
+    ks_ob_http_4xx: usize,
+    ks_ob_http_5xx: usize,
+    ks_ob_http_other: usize,
+    ks_ob_json_bad: usize,
+    /// 每周期至多各 [`DIAG_SAMPLE_CAP`] 条，合并后不超 [`DIAG_MERGED_SAMPLE_MAX`]
+    ks_ob_samples: Vec<String>,
+    ks_ladder_samples: Vec<String>,
 }
 
+/// 单 worker / 单线程追踪时，每类调试样本条数上限
+const DIAG_SAMPLE_CAP: usize = 4;
+/// 并发合并多段 diag 后，打印时保留的样本总行数上限
+const DIAG_MERGED_SAMPLE_MAX: usize = 8;
+
 impl TrackingArbDiag {
-    fn record_ladder_build_fail(&mut self, r: PairLadderBuildFail) {
+    fn push_diag_sample(buf: &mut Vec<String>, line: String, cap: usize) {
+        if buf.len() >= cap || buf.iter().any(|x| x == &line) {
+            return;
+        }
+        buf.push(line);
+    }
+
+    fn merge_samples(dst: &mut Vec<String>, src: &[String]) {
+        for s in src {
+            if dst.len() >= DIAG_MERGED_SAMPLE_MAX {
+                break;
+            }
+            if !dst.contains(s) {
+                dst.push(s.clone());
+            }
+        }
+    }
+
+    fn record_kalshi_ob_outcome(&mut self, ticker: &str, o: &KalshiOrderbookFetchOutcome) {
+        match o {
+            KalshiOrderbookFetchOutcome::Ok => {}
+            KalshiOrderbookFetchOutcome::Transport(msg) => {
+                self.ks_ob_transport += 1;
+                Self::push_diag_sample(
+                    &mut self.ks_ob_samples,
+                    format!("ob {ticker} transport {msg}"),
+                    DIAG_SAMPLE_CAP,
+                );
+            }
+            KalshiOrderbookFetchOutcome::Http {
+                status,
+                body_preview,
+            } => {
+                match *status {
+                    429 => self.ks_ob_http_429 += 1,
+                    500..=599 => self.ks_ob_http_5xx += 1,
+                    400..=499 => self.ks_ob_http_4xx += 1,
+                    _ => self.ks_ob_http_other += 1,
+                }
+                Self::push_diag_sample(
+                    &mut self.ks_ob_samples,
+                    format!("ob {ticker} HTTP{} {}", status, body_preview),
+                    DIAG_SAMPLE_CAP,
+                );
+            }
+            KalshiOrderbookFetchOutcome::JsonError(msg) => {
+                self.ks_ob_json_bad += 1;
+                Self::push_diag_sample(
+                    &mut self.ks_ob_samples,
+                    format!("ob {ticker} json_err {msg}"),
+                    DIAG_SAMPLE_CAP,
+                );
+            }
+        }
+    }
+
+    fn record_ladder_build_fail(&mut self, r: PairLadderBuildFail, ks_ticker: Option<&str>) {
         self.ladders_failed += 1;
         match r {
             PairLadderBuildFail::PmInvalidBuySide => self.ladder_pm_invalid_side += 1,
@@ -220,6 +293,15 @@ impl TrackingArbDiag {
             PairLadderBuildFail::KsNoAskLiquidityEmptySide => self.ladder_ks_liq_empty_side += 1,
             PairLadderBuildFail::KsNoAskLiquidityAllRowsFiltered => {
                 self.ladder_ks_liq_all_filtered += 1;
+            }
+        }
+        if let Some(t) = ks_ticker {
+            if let Some(tag) = kalshi_ladder_fail_tag(r) {
+                Self::push_diag_sample(
+                    &mut self.ks_ladder_samples,
+                    format!("ladder {t} {tag}"),
+                    DIAG_SAMPLE_CAP,
+                );
             }
         }
     }
@@ -248,6 +330,14 @@ impl TrackingArbDiag {
         self.loose_pass_strict_fail += o.loose_pass_strict_fail;
         self.loose_still_fail += o.loose_still_fail;
         self.accepted += o.accepted;
+        self.ks_ob_transport += o.ks_ob_transport;
+        self.ks_ob_http_429 += o.ks_ob_http_429;
+        self.ks_ob_http_4xx += o.ks_ob_http_4xx;
+        self.ks_ob_http_5xx += o.ks_ob_http_5xx;
+        self.ks_ob_http_other += o.ks_ob_http_other;
+        self.ks_ob_json_bad += o.ks_ob_json_bad;
+        Self::merge_samples(&mut self.ks_ob_samples, &o.ks_ob_samples);
+        Self::merge_samples(&mut self.ks_ladder_samples, &o.ks_ladder_samples);
     }
 
     /// 每追踪周期一行摘要，便于判断「真没机会」还是「订单簿拉取异常」。
@@ -263,23 +353,70 @@ impl TrackingArbDiag {
             self.rejected_strict,
             self.sum_ask_ge_1
         );
+        if kalshi_orderbook_debug_enabled() {
+            self.print_kalshi_orderbook_debug();
+        }
+    }
+
+    /// 环境变量 `KALSHI_ORDERBOOK_DEBUG=1` 时由 [`print_compact`] 调用；只在小样本与汇总计数层面打印。
+    fn print_kalshi_orderbook_debug(&self) {
+        let ob_sum = self.ks_ob_transport
+            + self.ks_ob_http_429
+            + self.ks_ob_http_4xx
+            + self.ks_ob_http_5xx
+            + self.ks_ob_http_other
+            + self.ks_ob_json_bad;
+        if ob_sum == 0 && self.ks_ladder_samples.is_empty() {
+            return;
+        }
+        if ob_sum > 0 {
+            println!(
+                "   🔧 Kalshi 簿缺细分: transport={} 429={} 4xx={} 5xx={} http其它={} json坏={}（应与 KS簿缺 {} 合计对照）",
+                self.ks_ob_transport,
+                self.ks_ob_http_429,
+                self.ks_ob_http_4xx,
+                self.ks_ob_http_5xx,
+                self.ks_ob_http_other,
+                self.ks_ob_json_bad,
+                self.ks_book_missing
+            );
+            for line in &self.ks_ob_samples {
+                println!("      · {}", line);
+            }
+        }
+        if !self.ks_ladder_samples.is_empty() {
+            println!(
+                "   🔧 Kalshi 阶梯失败样本 (至多 {} 条):",
+                self.ks_ladder_samples.len()
+            );
+            for line in &self.ks_ladder_samples {
+                println!("      · {}", line);
+            }
+        }
     }
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     println!("🚀 跨平台套利监控");
-    let live_trading = prompt_run_mode()?;
-    set_live_arbitrage_orders_allowed(live_trading);
-    if live_trading {
-        println!("📌 当前：实盘交易 (live_trading)，日志文件 {LIVE_TRADES_CSV}");
-    } else {
-        println!("📌 当前：仅跟踪 (tracking_only)");
+    prompt_confirm_live()?;
+    set_live_arbitrage_orders_allowed(true);
+    println!(
+        "📌 实盘交易：成交 JSONL: {DESK_EVENTS_JSONL}；追踪/簿快照: {TRACKING_PAIRS_CSV} / {TRACKING_ARB_EVENTS_CSV}"
+    );
+    println!(
+        "🔒 资金安全：无合格套利时主循环**仅**请求行情/订单簿/费率等只读接口；Kalshi IOC / PM FOK / 卖平敞口仅在 `validate_arbitrage_pair_post_success` 内且通过 `require_live_orders_allowed`，不因「空转」自动下单或划帐。"
+    );
+    println!(
+        "🔒 Polymarket CLOB `authenticate` 为链下鉴权；本程序不包含链上入金/USDC 划转；资金仍可能被他处改动。"
+    );
+    println!("📊 平台: Polymarket ↔ Kalshi");
+    if kalshi_orderbook_debug_enabled() {
         println!(
-            "🔒 已锁定：本进程禁止一切下单/平仓（`require_live_orders_allowed`）；秘钥仅用于只读/鉴权 API。"
+            "🔧 KALSHI_ORDERBOOK_DEBUG：追踪周期结束将打印 Kalshi 簿缺细分（transport/HTTP/json）与阶梯失败样本，各至多 {} 行。",
+            DIAG_MERGED_SAMPLE_MAX
         );
     }
-    println!("📊 平台: Polymarket ↔ Kalshi");
 
     println!("📚 加载类别配置...");
     let category_mapper = CategoryMapper::from_file("config/categories.toml")
@@ -291,37 +428,65 @@ async fn main() -> Result<()> {
     println!("🔐 加载 Kalshi / Polymarket 凭证（环境变量）…");
     let kalshi_cfg = KalshiTradeConfig::try_from_env()?;
     let pm_trader = PolymarketClobTrader::connect().await?;
-    if live_trading {
-        println!(
-            "   ✅ 凭证已就绪。用途：调用交易所 API（订单簿、Kalshi fee_changes、PM fee-rate、后续若有机会则下单等）。"
-        );
-        println!("   ⚠️ 实盘：仅在校验通过的路径中发起 IOC/FOK；秘钥仍不应用于本程序以外的操作。");
-    } else {
-        println!(
-            "   ✅ 凭证已就绪。用途：**仅限**本程序内的 API 调用（与公开行情相同的「查询」类：订单簿、费率、签名 GET 等），用于还原实盘可用的成本与价差。"
-        );
-        println!(
-            "   🔒 再次确认：仅跟踪模式下**不会**调用下单接口；若 `require_live_orders_allowed` 被绕过会直接报错退出，不发送改单请求。"
-        );
-    }
-    let live_log: Option<LiveTradesLog> = if live_trading {
-        Some(LiveTradesLog::new()?)
-    } else {
-        None
-    };
+    println!("   ✅ 凭证已就绪（订单簿、fee、成交路径）。秘钥勿用于本程序以外。");
+    let live_log = DeskEventsLog::new()?;
+
+    let tracking_pairs_log = TrackingPairsLog::new()?;
+    let tracking_arb_log = TrackingArbEventsLog::new()?;
+    println!(
+        "📝 追踪对 CSV: {}  |  套利事件（含簿）CSV: {}",
+        TRACKING_PAIRS_CSV, TRACKING_ARB_EVENTS_CSV
+    );
 
     let ks_http = HttpClient::builder()
         .timeout(Duration::from_secs(25))
         .build()
         .context("构建 Kalshi HTTP 客户端")?;
 
+    preflight_live_readonly_trading_apis(&ks_http, &kalshi_cfg, &pm_trader).await?;
+    println!("   ✅ 启动预检：两侧余额非零、Kalshi/PM 只读可用、geoblock 允许交易");
+
+    let snap = crate::session_risk::fetch_live_snapshot(&ks_http, &kalshi_cfg, &pm_trader, &polymarket)
+        .await
+        .context("会话风控：启动快照（余额+持仓+PM MTM）")?;
+    let session_risk_ctrl = crate::session_risk::SessionRiskController::from_startup_snapshot(snap.clone());
+    let startup_feishu = crate::session_risk::format_session_startup(&snap, session_risk_ctrl.baselines());
+    if let Err(e) = feishu_push::push_trade_summary_to_feishu(&startup_feishu) {
+        eprintln!("   ⚠️ 启动体检飞书未送达: {}", e);
+    }
+    let baselines_startup = session_risk_ctrl.baselines().clone();
+    let session_risk: SessionRiskHandle = Arc::new(Mutex::new(session_risk_ctrl));
+
     let (pl, pp) = arb_probe_caps();
     println!(
-        "   💵 参考总资金 ${} | 每腿探针 ${:.2} | 每对名义上限 ${:.2}（Kalshi 余额另按 {:.0}% 可动用）",
-        TOTAL_CAPITAL_USD as i32,
+        "   ── 本交易周期 · 账户快照（USD）──\n\
+         \x20   Kalshi   总资产 ${:.2}  现金 ${:.2}  市场 {} 个  token {} 个  持仓市值 ${:.2}\n\
+         \x20   PM       总资产 ${:.2}  现金 ${:.2}  市场 {} 个  token {} 个  持仓市值 ${:.2}\n\
+         \x20   持仓市值均为订单簿买卖中间价乘以持仓规模之和\n\
+         \x20   「市场」为较上层统计（Kalshi 为有敞口的 event 去重，Polymarket 为 Gamma 市场 id 去重）\n\
+         \x20   「token」为较细层（Kalshi 为有敞口的 ticker 合约腿去重，Polymarket 为 CLOB outcome token 条数）\n\
+         \x20   Polymarket 条件仓 API 为 micro 计值，须先 ÷1e6 再乘中间价\n\
+         \x20   簿不可用或单侧无流动性则该头寸不计入市值\n\
+         \x20   参考总资金 R=min(两侧总资产) ${:.2} → 每腿 ${:.4} | 每对 ${:.4}",
+        snap.ks_total_usd(),
+        snap.ks_cash_usd,
+        snap.ks_markets_n,
+        snap.ks_tokens_n,
+        snap.ks_position_mtm_usd,
+        snap.pm_total_usd(),
+        snap.pm_collateral_usd,
+        snap.pm_conditional_markets_n,
+        snap.pm_conditional_tokens_n,
+        snap.pm_cond_mtm_usd,
+        baselines_startup.reference_capital_usd,
         pl,
         pp,
-        crate::system_params::KALSHI_BALANCE_DEPLOYABLE_FRAC * 100.0
+    );
+    println!(
+        "   💵 Kalshi 可部署比例 {:.0}% 可接受净利 = pair_cap×{:.4}（≈{:.2}%）",
+        crate::system_params::KALSHI_BALANCE_DEPLOYABLE_FRAC * 100.0,
+        LIVE_ARBIT_MIN_NET_PROFIT_FRAC_OF_PAIR_CAP,
+        LIVE_ARBIT_MIN_NET_PROFIT_FRAC_OF_PAIR_CAP * 100.0
     );
     println!(
         "   🚀 价格追踪并发 = {}（`system_params::ARB_TRACK_CONCURRENCY`）",
@@ -369,12 +534,7 @@ async fn main() -> Result<()> {
 
     println!("\n🔍 初始化 · 全量匹配（周期 #0，沿用本次拉取与索引，不重复请求、不重训）...");
     let (per_leg_cap, pair_cap) = arb_probe_caps();
-    let top10_caption_init = format!(
-        "live · 参考资金 ${} · 每腿 ${:.2} · 每对 ${:.2}",
-        TOTAL_CAPITAL_USD as i32,
-        per_leg_cap,
-        pair_cap
-    );
+    let init_track_params = build_tracking_params_snapshot(&monitor_state, per_leg_cap, pair_cap);
     let mut no_track_arb_diag: Option<TrackingArbDiag> = None;
     run_full_match_work(
         &polymarket,
@@ -387,16 +547,19 @@ async fn main() -> Result<()> {
         per_leg_cap,
         pair_cap,
         per_leg_cap,
-        live_log.as_ref(),
-        live_trading,
+        &live_log,
+        &session_risk,
         &ks_http,
         &kalshi_cfg,
         &pm_trader,
-        &top10_caption_init,
         false,
         &mut no_track_arb_diag,
+        &tracking_arb_log,
+        &init_track_params,
     )
     .await?;
+    live_guard_pm_collateral_after_full_match(&pm_trader).await?;
+    tracking_pairs_log.append_cycle_snapshot(0, "full_match", &monitor_state.tracked_pairs)?;
 
     println!("\n✅ 初始化完成（全量匹配已作为周期 #0 完成）");
     println!("   📊 Kalshi 市场数: {}", kalshi_markets.len());
@@ -419,11 +582,13 @@ async fn main() -> Result<()> {
             &mut matcher,
             &arb_detector,
             &mut monitor_state,
-            live_log.as_ref(),
-            live_trading,
+            &live_log,
+            &session_risk,
             &ks_http,
             &kalshi_cfg,
             &pm_trader,
+            &tracking_pairs_log,
+            &tracking_arb_log,
         )
         .await
         {
@@ -442,6 +607,22 @@ async fn main() -> Result<()> {
     }
 }
 
+/// 实盘：全量匹配结束后、进入后续价格追踪前，若 CLOB Collateral 为 0 则立即终止（避免签名类型/缓存导致的误判与空仓继续跑）。
+async fn live_guard_pm_collateral_after_full_match(pm_trader: &PolymarketClobTrader) -> Result<()> {
+    let bal = pm_trader.fetch_clob_collateral_balance_for_guard().await?;
+    if bal == Decimal::ZERO {
+        anyhow::bail!(
+            "实盘保护：Polymarket CLOB Collateral 余额为 0，程序已停止。请检查 {}（网页钱包常见为 1=Proxy）、入金与 USDC 授权；可设置 PM_CLOB_BALANCE_SYNC=1 后重试。",
+            POLYMARKET_SIGNATURE_TYPE_ENV
+        );
+    }
+    println!(
+        "   🛡️ 实盘保护：Polymarket CLOB Collateral ≈ ${:.2} USD",
+        polymarket_trade::clob_collateral_micro_usdc_to_usd(&bal)
+    );
+    Ok(())
+}
+
 /// 追踪周期内从 Gamma 刷新 PM 快照（与原先 `run_tracking_cycle` 内联逻辑一致）
 async fn refresh_pm_market_from_gamma(pm: &PolymarketClient, target: &mut Market) {
     if let Ok(fresh_pm) = pm.fetch_market_snapshot_by_id(&target.market_id).await {
@@ -455,6 +636,24 @@ async fn refresh_pm_market_from_gamma(pm: &PolymarketClient, target: &mut Market
         }
         if target.resolution_date.is_none() {
             target.resolution_date = fresh_pm.resolution_date;
+        }
+    }
+}
+
+/// Polymarket `fee-rate` 失败时用 [`PM_TAKER_FEE_BPS_WHEN_FETCH_FAILS`] 保守估算（不丢弃机会、不按 0 bps）。
+async fn pm_fee_bps_with_conservative_fallback(
+    pm_trader: &PolymarketClobTrader,
+    token_id: &str,
+    log_ctx: &str,
+) -> u32 {
+    match pm_trader.get_fee_bps_for_token(token_id).await {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!(
+                "   ⚠️ [{}] Polymarket fee_rate 拉取失败，保守使用 {} bps: {}",
+                log_ctx, PM_TAKER_FEE_BPS_WHEN_FETCH_FAILS, e
+            );
+            PM_TAKER_FEE_BPS_WHEN_FETCH_FAILS
         }
     }
 }
@@ -488,9 +687,9 @@ async fn validate_arbitrage_core(
         }
         return Ok(None);
     };
-    let (pm_book_res, ks_book_res) = tokio::join!(
+    let (pm_book_res, ks_ob_report) = tokio::join!(
         polymarket.get_order_book(tid),
-        kalshi.get_order_book(&kalshi_market.market_id),
+        kalshi.fetch_order_book_raw(&kalshi_market.market_id),
     );
     let Some(pm_book) = pm_book_res.ok().flatten() else {
         if let Some(d) = arb_diag.as_mut() {
@@ -498,16 +697,17 @@ async fn validate_arbitrage_core(
         }
         return Ok(None);
     };
-    let Some(ks_book) = ks_book_res.ok().flatten() else {
+    let Some(ks_book) = ks_ob_report.json.as_ref() else {
         if let Some(d) = arb_diag.as_mut() {
             d.ks_book_missing += 1;
+            d.record_kalshi_ob_outcome(&kalshi_market.market_id, &ks_ob_report.outcome);
         }
         return Ok(None);
     };
 
     let ladders = match build_pair_orderbook_ladders_result(
         &pm_book,
-        &ks_book,
+        ks_book,
         pm_side,
         kalshi_side,
         pm_buy_no_via_yes,
@@ -515,16 +715,13 @@ async fn validate_arbitrage_core(
         Ok(l) => l,
         Err(reason) => {
             if let Some(d) = arb_diag.as_mut() {
-                d.record_ladder_build_fail(reason);
+                d.record_ladder_build_fail(reason, Some(&kalshi_market.market_id));
             }
             return Ok(None);
         }
     };
 
-    let pm_bps = match pm_trader.get_fee_bps_for_token(tid).await {
-        Ok(b) => b,
-        Err(_) => return Ok(None),
-    };
+    let pm_bps = pm_fee_bps_with_conservative_fallback(pm_trader, tid, "套利识别").await;
     let scan_cost = ArbCostParams {
         ks_taker_fee_multiplier: ks_fee.multiplier_for_ticker(&kalshi_market.market_id),
         pm_fee_bps: pm_bps,
@@ -592,189 +789,67 @@ async fn validate_arbitrage_core(
     Ok(Some((opp, pm_expiry, ks_expiry)))
 }
 
-/// 第二腿（PM）在业务重试后仍失败，且 Kalshi 第一腿已成交：在 **放宽 PM 对冲** 与 **Kalshi IOC 卖平** 间择**预估净利更高**者执行；主路径失败时尝试另一条。
-async fn try_stop_loss_min_loss(
-    polymarket: &PolymarketClient,
-    kalshi: &KalshiClient,
-    arb_detector: &ArbitrageDetector,
-    pm_market: &Market,
-    kalshi_market: &Market,
-    pm_side: &str,
-    kalshi_side: &str,
-    pm_token_id: &str,
-    ks_res: &KalshiIocResult,
-    leg_fee: &ArbCostParams,
-    ks_fill_price_dollars: f64,
-    per_leg_cap_usd: f64,
-    pair_cap_usdt: f64,
-    ks_http: &HttpClient,
+/// 实盘启动后、**拉取全量市场之前**：**只读**校验 Kalshi / Polymarket CLOB 余额均非零，并检查 Polymarket geoblock；不下单、不涉及资金划转。
+async fn preflight_live_readonly_trading_apis(
+    http: &HttpClient,
     kalshi_cfg: &KalshiTradeConfig,
     pm_trader: &PolymarketClobTrader,
-    pm_json: &mut String,
-    pm_err: &mut String,
-    log_contracts: &mut f64,
-) -> Result<Option<&'static str>> {
-    require_live_orders_allowed().context("try_stop_loss_min_loss")?;
-    let n1 = ks_res.fill_count.max(1);
-    let kalshi_cost = ks_res.fill_cost_usd_upper();
-    let pm_buy_no_via_yes = pm_buy_no_uses_yes_token_complement(pm_market, pm_side);
-
-    let (pm_book_res, ks_book_res) = tokio::join!(
-        polymarket.get_order_book(pm_token_id),
-        kalshi.get_order_book(&kalshi_market.market_id),
-    );
-    let Some(pm_book) = pm_book_res.ok().flatten() else {
-        eprintln!("   ⚠️ [止损] 拉取 Polymarket 订单簿失败，跳过损失比较");
-        return Ok(None);
-    };
-    let Some(ks_book) = ks_book_res.ok().flatten() else {
-        eprintln!("   ⚠️ [止损] 拉取 Kalshi 订单簿失败，跳过损失比较");
-        return Ok(None);
-    };
-    let ladders = match build_pair_orderbook_ladders_result(
-        &pm_book,
-        &ks_book,
-        pm_side,
-        kalshi_side,
-        pm_buy_no_via_yes,
-    ) {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("   ⚠️ [止损] 构建阶梯失败 {:?}，跳过损失比较", e);
-            return Ok(None);
-        }
-    };
-
-    let hedge_best = arb_detector.best_pm_hedge_net_after_kalshi(
-        n1,
-        &ladders.pm_asks,
-        kalshi_cost,
-        leg_fee,
-        ks_fill_price_dollars,
-        pair_cap_usdt,
-    );
-    let unwind_net_est = match try_parse_kalshi_sell_bids(&ks_book, kalshi_side) {
-        Ok(bids) => arb_detector.estimate_kalshi_sell_unwind_net(
-            n1,
-            &bids,
-            kalshi_cost,
-            leg_fee,
-            pair_cap_usdt,
-        ),
-        Err(e) => {
-            eprintln!("   ⚠️ [止损] 解析 Kalshi 卖盘失败 {:?}，无法估算卖平净利", e);
-            None
-        }
-    };
-
-    let prefer_hedge = match (hedge_best, unwind_net_est) {
-        (Some((_, hn)), Some(un)) => hn >= un,
-        (Some(_), None) => true,
-        (None, Some(_)) => false,
-        (None, None) => {
-            eprintln!("   ⚠️ [止损] 无可用放宽对冲亦无卖盘估算，放弃自动处置");
-            return Ok(None);
-        }
-    };
-
-    println!(
-        "   📛 [止损] 对比路径（预估净利，美元；卖平含单腿 Gas、对冲含两腿 Gas，略偏于卖平）：PM放宽={:?} | Kalshi卖平≈{:?} → 先执行{}",
-        hedge_best.map(|(n, net)| format!("n={} net≈{:.6}", n, net)),
-        unwind_net_est.map(|u| format!("{:.6}", u)),
-        if prefer_hedge { "放宽PM对冲" } else { "Kalshi卖平" }
-    );
-
-    if prefer_hedge {
-        if let Some((n2, _)) = hedge_best {
-            if let Some((_, pm_avg)) = cost_for_exact_contracts(&ladders.pm_asks, n2 as f64) {
-                match pm_trader
-                    .buy_outcome_token_fok_n(pm_token_id, n2 as f64, pm_avg, per_leg_cap_usd)
-                    .await
-                {
-                    Ok(j) => {
-                        *pm_json = j;
-                        pm_err.clear();
-                        *log_contracts = n2 as f64;
-                        return Ok(Some("STOP_HEDGE_OK"));
-                    }
-                    Err(e) => eprintln!("   ⚠️ [止损] 放宽 PM 对冲失败: {}，改试 Kalshi 卖平", e),
-                }
-            } else {
-                eprintln!("   ⚠️ [止损] 放宽 PM 阶梯不足以支撑 n2={}，改试 Kalshi 卖平", n2);
-            }
-        }
-        let oid = uuid::Uuid::new_v4().to_string();
-        match kalshi_place_sell_ioc(
-            ks_http,
-            kalshi_cfg,
-            &kalshi_market.market_id,
-            kalshi_side,
-            n1,
-            STOP_LOSS_KALSHI_SELL_MIN_PRICE_CENTS,
-            &oid,
-        )
+) -> Result<()> {
+    println!("   🔎 实盘预检：查询 Kalshi / Polymarket CLOB 余额（拉取市场前）…");
+    let ks_cents = kalshi_get_balance_cents(http, kalshi_cfg)
         .await
-        {
-            Ok(res) => {
-                println!(
-                    "   📛 [止损] Kalshi IOC 卖平 order_id={} fill_count={}/{}",
-                    res.order_id, res.fill_count, n1
-                );
-                *pm_err = format!(
-                    "stop_unwind_kalshi order_id={} fill_count={}",
-                    res.order_id, res.fill_count
-                );
-                *log_contracts = res.fill_count as f64;
-                return Ok(Some("STOP_UNWIND_OK"));
-            }
-            Err(e) => eprintln!("   ⚠️ [止损] Kalshi 卖平失败: {}", e),
-        }
-    } else {
-        let oid = uuid::Uuid::new_v4().to_string();
-        match kalshi_place_sell_ioc(
-            ks_http,
-            kalshi_cfg,
-            &kalshi_market.market_id,
-            kalshi_side,
-            n1,
-            STOP_LOSS_KALSHI_SELL_MIN_PRICE_CENTS,
-            &oid,
-        )
-        .await
-        {
-            Ok(res) => {
-                println!(
-                    "   📛 [止损] Kalshi IOC 卖平 order_id={} fill_count={}/{}",
-                    res.order_id, res.fill_count, n1
-                );
-                *pm_err = format!(
-                    "stop_unwind_kalshi order_id={} fill_count={}",
-                    res.order_id, res.fill_count
-                );
-                *log_contracts = res.fill_count as f64;
-                return Ok(Some("STOP_UNWIND_OK"));
-            }
-            Err(e) => eprintln!("   ⚠️ [止损] Kalshi 卖平失败: {}，改试放宽 PM 对冲", e),
-        }
-        if let Some((n2, _)) = hedge_best {
-            if let Some((_, pm_avg)) = cost_for_exact_contracts(&ladders.pm_asks, n2 as f64) {
-                match pm_trader
-                    .buy_outcome_token_fok_n(pm_token_id, n2 as f64, pm_avg, per_leg_cap_usd)
-                    .await
-                {
-                    Ok(j) => {
-                        *pm_json = j;
-                        pm_err.clear();
-                        *log_contracts = n2 as f64;
-                        return Ok(Some("STOP_HEDGE_OK"));
-                    }
-                    Err(e) => eprintln!("   ⚠️ [止损] 放宽 PM 对冲失败: {}", e),
-                }
-            }
-        }
+        .context("实盘预检：Kalshi GET /portfolio/balance 不可访问或鉴权失败")?;
+    if ks_cents <= 0 {
+        anyhow::bail!(
+            "实盘预检：Kalshi 余额为 {} 美分（须 > 0）。请先充值后再启动实盘。",
+            ks_cents
+        );
     }
+    println!(
+        "      Kalshi /portfolio/balance = {}¢（${:.2}）",
+        ks_cents,
+        ks_cents as f64 / 100.0
+    );
 
-    Ok(Some("STOP_LOSS_FAIL"))
+    let pm_collateral = pm_trader
+        .fetch_clob_collateral_balance_for_guard()
+        .await
+        .context("实盘预检：Polymarket CLOB balance-allowance（Collateral）失败")?;
+    if pm_collateral == Decimal::ZERO {
+        anyhow::bail!(
+            "实盘预检：Polymarket CLOB Collateral 为 0（须 > 0）。请检查 {}（常见网页账户为 1=Proxy）与私钥一致；可设 PM_CLOB_BALANCE_SYNC=1 后重试。",
+            POLYMARKET_SIGNATURE_TYPE_ENV
+        );
+    }
+    let pm_u = polymarket_trade::clob_collateral_micro_usdc_to_usd(&pm_collateral);
+    println!(
+        "      Polymarket CLOB Collateral ≈ ${:.2} USD（micro USDC ÷1e6，raw={}）",
+        pm_u, pm_collateral
+    );
+
+    let resp = http
+        .get("https://polymarket.com/api/geoblock")
+        .send()
+        .await
+        .context("实盘预检：GET https://polymarket.com/api/geoblock 失败")?;
+    if !resp.status().is_success() {
+        anyhow::bail!(
+            "实盘预检：Polymarket geoblock HTTP {}（须可访问以确认地理限制）",
+            resp.status().as_u16()
+        );
+    }
+    let v: serde_json::Value = resp
+        .json()
+        .await
+        .context("实盘预检：geoblock 响应非 JSON")?;
+    let blocked = v.get("blocked").and_then(|x| x.as_bool()).unwrap_or(true);
+    if blocked {
+        anyhow::bail!(
+            "实盘预检：Polymarket geoblock 禁止从此环境交易（blocked=true），country={:?}",
+            v.get("country")
+        );
+    }
+    Ok(())
 }
 
 async fn validate_arbitrage_pair_post_success(
@@ -791,7 +866,7 @@ async fn validate_arbitrage_pair_post_success(
     cycle_id: usize,
     cycle_phase: &str,
     pair_label: &str,
-    live_log: &LiveTradesLog,
+    live_log: &DeskEventsLog,
     ks_http: &HttpClient,
     kalshi_cfg: &KalshiTradeConfig,
     pm_trader: &PolymarketClobTrader,
@@ -802,13 +877,16 @@ async fn validate_arbitrage_pair_post_success(
     opp: &ArbitrageOpportunity,
     pm_expiry: Option<DateTime<Utc>>,
     ks_expiry: Option<DateTime<Utc>>,
+    session_risk: &SessionRiskHandle,
 ) -> Result<()> {
     require_live_orders_allowed().context("validate_arbitrage_pair_post_success")?;
     let Some(pm_token_id) = polymarket_clob_token_id_for_buy(pm_market, pm_side) else {
         anyhow::bail!("validate_arbitrage_pair_post_success: missing PM clob token");
     };
 
-    println!("\n  ── 实盘执行：识别 ✓ → 第一腿 Kalshi → 第二腿 Polymarket（每次取簿重算净利，第二腿业务最多 {LIVE_SECOND_LEG_BUSINESS_ATTEMPTS} 次）──");
+    println!(
+        "\n  ── 实盘执行：识别 ✓ → 第一腿 Kalshi（固定先）→ 第二腿 Polymarket：{LIVE_SECOND_LEG_DEADLINE_SECS}s 窗内对冲 vs 卖平 ──"
+    );
 
     let inv = if needs_inversion { " (Y/N颠倒)" } else { "" };
     let pm_slip = if opp.pm_optimal > 0.0 {
@@ -921,218 +999,332 @@ async fn validate_arbitrage_pair_post_success(
         }
     }
 
-    let mut pm_json = String::new();
     let mut pm_err = String::new();
     let mut log_contracts = opp.contracts;
     let mut status: &str = "INIT";
+    let mut pm_post_responses: Vec<PostOrderResponse> = Vec::new();
+    let mut ks_unwind_order_ids: Vec<String> = Vec::new();
 
     if !ks_err.is_empty() {
         pm_err = "skipped_pm_kalshi_failed".to_string();
         status = "KS_FAIL";
-        } else if let Some(ref ks_res) = kalshi_fill {
-        let n1 = ks_res.fill_count;
-        let kalshi_cost = ks_res.fill_cost_usd_upper();
+    } else if let Some(ref ks_res) = kalshi_fill {
+        let n1_orig = ks_res.fill_count;
+        let kalshi_cost_full = ks_res.fill_cost_usd_upper();
         let ks_fill_px = ks_res.limit_price_cents as f64 / 100.0;
-        log_contracts = n1 as f64;
+        log_contracts = n1_orig as f64;
 
-        pm_trader.invalidate_clob_caches();
-        let leg_pm_bps = pm_trader
-            .get_fee_bps_for_token(pm_token_id)
-            .await
-            .unwrap_or(0);
-        let leg_fee = ArbCostParams {
-            ks_taker_fee_multiplier: kalshi_fee.multiplier_for_ticker(&kalshi_market.market_id),
-            pm_fee_bps: leg_pm_bps,
-            pm_exponent: pm_exponent_for_pm_market(category_mapper, pm_market),
-        };
-
-        let pm_buy_no_via_yes = pm_buy_no_uses_yes_token_complement(pm_market, pm_side);
-        let mut pm_placed = false;
-        let mut pm_fail_precheck_only = true;
-
-        for biz_attempt in 0..LIVE_SECOND_LEG_BUSINESS_ATTEMPTS {
-            let (pm_book_res, ks_book_res) = tokio::join!(
-                polymarket.get_order_book(pm_token_id),
-                kalshi.get_order_book(&kalshi_market.market_id),
-            );
-            let Some(pm_book) = pm_book_res.ok().flatten() else {
-                pm_fail_precheck_only = false;
-                eprintln!(
-                    "   ⚠️ [第二腿] 拉取 Polymarket 订单簿失败 (业务尝试 {}/{})",
-                    biz_attempt + 1,
-                    LIVE_SECOND_LEG_BUSINESS_ATTEMPTS
-                );
-                if biz_attempt + 1 < LIVE_SECOND_LEG_BUSINESS_ATTEMPTS {
-                    let wait_ms = RETRY_INITIAL_DELAY_MS.saturating_mul(biz_attempt as u64 + 1);
-                    time::sleep(Duration::from_millis(wait_ms)).await;
-                }
-                continue;
-            };
-            let Some(ks_book) = ks_book_res.ok().flatten() else {
-                pm_fail_precheck_only = false;
-                eprintln!(
-                    "   ⚠️ [第二腿] 拉取 Kalshi 订单簿失败 (业务尝试 {}/{})",
-                    biz_attempt + 1,
-                    LIVE_SECOND_LEG_BUSINESS_ATTEMPTS
-                );
-                if biz_attempt + 1 < LIVE_SECOND_LEG_BUSINESS_ATTEMPTS {
-                    let wait_ms = RETRY_INITIAL_DELAY_MS.saturating_mul(biz_attempt as u64 + 1);
-                    time::sleep(Duration::from_millis(wait_ms)).await;
-                }
-                continue;
+        if n1_orig < 1 {
+            eprintln!("   ⚠️ [第二腿] Kalshi 成交量为 0，跳过");
+            status = "KS_ZERO_FILL";
+            pm_err = "kalshi_fill_zero".to_string();
+        } else {
+            pm_trader.invalidate_clob_caches();
+            let leg_pm_bps =
+                pm_fee_bps_with_conservative_fallback(pm_trader, pm_token_id, "第二腿").await;
+            let leg_fee = ArbCostParams {
+                ks_taker_fee_multiplier: kalshi_fee.multiplier_for_ticker(&kalshi_market.market_id),
+                pm_fee_bps: leg_pm_bps,
+                pm_exponent: pm_exponent_for_pm_market(category_mapper, pm_market),
             };
 
-            let ladders = match build_pair_orderbook_ladders_result(
-                &pm_book,
-                &ks_book,
-                pm_side,
-                kalshi_side,
-                pm_buy_no_via_yes,
-            ) {
-                Ok(l) => l,
-                Err(e) => {
-                    pm_fail_precheck_only = false;
-                    eprintln!(
-                        "   ⚠️ [第二腿] 解析订单簿阶梯失败 {:?} (业务尝试 {}/{})",
-                        e,
-                        biz_attempt + 1,
-                        LIVE_SECOND_LEG_BUSINESS_ATTEMPTS
-                    );
-                    if biz_attempt + 1 < LIVE_SECOND_LEG_BUSINESS_ATTEMPTS {
-                        let wait_ms = RETRY_INITIAL_DELAY_MS.saturating_mul(biz_attempt as u64 + 1);
-                        time::sleep(Duration::from_millis(wait_ms)).await;
-                    }
-                    continue;
-                }
-            };
+            let pm_buy_no_via_yes = pm_buy_no_uses_yes_token_complement(pm_market, pm_side);
+            let margin_usd =
+                pair_cap_usdt * LIVE_HEDGE_VS_UNWIND_MARGIN_FRAC_OF_PAIR_CAP;
+            let mut remaining = n1_orig;
+            let deadline =
+                Instant::now() + Duration::from_secs(LIVE_SECOND_LEG_DEADLINE_SECS);
+            let mut pm_filled_total = 0.0_f64;
+            status = "OK";
 
-            let Some(n2) = arb_detector.pick_pm_hedge_n_after_kalshi(
-                n1,
-                &ladders.pm_asks,
-                kalshi_cost,
-                &leg_fee,
-                ks_fill_px,
-                pair_cap_usdt,
-            ) else {
-                pm_err = "pm_precheck_no_profitable_n".to_string();
-                eprintln!(
-                    "   ⚠️ [第二腿] 当前簿上无满足净利阈值(>{:.6})的规模 n≤n1={} (业务尝试 {}/{})",
-                    arb_detector.min_profit_usd_for_pair_cap(pair_cap_usdt),
-                    n1,
-                    biz_attempt + 1,
-                    LIVE_SECOND_LEG_BUSINESS_ATTEMPTS
-                );
-                if biz_attempt + 1 < LIVE_SECOND_LEG_BUSINESS_ATTEMPTS {
-                    let wait_ms = RETRY_INITIAL_DELAY_MS.saturating_mul(biz_attempt as u64 + 1);
-                    time::sleep(Duration::from_millis(wait_ms)).await;
-                }
-                continue;
-            };
-
-            let Some((_, pm_avg)) = cost_for_exact_contracts(&ladders.pm_asks, n2 as f64) else {
-                pm_fail_precheck_only = false;
-                pm_err = "pm_ladder_insufficient_for_n".to_string();
-                continue;
-            };
-
-            if n2 < n1 {
-                println!(
-                    "   ⚠️ [第二腿] 次优 n2={} < Kalshi 已成交 n1={}，剩余 {} 份未对冲（平仓未实现）",
-                    n2,
-                    n1,
-                    n1 - n2
-                );
-            }
-
-            let est_net = arb_detector
-                .net_profit_pm_hedge_n(
-                    n2 as f64,
-                    &ladders.pm_asks,
-                    n1 as f64,
-                    kalshi_cost,
-                    &leg_fee,
-                    ks_fill_px,
-                    pair_cap_usdt,
-                )
-                .unwrap_or(f64::NAN);
             println!(
-                "   📘 [第二腿 Polymarket] 业务尝试 {}/{}: n2={} pm_avg≈{:.6} 预估净利≈{:.6}",
-                biz_attempt + 1,
-                LIVE_SECOND_LEG_BUSINESS_ATTEMPTS,
-                n2,
-                pm_avg,
-                est_net
+                "   📘 [第二腿] {LIVE_SECOND_LEG_DEADLINE_SECS}s 窗：Kalshi（腿1）卖侧 bid 总深度与 PM 买侧 ask 总深度均 ≥ 当前剩余时，才比较对冲净利 H 与卖平净利 U；否则不比较并优先走 PM 对冲。Kalshi bid 不足剩余时不比较。",
+            );
+            println!(
+                "   📘 [第二腿] 若 H < U − pair_cap×{:.4}（≈ ${:.6}），则 IOC 卖平 Kalshi 剩余仓位。",
+                LIVE_HEDGE_VS_UNWIND_MARGIN_FRAC_OF_PAIR_CAP,
+                margin_usd
             );
 
-            log_contracts = n2 as f64;
-            match pm_trader
-                .buy_outcome_token_fok_n(&pm_token_id, n2 as f64, pm_avg, per_leg_cap_usd)
-                .await
-            {
-                Ok(j) => {
-                    pm_json = j;
-                    pm_err.clear();
-                    pm_placed = true;
-                    status = if n2 < n1 {
-                        "PARTIAL_PM_OK"
-                    } else {
-                        "OK"
-                    };
-                    println!("   📗 [第二腿 Polymarket] FOK 已提交");
+            'second_leg: while remaining > 0 {
+                if Instant::now() >= deadline {
                     break;
                 }
-                Err(e) => {
-                    pm_fail_precheck_only = false;
-                    pm_err = format!("{}", e);
-                    eprintln!(
-                        "   ⚠️ [Polymarket] 下单失败 (业务尝试 {}/{}): {}",
-                        biz_attempt + 1,
-                        LIVE_SECOND_LEG_BUSINESS_ATTEMPTS,
-                        e
+
+                let (pm_book_res, ks_book_res) = tokio::join!(
+                    polymarket.get_order_book(pm_token_id),
+                    kalshi.get_order_book(&kalshi_market.market_id),
+                );
+                let Some(pm_book) = pm_book_res.ok().flatten() else {
+                    eprintln!("   ⚠️ [第二腿] 拉取 Polymarket 订单簿失败，稍后重试");
+                    time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                };
+                let Some(ks_book) = ks_book_res.ok().flatten() else {
+                    eprintln!("   ⚠️ [第二腿] 拉取 Kalshi 订单簿失败，稍后重试");
+                    time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                };
+
+                let ladders = match build_pair_orderbook_ladders_result(
+                    &pm_book,
+                    &ks_book,
+                    pm_side,
+                    kalshi_side,
+                    pm_buy_no_via_yes,
+                ) {
+                    Ok(l) => l,
+                    Err(e) => {
+                        eprintln!("   ⚠️ [第二腿] 构建阶梯失败 {:?}，稍后重试", e);
+                        time::sleep(Duration::from_millis(100)).await;
+                        continue;
+                    }
+                };
+
+                let ks_bids = match try_parse_kalshi_sell_bids(&ks_book, kalshi_side) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        eprintln!("   ⚠️ [第二腿] 解析 Kalshi bid 阶梯失败 {:?}，稍后重试", e);
+                        time::sleep(Duration::from_millis(100)).await;
+                        continue;
+                    }
+                };
+
+                let depth_pm = total_size_buy_ladder(&ladders.pm_asks);
+                let depth_ks_bid = total_size_sell_ladder(&ks_bids);
+                let rem_f = remaining as f64;
+                let bid_ok = depth_ks_bid + 1e-9 >= rem_f;
+                let ask_ok = depth_pm + 1e-9 >= rem_f;
+
+                if bid_ok && ask_ok {
+                    let h_est = arb_detector.net_profit_pm_hedge_n(
+                        rem_f,
+                        &ladders.pm_asks,
+                        n1_orig as f64,
+                        kalshi_cost_full,
+                        &leg_fee,
+                        ks_fill_px,
+                        pair_cap_usdt,
                     );
-                    if biz_attempt + 1 < LIVE_SECOND_LEG_BUSINESS_ATTEMPTS {
-                        let wait_ms = RETRY_INITIAL_DELAY_MS.saturating_mul(biz_attempt as u64 + 1);
-                        time::sleep(Duration::from_millis(wait_ms)).await;
+                    let k_rem = kalshi_cost_full * (rem_f / n1_orig as f64);
+                    let u_est = arb_detector.estimate_kalshi_sell_unwind_net(
+                        remaining,
+                        &ks_bids,
+                        k_rem,
+                        &leg_fee,
+                        pair_cap_usdt,
+                    );
+                    if let (Some(h), Some(u)) = (h_est, u_est) {
+                        if h < u - margin_usd {
+                            println!(
+                                "   📙 [第二腿] H≈{:.6} < U−margin（U≈{:.6}, margin=${:.6}）→ Kalshi IOC 卖平剩余 {}",
+                                h,
+                                u,
+                                margin_usd,
+                                remaining
+                            );
+                            let oid = uuid::Uuid::new_v4().to_string();
+                            match kalshi_place_sell_ioc(
+                                ks_http,
+                                kalshi_cfg,
+                                &kalshi_market.market_id,
+                                kalshi_side,
+                                remaining,
+                                STOP_LOSS_KALSHI_SELL_MIN_PRICE_CENTS,
+                                &oid,
+                            )
+                            .await
+                            {
+                                Ok(res) => {
+                                    ks_unwind_order_ids.push(res.order_id.clone());
+                                    println!(
+                                        "   📙 [第二腿] 卖平 IOC order_id={} fill_count={}/{}",
+                                        res.order_id,
+                                        res.fill_count,
+                                        remaining
+                                    );
+                                    pm_err = format!(
+                                        "unwind_compare order_id={} fill_count={}",
+                                        res.order_id, res.fill_count
+                                    );
+                                    remaining = 0;
+                                    status = "UNWIND_COMPARE";
+                                    log_contracts = pm_filled_total;
+                                    break 'second_leg;
+                                }
+                                Err(e) => {
+                                    eprintln!("   ⚠️ [第二腿] 卖平失败: {}，继续循环", e);
+                                    time::sleep(Duration::from_millis(150)).await;
+                                    continue 'second_leg;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let mut n2_target = remaining;
+                if depth_pm + 1e-9 < rem_f {
+                    n2_target = depth_pm.floor() as i64;
+                    if n2_target > remaining {
+                        n2_target = remaining;
+                    }
+                }
+                if n2_target < 1 {
+                    eprintln!(
+                        "   ⚠️ [第二腿] PM 买盘总深度 {:.4} < 1 份，等待簿更新…",
+                        depth_pm
+                    );
+                    time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+
+                if n2_target < remaining {
+                    println!(
+                        "   📘 [第二腿] PM ask 总深度 {:.1} < 剩余 {}，本节先买 {}",
+                        depth_pm, remaining, n2_target
+                    );
+                }
+
+                let Some((_, pm_avg)) =
+                    cost_for_exact_contracts(&ladders.pm_asks, n2_target as f64)
+                else {
+                    eprintln!(
+                        "   ⚠️ [第二腿] PM 阶梯无法精确吃满 n2={}，等待…",
+                        n2_target
+                    );
+                    time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                };
+
+                let est_net = arb_detector
+                    .net_profit_pm_hedge_n(
+                        n2_target as f64,
+                        &ladders.pm_asks,
+                        n1_orig as f64,
+                        kalshi_cost_full,
+                        &leg_fee,
+                        ks_fill_px,
+                        pair_cap_usdt,
+                    )
+                    .unwrap_or(f64::NAN);
+                println!(
+                    "   📘 [第二腿] PM 对冲: 剩余={} n2={} pm_avg≈{:.6} 预估净利≈{:.6}",
+                    remaining, n2_target, pm_avg, est_net
+                );
+
+                match pm_trader
+                    .buy_outcome_token_fok_n(
+                        &pm_token_id,
+                        n2_target as f64,
+                        pm_avg,
+                        per_leg_cap_usd,
+                    )
+                    .await
+                {
+                    Ok(post) => {
+                        pm_post_responses.push(post);
+                        pm_err.clear();
+                        pm_filled_total += n2_target as f64;
+                        log_contracts = pm_filled_total;
+                        remaining -= n2_target;
+                        status = if remaining > 0 {
+                            "PARTIAL_PM_PROGRESS"
+                        } else {
+                            "OK"
+                        };
+                        println!(
+                            "   📗 [第二腿 Polymarket] FOK 已提交，累计对冲 {:.1} / {}",
+                            pm_filled_total, n1_orig
+                        );
+                    }
+                    Err(e) => {
+                        pm_err = format!("{}", e);
+                        eprintln!("   ⚠️ [第二腿] PM FOK 失败: {}，将重试", e);
+                        time::sleep(Duration::from_millis(120)).await;
                     }
                 }
             }
-        }
 
-        if !pm_placed && ks_err.is_empty() {
-            let prelim: &'static str = if pm_fail_precheck_only && pm_err == "pm_precheck_no_profitable_n"
-            {
-                "PM_SKIP_UNPROFITABLE"
-            } else {
-                "PM_FAIL"
-            };
-            status = prelim;
-            if let Some(st) = try_stop_loss_min_loss(
-                polymarket,
-                kalshi,
-                arb_detector,
-                pm_market,
-                kalshi_market,
-                pm_side,
-                kalshi_side,
-                pm_token_id,
-                ks_res,
-                &leg_fee,
-                ks_fill_px,
-                per_leg_cap_usd,
-                pair_cap_usdt,
-                ks_http,
-                kalshi_cfg,
-                pm_trader,
-                &mut pm_json,
-                &mut pm_err,
-                &mut log_contracts,
-            )
-            .await?
-            {
-                status = st;
+            if remaining > 0 && status != "UNWIND_COMPARE" {
+                println!(
+                    "   📙 [第二腿] 时间窗结束仍有敞口 {} 份 → Kalshi IOC 卖平（最多重试 {} 次）",
+                    remaining, MAX_RETRIES
+                );
+                let mut unwind_res: Option<KalshiIocResult> = None;
+                let mut unwind_last_err = String::new();
+                for attempt in 0..MAX_RETRIES {
+                    let oid = uuid::Uuid::new_v4().to_string();
+                    match kalshi_place_sell_ioc(
+                        ks_http,
+                        kalshi_cfg,
+                        &kalshi_market.market_id,
+                        kalshi_side,
+                        remaining,
+                        STOP_LOSS_KALSHI_SELL_MIN_PRICE_CENTS,
+                        &oid,
+                    )
+                    .await
+                    {
+                        Ok(res) => {
+                            unwind_res = Some(res);
+                            unwind_last_err.clear();
+                            break;
+                        }
+                        Err(e) => {
+                            unwind_last_err = format!("{}", e);
+                            eprintln!(
+                                "   ⚠️ [第二腿] 窗末卖平失败 (重试 {}/{}): {}",
+                                attempt + 1,
+                                MAX_RETRIES,
+                                e
+                            );
+                            if attempt + 1 < MAX_RETRIES {
+                                let wait_ms =
+                                    RETRY_INITIAL_DELAY_MS.saturating_mul(attempt as u64 + 1);
+                                time::sleep(Duration::from_millis(wait_ms)).await;
+                            }
+                        }
+                    }
+                }
+                match unwind_res {
+                    Some(res) => {
+                        ks_unwind_order_ids.push(res.order_id.clone());
+                        println!(
+                            "   📙 [第二腿] 窗末卖平 IOC order_id={} fill_count={}/{}",
+                            res.order_id, res.fill_count, remaining
+                        );
+                        pm_err = format!(
+                            "unwind_timeout order_id={} fill_count={}",
+                            res.order_id, res.fill_count
+                        );
+                        status = if pm_filled_total > 0.5 {
+                            "UNWIND_TIMEOUT_PARTIAL"
+                        } else {
+                            "UNWIND_TIMEOUT"
+                        };
+                        log_contracts = pm_filled_total;
+                    }
+                    None => {
+                        eprintln!("   ⚠️ [第二腿] 窗末卖平仍失败: {}", unwind_last_err);
+                        pm_err = format!("unwind_timeout_failed: {}", unwind_last_err);
+                        status = "UNWIND_TIMEOUT_FAIL";
+                    }
+                }
             }
         }
     }
+
+    let pm_json = serde_json::json!({
+        "polymarket_orders": pm_post_responses.iter().map(|p| serde_json::json!({
+            "order_id": &p.order_id,
+            "success": p.success,
+            "status": format!("{:?}", p.status),
+            "taking_amount": p.taking_amount.to_string(),
+            "making_amount": p.making_amount.to_string(),
+            "trade_ids": &p.trade_ids,
+        })).collect::<Vec<serde_json::Value>>(),
+    })
+    .to_string();
 
     live_log.append(
         cycle_id,
@@ -1140,6 +1332,7 @@ async fn validate_arbitrage_pair_post_success(
         pair_label,
         &pm_market.market_id,
         &kalshi_market.market_id,
+        pm_token_id,
         pm_side,
         kalshi_side,
         log_contracts,
@@ -1150,8 +1343,57 @@ async fn validate_arbitrage_pair_post_success(
         &pm_json,
         &pm_err,
         &ks_err,
+        &ks_unwind_order_ids,
         status,
     )?;
+
+    trade_reconciliation::print_live_pair_reconciliation(
+        ks_http,
+        kalshi_cfg,
+        pm_trader,
+        pm_token_id,
+        pair_label,
+        status,
+        &ks_order_id,
+        &ks_unwind_order_ids,
+        &pm_post_responses,
+    )
+    .await;
+
+    if feishu_push::feishu_should_notify(status) && !ks_order_id.is_empty() {
+        let body = feishu_push::format_trade_summary(
+            pair_label,
+            cycle_id,
+            cycle_phase,
+            &pm_market.title,
+            &kalshi_market.title,
+            &pm_market.market_id,
+            &kalshi_market.market_id,
+            pm_side,
+            kalshi_side,
+            status,
+            &ks_order_id,
+            &ks_client_oid,
+            log_contracts,
+            pm_post_responses.len(),
+            ks_unwind_order_ids.len(),
+            opp.net_profit_100,
+            opp.capital_used,
+        );
+        if let Err(e) = feishu_push::push_trade_summary_to_feishu(&body) {
+            eprintln!("   ⚠️ 飞书推送未成功: {}", e);
+        }
+    }
+
+    crate::session_risk::refresh_and_notify(
+        session_risk,
+        ks_http,
+        kalshi_cfg,
+        pm_trader,
+        polymarket,
+    )
+    .await
+    .context("会话风控：成交后复检")?;
 
     Ok(())
 }
@@ -1173,14 +1415,16 @@ async fn validate_arbitrage_pair(
     cycle_id: usize,
     cycle_phase: &str,
     pair_label: &str,
-    live_log: Option<&LiveTradesLog>,
-    live_trading: bool,
+    live_log: &DeskEventsLog,
+    session_risk: &SessionRiskHandle,
     ks_http: &HttpClient,
     kalshi_cfg: &KalshiTradeConfig,
     pm_trader: &PolymarketClobTrader,
     ks_fee: &KalshiFeeScheduleState,
     category_mapper: &CategoryMapper,
     arb_diag: &mut Option<TrackingArbDiag>,
+    tracking_arb: Option<&TrackingArbEventsLog>,
+    track_params: &TrackingParamsSnapshot,
 ) -> Result<Option<(ArbitrageOpportunity, Option<DateTime<Utc>>, Option<DateTime<Utc>>)>> {
     let Some((opp, pm_exp, ks_exp)) = validate_arbitrage_core(
         polymarket,
@@ -1202,36 +1446,70 @@ async fn validate_arbitrage_pair(
     else {
         return Ok(None);
     };
-    if live_trading {
-        let log = live_log.context("实盘模式需已创建 LiveTradesLog")?;
-        validate_arbitrage_pair_post_success(
-            polymarket,
-            kalshi,
-            arb_detector,
-            pm_market,
-            kalshi_market,
-            similarity,
-            pm_side,
-            kalshi_side,
-            needs_inversion,
-            capital_usdt,
+    if let Some(t) = tracking_arb {
+        t.append_arbitrage_found(
             cycle_id,
             cycle_phase,
             pair_label,
-            log,
-            ks_http,
-            kalshi_cfg,
-            pm_trader,
-            ks_fee,
-            category_mapper,
-            per_leg_cap_usd,
-            pair_cap_usdt,
+            &pm_market.market_id,
+            &kalshi_market.market_id,
+            &pm_market.title,
+            &kalshi_market.title,
+            pm_side,
+            kalshi_side,
+            similarity,
+            needs_inversion,
             &opp,
+            track_params,
+        )?;
+    }
+    let paused = session_risk
+        .lock()
+        .map(|g| g.trading_paused())
+        .unwrap_or(false);
+    if paused {
+        println!("   🔒 会话风控：现金预警未解除，跳过本对实盘下单。");
+        print_arbitrage_detection_books(
+            &opp,
+            &pm_market.title,
+            &kalshi_market.title,
+            similarity,
+            needs_inversion,
+            pm_side,
+            kalshi_side,
             pm_exp,
             ks_exp,
-        )
-        .await?;
+        );
+        return Ok(Some((opp, pm_exp, ks_exp)));
     }
+    validate_arbitrage_pair_post_success(
+        polymarket,
+        kalshi,
+        arb_detector,
+        pm_market,
+        kalshi_market,
+        similarity,
+        pm_side,
+        kalshi_side,
+        needs_inversion,
+        capital_usdt,
+        cycle_id,
+        cycle_phase,
+        pair_label,
+        live_log,
+        ks_http,
+        kalshi_cfg,
+        pm_trader,
+        ks_fee,
+        category_mapper,
+        per_leg_cap_usd,
+        pair_cap_usdt,
+        &opp,
+        pm_exp,
+        ks_exp,
+        session_risk,
+    )
+    .await?;
     Ok(Some((opp, pm_exp, ks_exp)))
 }
 
@@ -1247,21 +1525,30 @@ async fn run_full_match_work(
     trade_amount: f64,
     pair_cap_usdt: f64,
     per_leg_cap_usd: f64,
-    live_log: Option<&LiveTradesLog>,
-    live_trading: bool,
+    live_log: &DeskEventsLog,
+    session_risk: &SessionRiskHandle,
     ks_http: &HttpClient,
     kalshi_cfg: &KalshiTradeConfig,
     pm_trader: &PolymarketClobTrader,
-    top10_mode_caption: &str,
     rebuild_index: bool,
     arb_diag: &mut Option<TrackingArbDiag>,
-) -> Result<(usize, usize, String)> {
+    tracking_arb: &TrackingArbEventsLog,
+    track_params_base: &TrackingParamsSnapshot,
+) -> Result<(usize, usize)> {
     if rebuild_index {
         println!("\n   🔄 重建索引...");
         matcher.fit_vectorizer(kalshi_markets, polymarket_markets)?;
         matcher.build_kalshi_index(kalshi_markets)?;
         matcher.build_polymarket_index(polymarket_markets)?;
     }
+
+    monitor_state.last_pm_pool = polymarket_markets.len();
+    monitor_state.last_ks_pool = kalshi_markets.len();
+    let params_cycle = TrackingParamsSnapshot {
+        polymarket_markets_n: polymarket_markets.len(),
+        kalshi_markets_n: kalshi_markets.len(),
+        ..track_params_base.clone()
+    };
 
     println!("   🔍 匹配市场...");
     let raw_matches = matcher.find_matches_bidirectional(polymarket_markets, kalshi_markets).await;
@@ -1293,9 +1580,7 @@ async fn run_full_match_work(
     let ks_fee = Arc::new(fetch_kalshi_fee_schedule(ks_http, kalshi_cfg, &series_keys).await?);
     let category_mapper = Arc::new(matcher.category_mapper.clone());
     
-    // 验证每个匹配对，统计有套利机会的，并收集用于 Top 10 统计
     let mut verified_count = 0;
-    let mut opportunities: Vec<OpportunityRow> = Vec::new();
     let conc = ARB_TRACK_CONCURRENCY;
     let full_cycle_id = monitor_state.current_cycle;
 
@@ -1307,7 +1592,7 @@ async fn run_full_match_work(
                 pm_side,
                 kalshi_side,
             );
-            if let Some((verified, pm_exp, ks_exp)) = validate_arbitrage_pair(
+            if validate_arbitrage_pair(
                 polymarket,
                 kalshi,
                 arb_detector,
@@ -1324,24 +1609,20 @@ async fn run_full_match_work(
                 "full_match",
                 &pair_label,
                 live_log,
-                live_trading,
+                session_risk,
                 ks_http,
                 kalshi_cfg,
                 pm_trader,
                 ks_fee.as_ref(),
                 category_mapper.as_ref(),
                 arb_diag,
+                Some(tracking_arb),
+                &params_cycle,
             )
             .await?
+            .is_some()
             {
                 verified_count += 1;
-                opportunities.push((
-                    verified.clone(),
-                    pm_market.title.clone(),
-                    kalshi_market.title.clone(),
-                    pm_exp,
-                    ks_exp,
-                ));
             }
         }
     } else {
@@ -1415,8 +1696,39 @@ async fn run_full_match_work(
             }
             match core_res {
                 Ok(Some((opp, pm_exp, ks_exp))) => {
-                    if live_trading {
-                        let log = live_log.context("实盘模式需已创建 LiveTradesLog")?;
+                    tracking_arb.append_arbitrage_found(
+                        full_cycle_id,
+                        "full_match",
+                        &pair_label,
+                        &pm_market.market_id,
+                        &kalshi_market.market_id,
+                        &pm_market.title,
+                        &kalshi_market.title,
+                        &pm_side,
+                        &kalshi_side,
+                        similarity,
+                        needs_inversion,
+                        &opp,
+                        &params_cycle,
+                    )?;
+                    let paused = session_risk
+                        .lock()
+                        .map(|g| g.trading_paused())
+                        .unwrap_or(false);
+                    if paused {
+                        println!("   🔒 会话风控：现金预警未解除，跳过本对实盘下单。");
+                        print_arbitrage_detection_books(
+                            &opp,
+                            &pm_market.title,
+                            &kalshi_market.title,
+                            similarity,
+                            needs_inversion,
+                            &pm_side,
+                            &kalshi_side,
+                            pm_exp,
+                            ks_exp,
+                        );
+                    } else {
                         validate_arbitrage_pair_post_success(
                             polymarket,
                             kalshi,
@@ -1431,7 +1743,7 @@ async fn run_full_match_work(
                             full_cycle_id,
                             "full_match",
                             &pair_label,
-                            log,
+                            live_log,
                             ks_http,
                             kalshi_cfg,
                             pm_trader,
@@ -1442,17 +1754,11 @@ async fn run_full_match_work(
                             &opp,
                             pm_exp,
                             ks_exp,
+                            session_risk,
                         )
                         .await?;
                     }
                     verified_count += 1;
-                    opportunities.push((
-                        opp.clone(),
-                        pm_market.title.clone(),
-                        kalshi_market.title.clone(),
-                        pm_exp,
-                        ks_exp,
-                    ));
                 }
                 Ok(None) => {}
                 Err(e) => return Err(e),
@@ -1460,13 +1766,9 @@ async fn run_full_match_work(
         }
     }
 
-    // 全量匹配周期结束：输出 Top 10 利润（与文件报告同源字符串）
-    let top10_block = format_top10_opportunities(&opportunities, top10_mode_caption);
-    print!("{}", top10_block);
-    // 更新追踪列表（所有匹配对，带方向信息）
     monitor_state.update_tracked_pairs(all_matches);
-    
-    Ok((matches.len(), verified_count, top10_block))
+
+    Ok((matches.len(), verified_count))
 }
 
 /// 执行全量匹配周期（重新拉取市场并重训索引后匹配）
@@ -1479,13 +1781,14 @@ async fn run_full_match_cycle(
     trade_amount: f64,
     pair_cap_usdt: f64,
     per_leg_cap_usd: f64,
-    live_log: Option<&LiveTradesLog>,
-    live_trading: bool,
+    live_log: &DeskEventsLog,
+    session_risk: &SessionRiskHandle,
     ks_http: &HttpClient,
     kalshi_cfg: &KalshiTradeConfig,
     pm_trader: &PolymarketClobTrader,
-    top10_mode_caption: &str,
-) -> Result<(usize, usize, String)> {
+    tracking_arb: &TrackingArbEventsLog,
+    track_params: &TrackingParamsSnapshot,
+) -> Result<(usize, usize)> {
     println!("   📡 执行全量匹配（拉取最新市场并重建索引）...");
 
     let polymarket_raw: Vec<Market> = polymarket.fetch_all_markets().await?;
@@ -1513,13 +1816,14 @@ async fn run_full_match_cycle(
         pair_cap_usdt,
         per_leg_cap_usd,
         live_log,
-        live_trading,
+        session_risk,
         ks_http,
         kalshi_cfg,
         pm_trader,
-        top10_mode_caption,
         true,
         &mut no_track_arb_diag,
+        tracking_arb,
+        track_params,
     )
     .await
 }
@@ -1533,14 +1837,15 @@ async fn run_tracking_cycle(
     trade_amount: f64,
     pair_cap_usdt: f64,
     per_leg_cap_usd: f64,
-    live_log: Option<&LiveTradesLog>,
-    live_trading: bool,
+    live_log: &DeskEventsLog,
+    session_risk: &SessionRiskHandle,
     ks_http: &HttpClient,
     kalshi_cfg: &KalshiTradeConfig,
     pm_trader: &PolymarketClobTrader,
     category_mapper: &CategoryMapper,
-    top10_mode_caption: &str,
-) -> Result<(usize, String)> {
+    tracking_arb: &TrackingArbEventsLog,
+    track_params: &TrackingParamsSnapshot,
+) -> Result<usize> {
     println!("   📡 执行价格追踪...");
     println!("      追踪 {} 个匹配对", monitor_state.tracked_pairs.len());
 
@@ -1552,7 +1857,6 @@ async fn run_tracking_cycle(
     let category_mapper = Arc::new(category_mapper.clone());
 
     let mut opportunity_count = 0;
-    let mut opportunities: Vec<OpportunityRow> = Vec::new();
     let conc = ARB_TRACK_CONCURRENCY;
     let n_active = monitor_state.tracked_pairs.iter().filter(|p| p.active).count();
     let tick = Instant::now();
@@ -1578,7 +1882,7 @@ async fn run_tracking_cycle(
                 );
             }
 
-            if let Some((verified, pm_exp, ks_exp)) = validate_arbitrage_pair(
+            if let Some((verified, _pm_exp, _ks_exp)) = validate_arbitrage_pair(
                 polymarket,
                 kalshi,
                 arb_detector,
@@ -1595,13 +1899,15 @@ async fn run_tracking_cycle(
                 "price_track",
                 &pair.pair_id,
                 live_log,
-                live_trading,
+                session_risk,
                 ks_http,
                 kalshi_cfg,
                 pm_trader,
                 ks_fee.as_ref(),
                 category_mapper.as_ref(),
                 &mut diag_slot,
+                Some(tracking_arb),
+                track_params,
             )
             .await?
             {
@@ -1610,13 +1916,6 @@ async fn run_tracking_cycle(
                 if verified.net_profit_100 > pair.best_profit {
                     pair.best_profit = verified.net_profit_100;
                 }
-                opportunities.push((
-                    verified.clone(),
-                    pair.pm_market.title.clone(),
-                    pair.kalshi_market.title.clone(),
-                    pm_exp,
-                    ks_exp,
-                ));
             }
         }
         diag_total = diag_slot.take().unwrap_or_default();
@@ -1684,8 +1983,39 @@ async fn run_tracking_cycle(
             tr.pm_market = pair.pm_market;
             match core_res {
                 Ok(Some((opp, pm_exp, ks_exp))) => {
-                    if live_trading {
-                        let log = live_log.context("实盘模式需已创建 LiveTradesLog")?;
+                    tracking_arb.append_arbitrage_found(
+                        monitor_state.current_cycle,
+                        "price_track",
+                        &tr.pair_id,
+                        &tr.pm_market.market_id,
+                        &tr.kalshi_market.market_id,
+                        &tr.pm_market.title,
+                        &tr.kalshi_market.title,
+                        &tr.pm_side,
+                        &tr.kalshi_side,
+                        tr.similarity,
+                        tr.needs_inversion,
+                        &opp,
+                        track_params,
+                    )?;
+                    let paused = session_risk
+                        .lock()
+                        .map(|g| g.trading_paused())
+                        .unwrap_or(false);
+                    if paused {
+                        println!("   🔒 会话风控：现金预警未解除，跳过本对实盘下单。");
+                        print_arbitrage_detection_books(
+                            &opp,
+                            &tr.pm_market.title,
+                            &tr.kalshi_market.title,
+                            tr.similarity,
+                            tr.needs_inversion,
+                            &tr.pm_side,
+                            &tr.kalshi_side,
+                            pm_exp,
+                            ks_exp,
+                        );
+                    } else {
                         validate_arbitrage_pair_post_success(
                             polymarket,
                             kalshi,
@@ -1700,7 +2030,7 @@ async fn run_tracking_cycle(
                             monitor_state.current_cycle,
                             "price_track",
                             &tr.pair_id,
-                            log,
+                            live_log,
                             ks_http,
                             kalshi_cfg,
                             pm_trader,
@@ -1711,6 +2041,7 @@ async fn run_tracking_cycle(
                             &opp,
                             pm_exp,
                             ks_exp,
+                            session_risk,
                         )
                         .await?;
                     }
@@ -1719,13 +2050,6 @@ async fn run_tracking_cycle(
                     if opp.net_profit_100 > tr.best_profit {
                         tr.best_profit = opp.net_profit_100;
                     }
-                    opportunities.push((
-                        opp.clone(),
-                        tr.pm_market.title.clone(),
-                        tr.kalshi_market.title.clone(),
-                        pm_exp,
-                        ks_exp,
-                    ));
                 }
                 Ok(None) => {}
                 Err(e) => return Err(e),
@@ -1736,10 +2060,7 @@ async fn run_tracking_cycle(
 
     diag_total.print_compact();
 
-    let top10_block = format_top10_opportunities(&opportunities, top10_mode_caption);
-    print!("{}", top10_block);
-
-    Ok((opportunity_count, top10_block))
+    Ok(opportunity_count)
 }
 /// 运行单个监控周期
 async fn run_cycle(
@@ -1748,11 +2069,13 @@ async fn run_cycle(
     matcher: &mut MarketMatcher,
     arb_detector: &ArbitrageDetector,
     monitor_state: &mut MonitorState,
-    live_log: Option<&LiveTradesLog>,
-    live_trading: bool,
+    live_log: &DeskEventsLog,
+    session_risk: &SessionRiskHandle,
     ks_http: &HttpClient,
     kalshi_cfg: &KalshiTradeConfig,
     pm_trader: &PolymarketClobTrader,
+    tracking_pairs: &TrackingPairsLog,
+    tracking_arb: &TrackingArbEventsLog,
 ) -> Result<CycleStats> {
     let start_time = Local::now();
     println!("🔄 开始新周期 #{} - {}", monitor_state.current_cycle, start_time.format("%H:%M:%S"));
@@ -1761,17 +2084,11 @@ async fn run_cycle(
 
     let (per_leg_cap, pair_cap) = arb_probe_caps();
     let trade_amount = per_leg_cap;
-    let top10_caption = format!(
-        "live · 参考资金 ${} · 每腿 ${:.2} · 每对 ${:.2}",
-        TOTAL_CAPITAL_USD as i32,
-        per_leg_cap,
-        pair_cap
-    );
+    let track_params = build_tracking_params_snapshot(monitor_state, per_leg_cap, pair_cap);
     let is_full_match_cycle = monitor_state.should_full_match();
 
-    // Top10 仅在终端打印；CSV 仅追加套利行。
-    let (new_matches, opportunities, _top10_block) = if is_full_match_cycle {
-        let (m, v, top10) = run_full_match_cycle(
+    let (new_matches, opportunities) = if is_full_match_cycle {
+        let (m, v) = run_full_match_cycle(
             polymarket,
             kalshi,
             matcher,
@@ -1781,16 +2098,18 @@ async fn run_cycle(
             pair_cap,
             per_leg_cap,
             live_log,
-            live_trading,
+            session_risk,
             ks_http,
             kalshi_cfg,
             pm_trader,
-            &top10_caption,
+            tracking_arb,
+            &track_params,
         )
         .await?;
-        (m, v, top10)
+        live_guard_pm_collateral_after_full_match(pm_trader).await?;
+        (m, v)
     } else {
-        let (c, top10) = run_tracking_cycle(
+        let c = run_tracking_cycle(
             polymarket,
             kalshi,
             arb_detector,
@@ -1799,16 +2118,24 @@ async fn run_cycle(
             pair_cap,
             per_leg_cap,
             live_log,
-            live_trading,
+            session_risk,
             ks_http,
             kalshi_cfg,
             pm_trader,
             &matcher.category_mapper,
-            &top10_caption,
+            tracking_arb,
+            &track_params,
         )
         .await?;
-        (0, c, top10)
+        (0, c)
     };
+
+    let phase = if is_full_match_cycle {
+        "full_match"
+    } else {
+        "price_track"
+    };
+    tracking_pairs.append_cycle_snapshot(monitor_state.current_cycle, phase, &monitor_state.tracked_pairs)?;
     
     let elapsed = Local::now() - start_time;
     println!("   ⏱️ 周期完成, 耗时: {}ms", elapsed.num_milliseconds());
@@ -1847,113 +2174,4 @@ async fn fetch_initial_markets(
 struct CycleStats {
     new_matches: usize,
     arbitrage_opportunities: usize,
-}
-
-/// 本周期利润 Top 10 文本（终端用；不含订单簿，簿档在每次 `validate_arbitrage_pair` 中已打印）
-fn format_top10_opportunities(opportunities: &[OpportunityRow], mode_caption: &str) -> String {
-    use std::fmt::Write as _;
-
-    let mut out = String::new();
-    writeln!(out).unwrap();
-    if opportunities.is_empty() {
-        writeln!(out, "🏆 本周期利润 Top 10: 无套利机会").unwrap();
-        return out;
-    }
-    let mut sorted: Vec<_> = opportunities.iter().collect();
-    sorted.sort_by(|a, b| {
-        b.0.net_profit_100
-            .partial_cmp(&a.0.net_profit_100)
-            .unwrap_or(Ordering::Equal)
-    });
-    writeln!(
-        out,
-        "🏆 本周期利润 Top 10（{}，手续费美元计；Gas/缓冲为固定美元，括号内为占该行「成本」比例）",
-        mode_caption
-    )
-    .unwrap();
-    writeln!(
-        out,
-        "──────────────────────────────────────────────────────────────────────"
-    )
-    .unwrap();
-    for (i, (opp, pm_title, kalshi_title, pm_dt, ks_dt)) in sorted.iter().take(10).enumerate() {
-        let pm_slip = if opp.pm_optimal > 0.0 {
-            (opp.pm_avg_slipped - opp.pm_optimal) / opp.pm_optimal * 100.0
-        } else {
-            0.0
-        };
-        let ks_slip = if opp.kalshi_optimal > 0.0 {
-            (opp.kalshi_avg_slipped - opp.kalshi_optimal) / opp.kalshi_optimal * 100.0
-        } else {
-            0.0
-        };
-        writeln!(
-            out,
-            "\n   ┌─ #{} 净利润 ${:.2}  ROI {:.1}% ─────────────────────────────────",
-            i + 1,
-            opp.net_profit_100,
-            opp.roi_100_percent
-        )
-        .unwrap();
-        writeln!(out, "   │  PM:      {}", pm_title).unwrap();
-        writeln!(out, "   │  Kalshi:  {}", kalshi_title).unwrap();
-        writeln!(out, "   │  📅 {}", format_resolution_expiry("PM", *pm_dt)).unwrap();
-        writeln!(out, "   │  📅 {}", format_resolution_expiry("Kalshi", *ks_dt)).unwrap();
-        writeln!(out, "   │  ─────────────────────────────────────────────────────────────").unwrap();
-        let inv = if opp.strategy.contains("颠倒") {
-            " (Y/N颠倒)"
-        } else {
-            ""
-        };
-        writeln!(
-            out,
-            "   │  📊 策略: Polymarket 买 {}  +  Kalshi 买 {}{}",
-            opp.polymarket_action.1, opp.kalshi_action.1, inv
-        )
-        .unwrap();
-        writeln!(out, "   │  📊 对冲份数 n: {:.4}", opp.contracts).unwrap();
-        writeln!(
-            out,
-            "   │  💵 最优Ask: PM {:.4}  Kalshi {:.4}  →  滑点后: PM {:.4}  Kalshi {:.4}",
-            opp.pm_optimal,
-            opp.kalshi_optimal,
-            opp.pm_avg_slipped,
-            opp.kalshi_avg_slipped
-        )
-        .unwrap();
-        writeln!(
-            out,
-            "   │  📉 滑点%: PM {:+.2}%  |  Kalshi {:+.2}%",
-            pm_slip, ks_slip
-        )
-        .unwrap();
-        writeln!(
-            out,
-            "   │  💰 成本 ${:.2}  →  净利 ${:.2}",
-            opp.capital_used, opp.net_profit_100
-        )
-        .unwrap();
-        writeln!(
-            out,
-            "   │     交易手续费: Polymarket ${:.2}  |  Kalshi ${:.2}",
-            opp.fee_polymarket_usd, opp.fee_kalshi_usd
-        )
-        .unwrap();
-        writeln!(
-            out,
-            "   │     链上执行成本（估）: ${:.4}",
-            opp.gas_assumed_usd
-        )
-        .unwrap();
-        writeln!(
-            out,
-            "   │     摩擦成本（friction cost）: ${:.4}",
-            opp.surplus_buffer_usd
-        )
-        .unwrap();
-        writeln!(out, "   │  ROI: {:.1}%", opp.roi_100_percent).unwrap();
-        writeln!(out, "   └────────────────────────────────────────────────────────────────").unwrap();
-    }
-    writeln!(out).unwrap();
-    out
 }

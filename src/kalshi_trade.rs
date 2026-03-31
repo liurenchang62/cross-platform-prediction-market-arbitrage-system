@@ -9,16 +9,21 @@ use rsa::pss::BlindedSigningKey;
 use rsa::signature::{RandomizedSigner, SignatureEncoding};
 use rsa::RsaPrivateKey;
 use serde_json::{json, Value};
+use std::collections::HashSet;
+use std::time::Duration;
+use tokio::time::sleep;
 
-use crate::arbitrage_detector::ArbitrageOpportunity;
+use crate::arbitrage_detector::{kalshi_orderbook_mid_dollars_for_outcome, ArbitrageOpportunity};
 use crate::system_params::{
     require_live_orders_allowed, KALSHI_API_KEY_ID_ENV, KALSHI_BALANCE_DEPLOYABLE_FRAC,
-    KALSHI_PRIVATE_KEY_PATH_ENV, KALSHI_TRADE_API_BASE,
+    KALSHI_PRIVATE_KEY_PATH_ENV, KALSHI_TRADE_API_BASE, REQUEST_INTERVAL_MS,
 };
 
 pub const KALSHI_SIGN_PATH_ORDERS: &str = "/trade-api/v2/portfolio/orders";
 pub const KALSHI_SIGN_PATH_BALANCE: &str = "/trade-api/v2/portfolio/balance";
 pub const KALSHI_SIGN_PATH_FEE_CHANGES: &str = "/trade-api/v2/series/fee_changes";
+pub const KALSHI_SIGN_PATH_FILLS: &str = "/trade-api/v2/portfolio/fills";
+pub const KALSHI_SIGN_PATH_POSITIONS: &str = "/trade-api/v2/portfolio/positions";
 
 #[derive(Clone)]
 pub struct KalshiTradeConfig {
@@ -79,12 +84,86 @@ pub async fn fetch_series_fee_changes_json(
 }
 
 fn sign_request(key: &RsaPrivateKey, timestamp_ms: &str, method: &str, path: &str) -> Result<String> {
+    // 官方：签名字符串中的 path 不得包含 `?` 及查询参数。
+    let path = path.split('?').next().unwrap_or(path);
     let msg = format!("{}{}{}", timestamp_ms, method, path);
     let sk = BlindedSigningKey::<sha2::Sha256>::new(key.clone());
     let sig = sk
         .sign_with_rng(&mut thread_rng(), msg.as_bytes())
         .to_bytes();
     Ok(BASE64.encode(sig))
+}
+
+/// `GET /portfolio/orders/{order_id}` — 单笔订单详情（含成交价口径 `*_fill_cost_dollars`、手续费等）。
+pub async fn get_order_json(http: &Client, cfg: &KalshiTradeConfig, order_id: &str) -> Result<Value> {
+    let sign_path = format!("/trade-api/v2/portfolio/orders/{order_id}");
+    let url = format!("{}/portfolio/orders/{order_id}", cfg.base_url);
+    let ts = millis_timestamp();
+    let sig = sign_request(&cfg.private_key, &ts, "GET", &sign_path)?;
+
+    let resp = http
+        .get(&url)
+        .header("KALSHI-ACCESS-KEY", &cfg.api_key_id)
+        .header("KALSHI-ACCESS-TIMESTAMP", &ts)
+        .header("KALSHI-ACCESS-SIGNATURE", sig)
+        .send()
+        .await
+        .context("Kalshi GET /portfolio/orders/{id}")?;
+
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        anyhow::bail!("Kalshi GET order HTTP {}: {}", status.as_u16(), text.trim());
+    }
+    serde_json::from_str(&text).with_context(|| format!("order JSON: {}", text.trim()))
+}
+
+/// 拉取与该 `order_id` 关联的**全部**成交回报（分页游标直到结束）。官方：`GET /portfolio/fills?order_id=`.
+pub async fn get_fills_for_order(http: &Client, cfg: &KalshiTradeConfig, order_id: &str) -> Result<Vec<Value>> {
+    let mut all = Vec::new();
+    let mut cursor: Option<String> = None;
+    for _page in 0..50 {
+        let url = format!("{}/portfolio/fills", cfg.base_url);
+        let ts = millis_timestamp();
+        let sig = sign_request(&cfg.private_key, &ts, "GET", KALSHI_SIGN_PATH_FILLS)?;
+
+        let mut req = http
+            .get(&url)
+            .query(&[("order_id", order_id), ("limit", "200")])
+            .header("KALSHI-ACCESS-KEY", &cfg.api_key_id)
+            .header("KALSHI-ACCESS-TIMESTAMP", &ts)
+            .header("KALSHI-ACCESS-SIGNATURE", sig);
+        if let Some(c) = cursor.as_deref() {
+            if !c.is_empty() {
+                req = req.query(&[("cursor", c)]);
+            }
+        }
+
+        let resp = req.send().await.context("Kalshi GET /portfolio/fills")?;
+
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            anyhow::bail!("Kalshi GET fills HTTP {}: {}", status.as_u16(), text.trim());
+        }
+        let v: Value = serde_json::from_str(&text).context("fills JSON")?;
+        if let Some(arr) = v["fills"].as_array() {
+            for f in arr {
+                all.push(f.clone());
+            }
+        }
+        let next = v["cursor"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+        match next {
+            Some(c) if cursor.as_ref() != Some(&c) => {
+                cursor = Some(c);
+            }
+            _ => break,
+        }
+    }
+    Ok(all)
 }
 
 pub async fn get_balance_cents(http: &Client, cfg: &KalshiTradeConfig) -> Result<i64> {
@@ -110,6 +189,177 @@ pub async fn get_balance_cents(http: &Client, cfg: &KalshiTradeConfig) -> Result
     v["balance"]
         .as_i64()
         .context("响应缺少 balance（美分）")
+}
+
+fn position_row_has_open_position(pos: &Value) -> bool {
+    let exposure = pos
+        .get("market_exposure_dollars")
+        .and_then(|x| x.as_str().and_then(|s| s.parse::<f64>().ok()))
+        .or_else(|| pos.get("market_exposure_dollars").and_then(|x| x.as_f64()));
+    if let Some(x) = exposure {
+        if x.abs() > 1e-9 {
+            return true;
+        }
+    }
+    if let Some(fp) = pos.get("position_fp").and_then(|x| x.as_str()) {
+        if let Ok(n) = fp.parse::<f64>() {
+            if n.abs() > 1e-9 {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn event_position_row_has_open(pos: &Value) -> bool {
+    let exposure = pos
+        .get("event_exposure_dollars")
+        .and_then(|x| x.as_str().and_then(|s| s.parse::<f64>().ok()))
+        .or_else(|| pos.get("event_exposure_dollars").and_then(|x| x.as_f64()));
+    if let Some(x) = exposure {
+        if x.abs() > 1e-9 {
+            return true;
+        }
+    }
+    if let Some(fp) = pos.get("total_cost_shares_fp").and_then(|x| x.as_str()) {
+        if let Ok(n) = fp.parse::<f64>() {
+            if n.abs() > 1e-9 {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// `position_fp`：正为 YES 净张数，负为 NO 净张数（见 Kalshi `MarketPosition` 文档）。
+fn kalshi_position_fp_contracts_and_side(pos: &Value) -> Option<(f64, &'static str)> {
+    let fp = pos
+        .get("position_fp")?
+        .as_str()
+        .and_then(|s| s.parse::<f64>().ok())
+        .or_else(|| pos.get("position_fp").and_then(|x| x.as_f64()))?;
+    let c = fp.abs();
+    if !c.is_finite() || c <= 1e-9 {
+        return None;
+    }
+    let side = if fp > 0.0 { "YES" } else { "NO" };
+    Some((c, side))
+}
+
+/// 公开 `GET /markets/{ticker}/orderbook`（与 [`crate::clients::KalshiClient::get_order_book`] 同路径）。
+pub async fn fetch_market_orderbook_json(
+    http: &Client,
+    cfg: &KalshiTradeConfig,
+    ticker: &str,
+) -> Result<Option<Value>> {
+    if ticker.is_empty() {
+        return Ok(None);
+    }
+    let url = format!("{}/markets/{}/orderbook", cfg.base_url, ticker);
+    let resp = http
+        .get(&url)
+        .send()
+        .await
+        .with_context(|| format!("Kalshi GET orderbook {}", ticker))?;
+    if !resp.status().is_success() {
+        return Ok(None);
+    }
+    let text = resp.text().await.unwrap_or_default();
+    let v: Value =
+        serde_json::from_str(&text).with_context(|| format!("orderbook JSON for {}", ticker))?;
+    Ok(Some(v))
+}
+
+/// 分页 `GET /portfolio/positions`：每条有敞口的市场拉簿，**份数 × YES/NO 中间价（美元）** 求和为 **MTM**。  
+/// 返回 `(mtm, 市场数, token 数, 成功标价数)`：  
+/// - **市场** = `event_positions` 中有敞口的 **event_ticker** 去重数（与 Polymarket Gamma「市场」上层概念对齐）  
+/// - **token** = `market_positions` 中有敞口的 **ticker** 去重数（单合约/ outcome 腿）  
+/// 若无 `event_positions` 数据则 **市场数 = token 数**。
+pub async fn aggregate_kalshi_market_positions_mtm_usd_and_count(
+    http: &Client,
+    cfg: &KalshiTradeConfig,
+) -> Result<(f64, usize, usize, usize)> {
+    let mut mtm_total = 0.0_f64;
+    let mut open_tickers: HashSet<String> = HashSet::new();
+    let mut open_events: HashSet<String> = HashSet::new();
+    let mut priced_n = 0usize;
+    let mut cursor: Option<String> = None;
+    for _ in 0..256 {
+        let url = format!("{}/portfolio/positions", cfg.base_url);
+        let ts = millis_timestamp();
+        let sig = sign_request(&cfg.private_key, &ts, "GET", KALSHI_SIGN_PATH_POSITIONS)?;
+
+        let mut req = http
+            .get(&url)
+            .query(&[("limit", "1000")])
+            .header("KALSHI-ACCESS-KEY", &cfg.api_key_id)
+            .header("KALSHI-ACCESS-TIMESTAMP", &ts)
+            .header("KALSHI-ACCESS-SIGNATURE", sig);
+        if let Some(c) = cursor.as_deref() {
+            if !c.is_empty() {
+                req = req.query(&[("cursor", c)]);
+            }
+        }
+
+        let resp = req.send().await.context("Kalshi GET /portfolio/positions")?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            anyhow::bail!("Kalshi positions HTTP {}: {}", status.as_u16(), text.trim());
+        }
+        let v: Value = serde_json::from_str(&text).context("positions JSON")?;
+        if let Some(arr) = v["market_positions"].as_array() {
+            for pos in arr {
+                let is_open = position_row_has_open_position(pos);
+                if is_open {
+                    if let Some(t) = pos.get("ticker").and_then(|x| x.as_str()) {
+                        open_tickers.insert(t.to_string());
+                    }
+                }
+                if !is_open {
+                    continue;
+                }
+                let Some(ticker) = pos.get("ticker").and_then(|x| x.as_str()) else {
+                    continue;
+                };
+                let Some((contracts, side)) = kalshi_position_fp_contracts_and_side(pos) else {
+                    continue;
+                };
+                if let Some(book) = fetch_market_orderbook_json(http, cfg, ticker).await? {
+                    if let Some(mid) = kalshi_orderbook_mid_dollars_for_outcome(&book, side) {
+                        mtm_total += contracts * mid;
+                        priced_n += 1;
+                    }
+                }
+                sleep(Duration::from_millis(REQUEST_INTERVAL_MS)).await;
+            }
+        }
+        if let Some(evs) = v["event_positions"].as_array() {
+            for pos in evs {
+                if !event_position_row_has_open(pos) {
+                    continue;
+                }
+                if let Some(et) = pos.get("event_ticker").and_then(|x| x.as_str()) {
+                    open_events.insert(et.to_string());
+                }
+            }
+        }
+        let next = v["cursor"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+        match next {
+            Some(c) if cursor.as_ref() != Some(&c) => cursor = Some(c),
+            _ => break,
+        }
+    }
+    let ks_tokens_n = open_tickers.len();
+    let ks_markets_n = if open_events.is_empty() {
+        ks_tokens_n
+    } else {
+        open_events.len()
+    };
+    Ok((mtm_total, ks_markets_n, ks_tokens_n, priced_n))
 }
 
 fn millis_timestamp() -> String {

@@ -4,9 +4,9 @@
 
 ## 项目简介
 
-`arbitrage-monitor` 是一款 **Rust** 实现的程序：在 **Polymarket** 与 **Kalshi** 之间基于文本相似度与类别规则发现可对齐的预测市场，维护高置信配对并周期性评估其**可执行层面的经济结果**。定价与盈亏以**实时订单簿**解析结果为依据；在严格校验通过且用户选择**实盘**后，经官方生产接口下单（**Kalshi IOC** 买入、**Polymarket CLOB FOK**），成交与请求摘要写入 **`logs/live_trades.csv`**。
+`arbitrage-monitor` 是一款 **Rust** 实现的程序：在 **Polymarket** 与 **Kalshi** 之间基于文本相似度与类别规则发现可对齐的预测市场，维护高置信配对并周期性评估其**可执行层面的经济结果**。定价与盈亏以**实时订单簿**解析结果为依据；在严格校验通过且用户选择**实盘**后，经官方生产接口下单（**Kalshi IOC** 买入、**Polymarket CLOB FOK**），成交与请求摘要写入 **`logs/desk_events.jsonl`**（一行一条 JSON，可用 **`portfolio_monitor`** 各 bin 制图/对账）。
 
-整体流程包括：市场列表拉取、向量匹配与索引、全量刷新与增量追踪、以及控制台输出与上述 CSV。
+整体流程包括：市场列表拉取、向量匹配与索引、全量刷新与增量追踪、以及控制台输出与实盘 JSONL / 追踪 CSV 等持久化日志。
 
 **仓库内不包含秘钥**：Kalshi / Polymarket 凭据均通过**环境变量**（及本机 PEM / 私钥文件路径）在运行时注入，详见下文与 `.gitignore`（已忽略 `.env`、`secrets/` 等）。
 
@@ -21,9 +21,9 @@
 
 - **订单簿场景盈亏**：对每个候选配对，在双方**卖档深度**上按**单腿探针上限**与**每对名义上限**模拟吃单；**手续费**按 Kalshi / Polymarket taker 公式计算，并扣除**链上执行成本（估）**与**摩擦成本（friction，原盈余缓冲）**，再与**按 `pair_cap` 比例的最小净利门槛**比较（见 **订单簿盈亏与成本模型**）。
 - **状态追踪**：维护追踪列表，按参数进行全量重建与周期更新（`src/system_params.rs`）。
-- **实盘日志**：实盘模式下持久化 **`logs/live_trades.csv`**。
+- **实盘日志**：实盘模式下持久化 **`logs/desk_events.jsonl`**。
 - **实盘执行**：第一腿 Kalshi IOC，第二腿 Polymarket FOK；第二腿每次业务尝试**重拉双边簿**并重算净利（业务次数上限见 `main.rs` 常量）。第二腿失败后可选止损路径：放宽 PM 对冲 vs Kalshi IOC 卖平。
-- **辅助二进制**：`kalshi_balance`（生产余额）、`check_env`（环境/密钥加载检查）、`live_account_positions`、`smoke_live_orders`（见 **可选二进制工具**）。
+- **辅助工具**：`check_env`、`track_backtest`，以及工作区 crate **`portfolio_monitor`**（`portfolio-overview` / `-pairs` / `-settled` / `-charts`，消费 `desk_events.jsonl`）。
 
 ## 订单簿盈亏与成本模型
 
@@ -66,14 +66,14 @@ cargo run --release    # 长时间运行建议
 
 启动时在交互中选择**仅跟踪**或**实盘**；实盘需配置下文环境变量并确认。首次运行前请确保存在 **`config/categories.toml`**（仓库已附带）。
 
-## 可选二进制工具
+## 可选二进制 / 工作区工具
 
 | 命令 | 作用 |
 |------|------|
-| `cargo run --bin kalshi_balance` | 生产环境 Kalshi `GET /portfolio/balance`（RSA 鉴权）。 |
 | `cargo run --bin check_env` | 检查环境变量与密钥加载（输出脱敏）。 |
-| `cargo run --bin live_account_positions` | 账户/持仓类诊断（详见该 bin 内注释）。 |
-| `cargo run --bin smoke_live_orders` | 受控实盘冒烟（谨慎使用）。 |
+| `cargo run --bin track_backtest` | 回放 / 分析 `logs/tracking_*.csv`（见该 bin 内注释）。 |
+| `cargo run -p portfolio-monitor --bin portfolio-overview` | 账户与映射总览（见 `--help`）。 |
+| `cargo run -p portfolio-monitor --bin portfolio-charts` | 由 `desk_events.jsonl` 与 Kalshi settlements 出图。 |
 
 ## API 探针脚本（Windows）
 
@@ -88,7 +88,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\verify_apis.ps1
 | 路径 | 说明 |
 |------|------|
 | `config/categories.toml` | 类别名称、权重、关键词，用于分类与匹配 |
-| `src/system_params.rs` | HTTP/匹配/时间窗口、参考总盘子、`pair_cap`/单腿比例、Gas、摩擦与最小净利比例、实盘 CSV 路径、环境变量名常量 |
+| `src/system_params.rs` | HTTP/匹配/时间窗口、参考总盘子、`pair_cap`/单腿比例、Gas、摩擦与最小净利比例、`desk_events.jsonl` 路径、环境变量名常量 |
 | `src/fee_model.rs` | 双边 taker 公式、`ArbCostParams`、PM exponent 表 |
 
 ### 环境变量
@@ -102,7 +102,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\verify_apis.ps1
 ## 仓库结构
 
 ```
-Cargo.toml              单包工程根（非多 crate 工作区）
+Cargo.toml              工作区根（`arbitrage-monitor` + `portfolio-monitor`）
 scripts/
   verify_apis.ps1       可选：公开 API 结构探针（Windows）
 src/
@@ -118,15 +118,16 @@ src/
   system_params.rs      全局调参与环境变量名字符串
   validation.rs         校验辅助
   tracking.rs           周期监控状态
-  live_trades.rs        实盘 CSV 日志
+  desk_events.rs        实盘 JSONL
+  feishu_push.rs        飞书摘要（与主程序绑定）
+  trade_reconciliation.rs 成交核对
   kalshi_trade.rs       Kalshi 生产下单
   polymarket_trade.rs   Polymarket CLOB 实盘下单
   category_mapper.rs    基于 categories.toml 的分类
   bin/
-    kalshi_balance.rs
     check_env.rs
-    live_account_positions.rs
-    smoke_live_orders.rs
+    track_backtest.rs
+portfolio_monitor/      库 + 四个独立 portfolio-* 可执行文件
 config/
   categories.toml
 docs/
