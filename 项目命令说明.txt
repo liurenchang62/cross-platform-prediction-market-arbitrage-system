@@ -5,7 +5,7 @@
 --------------------------------------------------------------------------------
 ## 跨平台实盘套利主程序（默认 binary）
 
-功能：Kalshi ↔ Polymarket 实盘监控与套利；启动及**每个交易周期开始**会自动尝试 Proxy 经 Relayer **赎回可结算头寸**并 **刷新 Polymarket CLOB Collateral**（需 `POLYMARKET_SIGNATURE_TYPE=1` 及 `RELAYER_API_KEY` / `POLYMARKET_API_KEY` 等，见代码 `portfolio_monitor::pm_relayer_automation`）。赎回有链上提交时向飞书推送一行摘要（与成交推送共用机器人脚本）。
+功能：Kalshi ↔ Polymarket 实盘监控与套利；仅在**程序启动、进入主监控循环前**自动尝试 Proxy 经 Relayer **赎回可结算头寸**并 **刷新 Polymarket CLOB Collateral**（需 `POLYMARKET_SIGNATURE_TYPE=1` 及 `RELAYER_API_KEY` / `POLYMARKET_API_KEY` 等，见代码 `portfolio_monitor::pm_relayer_automation`）。后续监控周期内不再重复执行。赎回有链上提交时向飞书推送一行摘要（与成交推送共用机器人脚本）。
 
   cargo run -p arbitrage-monitor --release
 

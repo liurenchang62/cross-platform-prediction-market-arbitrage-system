@@ -1,5 +1,5 @@
 //! 实盘桌面：Proxy 钱包经 Relayer **批量授权**、**按条件赎回**、**刷新 CLOB Collateral**。  
-//! 由主程序 `arbitrage-monitor` 在每周期开始（及启动首次快照前）调用；不要求独立 CLI。
+//! 由主程序 `arbitrage-monitor` 在**启动进入主循环前**调用一次；不要求独立 CLI。
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr as _;
@@ -824,7 +824,7 @@ async fn refresh_clob_collateral_desk() -> Result<()> {
     Ok(())
 }
 
-/// `batch_approvals`：**进程内首次**传 `true`（启动前快照）；后续周期传 `false`，避免每 30s 重复 Relayer 授权。
+/// `batch_approvals`：当前仅启动时调用，传 `true`（Relayer 批量授权 + 赎回 + 刷新 Collateral）。保留参数供将来若需「仅赎回不重授权」扩展。
 pub async fn desk_hydrate_pm_proxy(
     http: &reqwest::Client,
     polygon_rpc: &str,

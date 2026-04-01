@@ -1,4 +1,4 @@
-//! 实盘成交一行一条 JSON（`logs/desk_events.jsonl`），供 `portfolio-charts`、`portfolio-snapshot`、`portfolio-dashboard` 等工具消费。
+//! 实盘成交一行一条 JSON（`logs/desk_events.jsonl`），供 `portfolio-turnover` 等组合工具消费。
 //! 固定字段含 `time_utc_rfc3339`、`trading_session_utc_date`（YYYY-MM-DD）、`session_cycle_id`、`global_tick`、`status`、`pair_label` 等。
 
 use std::fs::{self, OpenOptions};

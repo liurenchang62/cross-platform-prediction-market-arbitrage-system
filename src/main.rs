@@ -408,7 +408,7 @@ async fn main() -> Result<()> {
         "🔒 资金安全：无合格套利时主循环**仅**请求行情/订单簿/费率等只读接口；Kalshi IOC / PM FOK / 卖平敞口仅在 `validate_arbitrage_pair_post_success` 内且通过 `require_live_orders_allowed`，不因「空转」自动下单或划帐。"
     );
     println!(
-        "🔒 Polymarket：CLOB 鉴权为链下；启动与每周期可经 Relayer 自动赎回 Proxy 头寸并刷新 Collateral（需 API key）；非此类链上操作仍可能于他处发生。"
+        "🔒 Polymarket：CLOB 鉴权为链下；仅在**程序启动、进入主循环前**经 Relayer 尝试赎回可结算头寸并刷新 Collateral（需 API key）；非此类链上操作仍可能于他处发生。"
     );
     println!("📊 平台: Polymarket ↔ Kalshi");
     if kalshi_orderbook_debug_enabled() {
@@ -446,7 +446,7 @@ async fn main() -> Result<()> {
     preflight_live_readonly_trading_apis(&ks_http, &kalshi_cfg, &pm_trader).await?;
     println!("   ✅ 启动预检：两侧余额非零、Kalshi/PM 只读可用、geoblock 允许交易");
 
-    println!("   💰 Polymarket（Proxy）：Relayer 授权(仅本次启动) / 待赎回结算 / 刷新 CLOB Collateral…");
+    println!("   💰 Polymarket（Proxy）：Relayer 授权(仅本进程这一次) / 待赎回结算 / 刷新 CLOB Collateral…");
     let rpc_pm = portfolio_monitor::pm_relayer_automation::polygon_rpc_for_automation();
     let relay_pm = portfolio_monitor::pm_relayer_automation::relayer_url_for_automation();
     match portfolio_monitor::pm_relayer_automation::desk_hydrate_pm_proxy(
@@ -2157,29 +2157,6 @@ async fn run_cycle(
         monitor_state.global_tick,
         start_time.format("%H:%M:%S")
     );
-
-    println!("   💰 PM：待赎回结算 / 刷新 CLOB（不含重复 Relayer 全量授权）…");
-    let rpc_pm = portfolio_monitor::pm_relayer_automation::polygon_rpc_for_automation();
-    let relay_pm = portfolio_monitor::pm_relayer_automation::relayer_url_for_automation();
-    let cyc = monitor_state.session_cycle_seq;
-    let gtick = monitor_state.global_tick;
-    match portfolio_monitor::pm_relayer_automation::desk_hydrate_pm_proxy(
-        ks_http,
-        &rpc_pm,
-        &relay_pm,
-        false,
-    )
-    .await
-    {
-        Ok(rep) => {
-            if let Some(line) =
-                portfolio_monitor::pm_relayer_automation::feishu_pm_redeem_line(&rep, cyc, gtick)
-            {
-                let _ = feishu_push::push_trade_summary_to_feishu(&line);
-            }
-        }
-        Err(e) => eprintln!("   ⚠️ PM 周期赎回/同步: {}", e),
-    }
 
     let cycle_snap = crate::session_risk::fetch_live_snapshot(
         ks_http,
