@@ -1,0 +1,69 @@
+# 仓库内各功能的命令行说明
+
+在项目根目录执行。Windows 可用 `set VAR=value`，PowerShell 可用 `$env:VAR="value"`。以下为典型用法，`--release` 可选。
+
+--------------------------------------------------------------------------------
+## 跨平台实盘套利主程序（默认 binary）
+
+功能：Kalshi ↔ Polymarket 实盘监控与套利；启动及**每个交易周期开始**会自动尝试 Proxy 经 Relayer **赎回可结算头寸**并 **刷新 Polymarket CLOB Collateral**（需 `POLYMARKET_SIGNATURE_TYPE=1` 及 `RELAYER_API_KEY` / `POLYMARKET_API_KEY` 等，见代码 `portfolio_monitor::pm_relayer_automation`）。赎回有链上提交时向飞书推送一行摘要（与成交推送共用机器人脚本）。
+
+  cargo run -p arbitrage-monitor --release
+
+--------------------------------------------------------------------------------
+## 环境自检（根 crate）
+
+  cargo run -p arbitrage-monitor --bin check_env --release
+
+--------------------------------------------------------------------------------
+## 追踪回测（根 crate）
+
+  cargo run -p arbitrage-monitor --bin track_backtest --release
+
+--------------------------------------------------------------------------------
+## portfolio-monitor：统一快照（Kalshi / PM 同构账户摘要 + 对冲对照表）
+
+  默认配置 `portfolio_monitor/config/arb_pairs.toml`，桌面事件 `logs/desk_events.jsonl`（用于补全映射）。
+
+  cargo run -p portfolio-monitor --bin portfolio-snapshot --release
+
+  cargo run -p portfolio-monitor --bin portfolio-snapshot --release -- --config <toml> --desk <jsonl>
+
+--------------------------------------------------------------------------------
+## portfolio-monitor：现金流 CSV（stdin 输入回望天数，覆盖写入 out/cashflow.csv）
+
+  运行后按提示输入整数天数；输出目录默认 `portfolio_monitor/out`，每次运行清空并重写 `cashflow.csv`（时间升序）。
+
+  cargo run -p portfolio-monitor --bin portfolio-cashflow --release
+
+  cargo run -p portfolio-monitor --bin portfolio-cashflow --release -- --out <目录>
+
+--------------------------------------------------------------------------------
+## portfolio-monitor：利润统计（终端，全历史口径汇总）
+
+  cargo run -p portfolio-monitor --bin portfolio-profit --release
+
+--------------------------------------------------------------------------------
+## portfolio-monitor：交易回测统计（desk_events OK、stdin 回望天数，覆盖写入 PNG）
+
+  输出 `portfolio_monitor/out/turnover_count.png` 与 `turnover_volume.png`（每次运行覆盖）。
+
+  cargo run -p portfolio-monitor --bin portfolio-turnover --release
+
+  cargo run -p portfolio-monitor --bin portfolio-turnover --release -- --events <jsonl> --out <目录>
+
+--------------------------------------------------------------------------------
+## portfolio-monitor：Polymarket 赎回诊断（链上 payout / 余额，不调 Relayer 提交）
+
+  cargo run -p portfolio-monitor --bin portfolio-pm-redeem-diagnose --release
+
+--------------------------------------------------------------------------------
+## 相关环境变量（实盘 / PM 自动赎回）
+
+  POLYMARKET_SIGNATURE_TYPE=1
+  POLYMARKET_PRIVATE_KEY 或 POLYMARKET_PRIVATE_KEY_PATH
+  RELAYER_API_KEY 或 POLYMARKET_API_KEY
+  RELAYER_API_KEY_ADDRESS 或 POLYMARKET_ADDRESS
+  POLYGON_RPC_URL（可选）
+  POLYMARKET_RELAYER_URL（可选，默认 relayer-v2.polymarket.com）
+
+飞书推送依赖仓库根目录 `【消息推送】飞书转发.py` 与 Python3。

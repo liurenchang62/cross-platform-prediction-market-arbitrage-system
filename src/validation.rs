@@ -32,12 +32,6 @@ const GARBAGE_KEYWORDS: [&str; 10] = [
     "quarters", "halves", "periods", "wins"
 ];
 
-/// 统计数据类型（必须互斥）
-const STAT_TYPES: [&str; 8] = [
-    "points", "rebounds", "assists", "steals",
-    "blocks", "threes", "double", "triple"
-];
-
 /// PM「比赛是否结束/已赛完」类命题 vs Kalshi「谁赢」胜负盘：向量再像也不是同一合约。
 fn reject_match_completion_vs_winner_moneyline(pm_title: &str, kalshi_title: &str) -> bool {
     let pm = pm_title.to_lowercase();
@@ -1161,62 +1155,205 @@ impl WinnerMarketValidator {
     }
 }
 
-/// ==================== 技术统计市场验证器 ====================
-/// 体育球员技术统计（得分/助攻/篮板/三分）必须类型一致
-/// O/U 5.5 Over 等价于 6+：同向，1Y1N，无颠倒
-/// O/U 6.5 Over 与 6- 为颠倒市场：PM Y=>=7，Kalshi Y=<=6，需 (YES,YES)
-pub struct StatMarketValidator;
+/// ==================== 球员技术统计：规范语义（可扩展同义词表）====================
+/// 在双方均为「PM 尾段 O/U / over / under + Kalshi N±」范式且抽出语文后：
+/// - 若两句均能映射到 [`CanonicalPlayerStat`]：仅当**同一规范项**视为语义相同；
+/// - 若**均不能**映射：仅当规范化后的字面**完全一致**视为相同（未知新词、两平台同文案）；
+/// - 若**恰一侧**能映射：**不**视为语义相同（保守拒绝，避免 pts / 未登录别名 误配）。
+///
+/// 约定：以下「一定」相对于**本表覆盖的语文**成立；新话术需补 [`phrase_to_canonical`]。
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+enum CanonicalPlayerStat {
+    Points,
+    /// 总篮板（未区分前板/后板）
+    Rebounds,
+    OffensiveRebounds,
+    DefensiveRebounds,
+    Assists,
+    Steals,
+    Blocks,
+    ThreesMade,
+    FreeThrowsMade,
+    FieldGoalsMade,
+    Turnovers,
+    Minutes,
+    PersonalFouls,
+}
 
-/// 统计类型归一化（points/rebounds/assists/threes 互斥）
-fn normalize_stat_type(s: &str) -> Option<&'static str> {
-    let lower = s.to_lowercase();
-    if lower.contains("points") && !lower.contains("rebounds") && !lower.contains("assists") {
-        return Some("points");
+fn alnum_space_lower(s: &str) -> String {
+    s.to_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { ' ' })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// 将一侧标题抽出的统计语文映射为规范项；无法可靠归类则 `None`（交给字面回退）。
+fn phrase_to_canonical(phrase: &str) -> Option<CanonicalPlayerStat> {
+    let n = alnum_space_lower(phrase);
+    if n.is_empty() {
+        return None;
     }
-    if lower.contains("rebounds") {
-        return Some("rebounds");
+    let words: Vec<&str> = n.split_whitespace().collect();
+
+    if (n.contains("offensive") && n.contains("rebound")) || n.contains("oreb") {
+        return Some(CanonicalPlayerStat::OffensiveRebounds);
     }
-    if lower.contains("assists") {
-        return Some("assists");
+    if (n.contains("defensive") && n.contains("rebound")) || n.contains("dreb") {
+        return Some(CanonicalPlayerStat::DefensiveRebounds);
     }
-    if lower.contains("block") {
-        return Some("blocks");
+    if (n.contains("free") && n.contains("throw"))
+        || n == "ft"
+        || n == "fts"
+        || words.iter().any(|&w| w == "ft" || w == "fts")
+    {
+        return Some(CanonicalPlayerStat::FreeThrowsMade);
     }
-    if lower.contains("three") || lower.contains("threes") {
-        return Some("threes");
+    if (n.contains("field") && n.contains("goal"))
+        || n == "fg"
+        || n == "fgm"
+        || words.iter().any(|&w| w == "fg" || w == "fgm")
+    {
+        return Some(CanonicalPlayerStat::FieldGoalsMade);
+    }
+    // 三分：须在得分「points」之前判断，避免 "pointer" 被当成 point
+    if n.contains("3pt")
+        || n.contains("3pm")
+        || n.contains("3 pt")
+        || (n.contains("three") && (n.contains("point") || n.contains("pointer")))
+        || words.iter().any(|&w| w == "threes" || w == "pointer" || w == "pointers")
+    {
+        return Some(CanonicalPlayerStat::ThreesMade);
+    }
+    if n.contains("steal") {
+        return Some(CanonicalPlayerStat::Steals);
+    }
+    if n.contains("assist") {
+        return Some(CanonicalPlayerStat::Assists);
+    }
+    if n.contains("block") {
+        return Some(CanonicalPlayerStat::Blocks);
+    }
+    if n.contains("turnover") || n.contains("tov") {
+        return Some(CanonicalPlayerStat::Turnovers);
+    }
+    if n.contains("minute") || n.contains("mins") {
+        return Some(CanonicalPlayerStat::Minutes);
+    }
+    if n.contains("foul") {
+        return Some(CanonicalPlayerStat::PersonalFouls);
+    }
+    if n.contains("rebound")
+        || n.contains("boards")
+        || words.iter().any(|&w| w == "reb" || w == "rebs" || w == "boards")
+    {
+        return Some(CanonicalPlayerStat::Rebounds);
+    }
+    for &w in &words {
+        match w {
+            "pts" | "scoring" | "points" | "point" => {
+                return Some(CanonicalPlayerStat::Points);
+            }
+            _ => {}
+        }
     }
     None
 }
 
-impl StatMarketValidator {
-    /// PM 格式: "Player: Rebounds O/U 4.5" 或 "Player: Assists O/U 5.5" 或 "Points Under 20.5"
-    fn extract_pm_stat(title: &str) -> Option<(&'static str, f64, bool)> {
-        let lower = title.to_lowercase();
-        let has_ou = title.contains("O/U") || lower.contains(" over ") || lower.contains(" under ");
-        if !has_ou {
-            return None;
+/// 结构化范式下统计语义是否相同（见模块注释「双 `Some` / 双 `None` / 一有一无」规则）。
+fn stat_phrases_same_semantics(pm_phrase: &str, ks_phrase: &str) -> bool {
+    let c1 = phrase_to_canonical(pm_phrase);
+    let c2 = phrase_to_canonical(ks_phrase);
+    match (c1, c2) {
+        (Some(a), Some(b)) => a == b,
+        (None, None) => alnum_space_lower(pm_phrase) == alnum_space_lower(ks_phrase),
+        _ => false,
+    }
+}
+
+/// PM 尾段里、O/U（或 over/under）之前的统计描述语文，如 `Rebounds`、`Points`、`Made Threes`。
+fn extract_pm_stat_phrase(title: &str) -> Option<String> {
+    let lower = title.to_lowercase();
+    let has_ou =
+        title.contains("O/U") || lower.contains(" over ") || lower.contains(" under ");
+    if !has_ou {
+        return None;
+    }
+    extract_number(title)?;
+    let tail = title.rsplit(':').next()?.trim();
+    let low_tail = tail.to_lowercase();
+    let cut = if let Some(i) = tail.find("O/U") {
+        i
+    } else if let Some(i) = low_tail.find(" over ") {
+        i
+    } else if let Some(i) = low_tail.find(" under ") {
+        i
+    } else {
+        return None;
+    };
+    let phrase = tail[..cut].trim();
+    if phrase.is_empty() {
+        return None;
+    }
+    Some(phrase.to_string())
+}
+
+/// Kalshi 第一处 `N+ …` 或 `N- …`（球员 prop）后的统计语文，直到 ` - ` 或行尾。
+fn extract_ks_stat_phrase_from_kalshi(title: &str) -> Option<String> {
+    let re_plus = Regex::new(r"(?i)(\d+\.?\d*)\s*\+\s*([^\-\n]+?)(?:\s+-\s+|$)").ok()?;
+    if let Some(caps) = re_plus.captures(title) {
+        let ph = caps.get(2)?.as_str().trim();
+        if !ph.is_empty() {
+            return Some(ph.to_string());
         }
-        let stat = normalize_stat_type(title)?;
+    }
+    let re_minus =
+        Regex::new(r"(?i)(\d+\.?\d*)\s*-\s*(\s*[a-z]+(?:\s+[a-z]+)*)\b").ok()?;
+    if let Some(caps) = re_minus.captures(title) {
+        let ph = caps.get(2)?.as_str().trim();
+        if !ph.is_empty() {
+            return Some(ph.to_string());
+        }
+    }
+    None
+}
+
+/// ==================== 技术统计市场验证器 ====================
+/// 球员技术统计：规范语义一致；阈值上 O/U 5.5 Over 等价于 6+（1Y1N），颠倒须 2Y。
+pub struct StatMarketValidator;
+
+impl StatMarketValidator {
+    /// PM：带 O/U（或 over/under）阈值与统计语文。
+    fn extract_pm_stat(title: &str) -> Option<(String, f64, bool)> {
+        let phrase = extract_pm_stat_phrase(title)?;
         let num = extract_number(title)?;
+        let lower = title.to_lowercase();
         let is_over = !lower.contains("under");
-        Some((stat, num, is_over))
+        Some((phrase, num, is_over))
     }
 
-    /// Kalshi 格式: "Player: 4+ assists" 或 "Player: 6+ rebounds - Player: 6+"
-    fn extract_ks_stat(title: &str) -> Option<(&'static str, f64, bool)> {
-        let re_plus = Regex::new(r"(?i)(\d+\.?\d*)\s*\+\s*([a-z]+)").ok()?;
+    /// Kalshi：`N+ stat…` 或 `N- stat…`（到下一 ` - ` 前）。
+    fn extract_ks_stat(title: &str) -> Option<(String, f64, bool)> {
+        let re_plus = Regex::new(r"(?i)(\d+\.?\d*)\s*\+\s*([^\-\n]+?)(?:\s+-\s+|$)").ok()?;
         if let Some(caps) = re_plus.captures(title) {
             let num: f64 = caps.get(1)?.as_str().parse().ok()?;
-            let word = caps.get(2)?.as_str();
-            let stat = normalize_stat_type(word).or_else(|| normalize_stat_type(title))?;
-            return Some((stat, num, true));
+            let ph = caps.get(2)?.as_str().trim().to_string();
+            if ph.is_empty() {
+                return None;
+            }
+            return Some((ph, num, true));
         }
-        let re_minus = Regex::new(r"(?i)(\d+\.?\d*)\s*-\s*([a-z]+)").ok()?;
+        let re_minus =
+            Regex::new(r"(?i)(\d+\.?\d*)\s*-\s*(\s*[a-z]+(?:\s+[a-z]+)*)\b").ok()?;
         if let Some(caps) = re_minus.captures(title) {
             let num: f64 = caps.get(1)?.as_str().parse().ok()?;
-            let word = caps.get(2)?.as_str();
-            let stat = normalize_stat_type(word).or_else(|| normalize_stat_type(title))?;
-            return Some((stat, num, false));
+            let ph = caps.get(2)?.as_str().trim().to_string();
+            if ph.is_empty() {
+                return None;
+            }
+            return Some((ph, num, false));
         }
         None
     }
@@ -1226,14 +1363,13 @@ impl StatMarketValidator {
         Self::extract_pm_stat(pm_title).is_some() && Self::extract_ks_stat(kalshi_title).is_some()
     }
 
-    /// 验证：统计类型一致且阈值匹配
+    /// 验证：统计语文一致且阈值匹配
     /// 同向（Over+Plus 或 Under+Minus）：等价市场，1Y1N 无颠倒
     /// 颠倒（Over+Minus 或 Under+Plus）：相反市场，需 (YES,YES)
     pub fn validate(pm_title: &str, kalshi_title: &str) -> Option<(String, String, bool)> {
-        let (pm_stat, pm_num, pm_is_over) = Self::extract_pm_stat(pm_title)?;
-        let (ks_stat, ks_num, ks_is_plus) = Self::extract_ks_stat(kalshi_title)?;
-
-        if pm_stat != ks_stat {
+        let (pm_phrase, pm_num, pm_is_over) = Self::extract_pm_stat(pm_title)?;
+        let (ks_phrase, ks_num, ks_is_plus) = Self::extract_ks_stat(kalshi_title)?;
+        if !stat_phrases_same_semantics(&pm_phrase, &ks_phrase) {
             return None;
         }
 
@@ -1281,12 +1417,6 @@ impl ScoreMarketValidator {
         // 若双方均为技术统计市场，交给 StatMarketValidator（避免 rebounds 与 assists 误配）
         if StatMarketValidator::is_stat_market_pair(pm_title, kalshi_title) {
             return None;
-        }
-        // 双方都能归到具体 stat 且类型不同：禁止只比阈值数字（如 assists O/U vs blocks N+）
-        if let (Some(a), Some(b)) = (normalize_stat_type(pm_title), normalize_stat_type(kalshi_title)) {
-            if a != b {
-                return None;
-            }
         }
         // 检查是否都是得分市场（Points）
         let pm_is_score = pm_title.contains("O/U") || pm_title.contains("Points");
@@ -1688,6 +1818,16 @@ pub(crate) fn second_screen_try_match(
             kalshi_side,
             needs_inversion,
         });
+    }
+
+    // PM 球员式 O/U 与 Kalshi N± prop：两边都能抽出统计描述时，语文须对齐（不依赖枚举）。
+    if let (Some(pp), Some(kp)) = (
+        extract_pm_stat_phrase(pm_title),
+        extract_ks_stat_phrase_from_kalshi(kalshi_title),
+    ) {
+        if !stat_phrases_same_semantics(&pp, &kp) {
+            return None;
+        }
     }
 
     if let Some((pm_side, kalshi_side, needs_inversion)) =
@@ -2337,6 +2477,16 @@ mod tests {
             "Donovan Clingan: Assists O/U 2.5",
             "Donovan Clingan: 2+ blocks - Donovan Clingan: 2+"
         ).is_none());
+        // Rebounds O/U vs Steals N+（向量高分误配实盘曾发生）
+        assert!(StatMarketValidator::validate(
+            "Jalen Suggs: Rebounds O/U 3.5",
+            "Jalen Suggs: 3+ steals - Jalen Suggs: 3+"
+        )
+        .is_none());
+        assert!(StatMarketValidator::is_stat_market_pair(
+            "Jalen Suggs: Rebounds O/U 3.5",
+            "Jalen Suggs: 3+ steals - Jalen Suggs: 3+"
+        ));
     }
 
     #[test]
@@ -2363,6 +2513,40 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn test_second_screen_rejects_rebounds_ou_vs_steals_plus() {
+        assert!(
+            second_screen_try_match(
+                "Jalen Suggs: Rebounds O/U 3.5",
+                "Jalen Suggs: 3+ steals - Jalen Suggs: 3+",
+                0.99,
+                "sports_basketball",
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn test_stat_market_offensive_vs_defensive_rebounds_rejected() {
+        assert!(StatMarketValidator::validate(
+            "Player: Offensive Rebounds O/U 2.5",
+            "Player: 2+ defensive rebounds - Player: 2+"
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn test_stat_market_pts_alias_matches_points() {
+        let r = StatMarketValidator::validate(
+            "Player: Points O/U 19.5",
+            "Player: 20+ pts - Player: 20+",
+        )
+        .expect("pts 与 Points 须映射到同一规范项");
+        assert_eq!(r.0, "YES");
+        assert_eq!(r.1, "NO");
+        assert!(!r.2);
     }
 
     #[test]

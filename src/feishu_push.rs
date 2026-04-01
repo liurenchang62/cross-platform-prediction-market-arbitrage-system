@@ -104,7 +104,9 @@ pub fn push_trade_summary_to_feishu(summary: &str) -> Result<()> {
 #[allow(clippy::too_many_arguments)]
 pub fn format_trade_summary(
     pair_label: &str,
-    cycle_id: usize,
+    trading_session_utc_date: &str,
+    session_cycle_id: usize,
+    global_tick: usize,
     cycle_phase: &str,
     pm_title: &str,
     kalshi_title: &str,
@@ -131,7 +133,8 @@ pub fn format_trade_summary(
     format!(
         "【套利实盘成交】 ARBITRAGE LIVE FILL\n\
 市场对: {}\n\
-周期: #{} {}\n\
+UTC会话日: {} | 会话内周期 #{} | 调度 tick {}\n\
+阶段: {}\n\
 策略: Polymarket 买 {} + Kalshi 买 {}\n\
 执行结果: {} — {}\n\
 — — —\n\
@@ -149,7 +152,9 @@ Kalshi 卖平订单数(本窗): {}\n\
 识别阶段(模型): 净利≈${:.4} 探针成本≈${:.4}\n\
 完整成交分项以本机终端「实盘核对」与 {} 为准。",
         pair_label,
-        cycle_id,
+        trading_session_utc_date,
+        session_cycle_id,
+        global_tick,
         cycle_phase,
         pm_side,
         kalshi_side,

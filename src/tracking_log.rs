@@ -6,7 +6,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use csv::WriterBuilder;
 use serde_json::json;
 
@@ -45,6 +45,8 @@ const PAIRS_HEADER: &[&str] = &[
     "similarity",
     "needs_inversion",
     "active",
+    "trading_session_utc_date",
+    "global_tick",
 ];
 
 const ARB_HEADER: &[&str] = &[
@@ -118,9 +120,11 @@ impl TrackingPairsLog {
 
     pub fn append_cycle_snapshot(
         &self,
-        cycle_id: usize,
+        session_cycle_id: usize,
         cycle_phase: &str,
         pairs: &[TrackedArbitrage],
+        trading_session_utc_date: NaiveDate,
+        global_tick: usize,
     ) -> Result<()> {
         let _g = self.inner.lock().expect("tracking_pairs lock");
         let t = Utc::now().to_rfc3339();
@@ -139,7 +143,7 @@ impl TrackingPairsLog {
             }
             w.write_record(&[
                 t.clone(),
-                cycle_id.to_string(),
+                session_cycle_id.to_string(),
                 cycle_phase.to_string(),
                 p.pair_id.clone(),
                 p.pm_market.market_id.clone(),
@@ -151,6 +155,8 @@ impl TrackingPairsLog {
                 format!("{:.6}", p.similarity),
                 if p.needs_inversion { "1" } else { "0" }.to_string(),
                 "1".to_string(),
+                trading_session_utc_date.format("%Y-%m-%d").to_string(),
+                global_tick.to_string(),
             ])?;
         }
         w.flush()?;
@@ -174,7 +180,7 @@ impl TrackingArbEventsLog {
     #[allow(clippy::too_many_arguments)]
     pub fn append_arbitrage_found(
         &self,
-        cycle_id: usize,
+        session_cycle_id: usize,
         cycle_phase: &str,
         pair_id: &str,
         pm_market_id: &str,
@@ -187,6 +193,8 @@ impl TrackingArbEventsLog {
         needs_inversion: bool,
         opp: &ArbitrageOpportunity,
         params: &TrackingParamsSnapshot,
+        trading_session_utc_date: NaiveDate,
+        global_tick: usize,
     ) -> Result<()> {
         let _g = self.inner.lock().expect("tracking_arb lock");
         let t = Utc::now().to_rfc3339();
@@ -203,7 +211,7 @@ impl TrackingArbEventsLog {
         let ksj = book_top5_json(&opp.orderbook_kalshi_top5);
         w.write_record(&[
             t,
-            cycle_id.to_string(),
+            session_cycle_id.to_string(),
             cycle_phase.to_string(),
             pair_id.to_string(),
             pm_market_id.to_string(),
@@ -236,6 +244,8 @@ impl TrackingArbEventsLog {
             params.full_fetch_interval_cycles.to_string(),
             params.arb_track_concurrency.to_string(),
             format!("{:.6}", params.min_net_profit_frac_of_pair_cap),
+            trading_session_utc_date.format("%Y-%m-%d").to_string(),
+            global_tick.to_string(),
         ])?;
         w.flush()?;
         Ok(())

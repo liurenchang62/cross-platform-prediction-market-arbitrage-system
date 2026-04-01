@@ -4,7 +4,7 @@ use futures::stream::{self, StreamExt};
 use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 use tokio::time;
-use chrono::{DateTime, Utc, Local};
+use chrono::{DateTime, Local, Utc};
 
 mod market;
 mod market_matcher;
@@ -49,7 +49,7 @@ use polymarket_client_sdk::types::Decimal;
 use reqwest::Client as HttpClient;
 use market_matcher::{MarketMatcher, MarketMatcherConfig};
 use arbitrage_detector::{ArbitrageDetector, ArbitrageOpportunity};
-use crate::tracking::{oriented_track_id, MonitorState, TrackedArbitrage};
+use crate::tracking::{oriented_track_id, DeskCycleCtx, MonitorState, TrackedArbitrage};
 use crate::system_params::{
     ARB_TRACK_CONCURRENCY, FULL_FETCH_INTERVAL, LIVE_ARBIT_MIN_NET_PROFIT_FRAC_OF_PAIR_CAP,
     LIVE_HEDGE_VS_UNWIND_MARGIN_FRAC_OF_PAIR_CAP, LIVE_SECOND_LEG_DEADLINE_SECS,
@@ -408,7 +408,7 @@ async fn main() -> Result<()> {
         "🔒 资金安全：无合格套利时主循环**仅**请求行情/订单簿/费率等只读接口；Kalshi IOC / PM FOK / 卖平敞口仅在 `validate_arbitrage_pair_post_success` 内且通过 `require_live_orders_allowed`，不因「空转」自动下单或划帐。"
     );
     println!(
-        "🔒 Polymarket CLOB `authenticate` 为链下鉴权；本程序不包含链上入金/USDC 划转；资金仍可能被他处改动。"
+        "🔒 Polymarket：CLOB 鉴权为链下；启动与每周期可经 Relayer 自动赎回 Proxy 头寸并刷新 Collateral（需 API key）；非此类链上操作仍可能于他处发生。"
     );
     println!("📊 平台: Polymarket ↔ Kalshi");
     if kalshi_orderbook_debug_enabled() {
@@ -445,6 +445,27 @@ async fn main() -> Result<()> {
 
     preflight_live_readonly_trading_apis(&ks_http, &kalshi_cfg, &pm_trader).await?;
     println!("   ✅ 启动预检：两侧余额非零、Kalshi/PM 只读可用、geoblock 允许交易");
+
+    println!("   💰 Polymarket（Proxy）：Relayer 授权(仅本次启动) / 待赎回结算 / 刷新 CLOB Collateral…");
+    let rpc_pm = portfolio_monitor::pm_relayer_automation::polygon_rpc_for_automation();
+    let relay_pm = portfolio_monitor::pm_relayer_automation::relayer_url_for_automation();
+    match portfolio_monitor::pm_relayer_automation::desk_hydrate_pm_proxy(
+        &ks_http,
+        &rpc_pm,
+        &relay_pm,
+        true,
+    )
+    .await
+    {
+        Ok(rep) => {
+            if let Some(line) =
+                portfolio_monitor::pm_relayer_automation::feishu_pm_redeem_line(&rep, 0, 0)
+            {
+                let _ = feishu_push::push_trade_summary_to_feishu(&line);
+            }
+        }
+        Err(e) => eprintln!("   ⚠️ PM 启动前赎回/同步未完成: {}", e),
+    }
 
     let snap = crate::session_risk::fetch_live_snapshot(&ks_http, &kalshi_cfg, &pm_trader, &polymarket)
         .await
@@ -559,7 +580,13 @@ async fn main() -> Result<()> {
     )
     .await?;
     live_guard_pm_collateral_after_full_match(&pm_trader).await?;
-    tracking_pairs_log.append_cycle_snapshot(0, "full_match", &monitor_state.tracked_pairs)?;
+    tracking_pairs_log.append_cycle_snapshot(
+        monitor_state.session_cycle_seq,
+        "full_match",
+        &monitor_state.tracked_pairs,
+        monitor_state.trading_session_utc_date,
+        monitor_state.global_tick,
+    )?;
 
     println!("\n✅ 初始化完成（全量匹配已作为周期 #0 完成）");
     println!("   📊 Kalshi 市场数: {}", kalshi_markets.len());
@@ -567,10 +594,10 @@ async fn main() -> Result<()> {
     println!("   📊 Kalshi 索引大小: {}", matcher.kalshi_index_size());
     println!("   📊 Polymarket 索引大小: {}", matcher.polymarket_index_size());
     println!(
-        "   📌 监控从周期 #1 起为价格追踪；下一全量重建约在周期 #{}",
+        "   📌 监控从会话内周期 #1 起为价格追踪；下一全量重建约在全局 tick 为 {} 的倍数时（与 UTC 会话日无关）",
         FULL_FETCH_INTERVAL
     );
-    monitor_state.next_cycle();
+    monitor_state.finish_init_advance_scheduling_counters();
 
     println!("\n🔄 开始监控循环 (间隔: 30秒)...\n");
     
@@ -601,7 +628,7 @@ async fn main() -> Result<()> {
             }
         }
         
-        monitor_state.next_cycle();
+        monitor_state.advance_tick_after_iteration();
         println!("⏳ 等待下一周期...\n");
         time::sleep(Duration::from_secs(30)).await;
     }
@@ -660,6 +687,9 @@ async fn pm_fee_bps_with_conservative_fallback(
 
 /// 拉双边簿、建阶梯、严格阈值判定；**不含**终端详表 / CSV（实盘见 `validate_arbitrage_pair_post_success`）。  
 /// PM 与 Kalshi 订单簿在单对内 `join` 并行，减少一轮 RTT。
+///
+/// `print_tracking_positive_roi_preview`：仅追踪周期（`price_track`）传 `true`；用净利门槛 0 的探针计算 [`ArbitrageOpportunity::roi_100_percent`]，
+/// 若 **> 0** 则**只打印** PM 标题、Kalshi 标题与 ROI，**不改变**是否通过严格校验或是否下单。
 async fn validate_arbitrage_core(
     polymarket: &PolymarketClient,
     kalshi: &KalshiClient,
@@ -675,6 +705,7 @@ async fn validate_arbitrage_core(
     category_mapper: &CategoryMapper,
     pm_trader: &PolymarketClobTrader,
     arb_diag: &mut Option<TrackingArbDiag>,
+    print_tracking_positive_roi_preview: bool,
 ) -> Result<Option<(ArbitrageOpportunity, Option<DateTime<Utc>>, Option<DateTime<Utc>>)>> {
     if let Some(d) = arb_diag.as_mut() {
         d.attempts += 1;
@@ -727,6 +758,29 @@ async fn validate_arbitrage_core(
         pm_fee_bps: pm_bps,
         pm_exponent: pm_exponent_for_pm_market(category_mapper, pm_market),
     };
+
+    if print_tracking_positive_roi_preview {
+        let preview_det = ArbitrageDetector::new(0.0);
+        if let Some(prev) = validate_opportunity_from_ladders(
+            &preview_det,
+            &ladders,
+            pm_side,
+            kalshi_side,
+            needs_inversion,
+            capital_usdt,
+            pair_cap_usdt,
+            &scan_cost,
+        ) {
+            if prev.roi_100_percent > 0.0 {
+                println!(
+                    "   📈 [追踪·探针ROI>0] PM: {} | Kalshi: {} | ROI {:.2}%",
+                    pm_market.title,
+                    kalshi_market.title,
+                    prev.roi_100_percent
+                );
+            }
+        }
+    }
 
     let Some(opp) = validate_opportunity_from_ladders(
         arb_detector,
@@ -863,7 +917,7 @@ async fn validate_arbitrage_pair_post_success(
     kalshi_side: &str,
     needs_inversion: bool,
     capital_usdt: f64,
-    cycle_id: usize,
+    desk_ctx: DeskCycleCtx,
     cycle_phase: &str,
     pair_label: &str,
     live_log: &DeskEventsLog,
@@ -1327,7 +1381,9 @@ async fn validate_arbitrage_pair_post_success(
     .to_string();
 
     live_log.append(
-        cycle_id,
+        desk_ctx.trading_session_utc_date,
+        desk_ctx.session_cycle_id,
+        desk_ctx.global_tick,
         cycle_phase,
         pair_label,
         &pm_market.market_id,
@@ -1363,7 +1419,12 @@ async fn validate_arbitrage_pair_post_success(
     if feishu_push::feishu_should_notify(status) && !ks_order_id.is_empty() {
         let body = feishu_push::format_trade_summary(
             pair_label,
-            cycle_id,
+            &desk_ctx
+                .trading_session_utc_date
+                .format("%Y-%m-%d")
+                .to_string(),
+            desk_ctx.session_cycle_id,
+            desk_ctx.global_tick,
             cycle_phase,
             &pm_market.title,
             &kalshi_market.title,
@@ -1412,7 +1473,7 @@ async fn validate_arbitrage_pair(
     capital_usdt: f64,
     pair_cap_usdt: f64,
     per_leg_cap_usd: f64,
-    cycle_id: usize,
+    desk_ctx: DeskCycleCtx,
     cycle_phase: &str,
     pair_label: &str,
     live_log: &DeskEventsLog,
@@ -1441,6 +1502,7 @@ async fn validate_arbitrage_pair(
         category_mapper,
         pm_trader,
         arb_diag,
+        cycle_phase == "price_track",
     )
     .await?
     else {
@@ -1448,7 +1510,7 @@ async fn validate_arbitrage_pair(
     };
     if let Some(t) = tracking_arb {
         t.append_arbitrage_found(
-            cycle_id,
+            desk_ctx.session_cycle_id,
             cycle_phase,
             pair_label,
             &pm_market.market_id,
@@ -1461,6 +1523,8 @@ async fn validate_arbitrage_pair(
             needs_inversion,
             &opp,
             track_params,
+            desk_ctx.trading_session_utc_date,
+            desk_ctx.global_tick,
         )?;
     }
     let paused = session_risk
@@ -1493,7 +1557,7 @@ async fn validate_arbitrage_pair(
         kalshi_side,
         needs_inversion,
         capital_usdt,
-        cycle_id,
+        desk_ctx,
         cycle_phase,
         pair_label,
         live_log,
@@ -1582,7 +1646,7 @@ async fn run_full_match_work(
     
     let mut verified_count = 0;
     let conc = ARB_TRACK_CONCURRENCY;
-    let full_cycle_id = monitor_state.current_cycle;
+    let desk_ctx = monitor_state.desk_cycle_ctx();
 
     if conc <= 1 {
         for (pm_market, kalshi_market, similarity, pm_side, kalshi_side, needs_inversion) in &matches {
@@ -1605,7 +1669,7 @@ async fn run_full_match_work(
                 trade_amount,
                 pair_cap_usdt,
                 per_leg_cap_usd,
-                full_cycle_id,
+                desk_ctx,
                 "full_match",
                 &pair_label,
                 live_log,
@@ -1667,6 +1731,7 @@ async fn run_full_match_work(
                         cm.as_ref(),
                         &pm_tr,
                         &mut dslot,
+                        false,
                     )
                     .await;
                     let frag = dslot.unwrap_or_default();
@@ -1697,7 +1762,7 @@ async fn run_full_match_work(
             match core_res {
                 Ok(Some((opp, pm_exp, ks_exp))) => {
                     tracking_arb.append_arbitrage_found(
-                        full_cycle_id,
+                        desk_ctx.session_cycle_id,
                         "full_match",
                         &pair_label,
                         &pm_market.market_id,
@@ -1710,6 +1775,8 @@ async fn run_full_match_work(
                         needs_inversion,
                         &opp,
                         &params_cycle,
+                        desk_ctx.trading_session_utc_date,
+                        desk_ctx.global_tick,
                     )?;
                     let paused = session_risk
                         .lock()
@@ -1740,7 +1807,7 @@ async fn run_full_match_work(
                             &kalshi_side,
                             needs_inversion,
                             trade_amount,
-                            full_cycle_id,
+                            desk_ctx,
                             "full_match",
                             &pair_label,
                             live_log,
@@ -1848,6 +1915,7 @@ async fn run_tracking_cycle(
 ) -> Result<usize> {
     println!("   📡 执行价格追踪...");
     println!("      追踪 {} 个匹配对", monitor_state.tracked_pairs.len());
+    let desk_ctx = monitor_state.desk_cycle_ctx();
 
     let mut series_keys: HashSet<String> = HashSet::new();
     for p in monitor_state.tracked_pairs.iter().filter(|x| x.active) {
@@ -1895,7 +1963,7 @@ async fn run_tracking_cycle(
                 trade_amount,
                 pair_cap_usdt,
                 per_leg_cap_usd,
-                monitor_state.current_cycle,
+                desk_ctx,
                 "price_track",
                 &pair.pair_id,
                 live_log,
@@ -1967,6 +2035,7 @@ async fn run_tracking_cycle(
                         cm.as_ref(),
                         &pm_tr,
                         &mut dslot,
+                        true,
                     )
                     .await;
                     let frag = dslot.unwrap_or_default();
@@ -1984,7 +2053,7 @@ async fn run_tracking_cycle(
             match core_res {
                 Ok(Some((opp, pm_exp, ks_exp))) => {
                     tracking_arb.append_arbitrage_found(
-                        monitor_state.current_cycle,
+                        desk_ctx.session_cycle_id,
                         "price_track",
                         &tr.pair_id,
                         &tr.pm_market.market_id,
@@ -1997,6 +2066,8 @@ async fn run_tracking_cycle(
                         tr.needs_inversion,
                         &opp,
                         track_params,
+                        desk_ctx.trading_session_utc_date,
+                        desk_ctx.global_tick,
                     )?;
                     let paused = session_risk
                         .lock()
@@ -2027,7 +2098,7 @@ async fn run_tracking_cycle(
                             &tr.kalshi_side,
                             tr.needs_inversion,
                             trade_amount,
-                            monitor_state.current_cycle,
+                            desk_ctx,
                             "price_track",
                             &tr.pair_id,
                             live_log,
@@ -2078,7 +2149,57 @@ async fn run_cycle(
     tracking_arb: &TrackingArbEventsLog,
 ) -> Result<CycleStats> {
     let start_time = Local::now();
-    println!("🔄 开始新周期 #{} - {}", monitor_state.current_cycle, start_time.format("%H:%M:%S"));
+    monitor_state.roll_session_if_new_utc_day();
+    println!(
+        "🔄 新监控迭代 UTC会话日 {} | 会话内周期 #{} | 调度 tick {} — 本地 {}",
+        monitor_state.trading_session_utc_date,
+        monitor_state.session_cycle_seq,
+        monitor_state.global_tick,
+        start_time.format("%H:%M:%S")
+    );
+
+    println!("   💰 PM：待赎回结算 / 刷新 CLOB（不含重复 Relayer 全量授权）…");
+    let rpc_pm = portfolio_monitor::pm_relayer_automation::polygon_rpc_for_automation();
+    let relay_pm = portfolio_monitor::pm_relayer_automation::relayer_url_for_automation();
+    let cyc = monitor_state.session_cycle_seq;
+    let gtick = monitor_state.global_tick;
+    match portfolio_monitor::pm_relayer_automation::desk_hydrate_pm_proxy(
+        ks_http,
+        &rpc_pm,
+        &relay_pm,
+        false,
+    )
+    .await
+    {
+        Ok(rep) => {
+            if let Some(line) =
+                portfolio_monitor::pm_relayer_automation::feishu_pm_redeem_line(&rep, cyc, gtick)
+            {
+                let _ = feishu_push::push_trade_summary_to_feishu(&line);
+            }
+        }
+        Err(e) => eprintln!("   ⚠️ PM 周期赎回/同步: {}", e),
+    }
+
+    let cycle_snap = crate::session_risk::fetch_live_snapshot(
+        ks_http,
+        kalshi_cfg,
+        pm_trader,
+        polymarket,
+    )
+    .await
+    .context("本周期账户快照")?;
+    println!(
+        "   ── 本周期 · 账户（USD）── Kalshi 总 ${:.2} · 现金 ${:.2} │ PM 总 ${:.2} · 现金(Collateral) ${:.2}",
+        cycle_snap.ks_total_usd(),
+        cycle_snap.ks_cash_usd,
+        cycle_snap.pm_total_usd(),
+        cycle_snap.pm_collateral_usd,
+    );
+    session_risk
+        .lock()
+        .unwrap()
+        .apply_snapshot_with_notifications(&cycle_snap);
 
     monitor_state.prune_tracked_beyond_resolution_horizon(Utc::now());
 
@@ -2135,7 +2256,13 @@ async fn run_cycle(
     } else {
         "price_track"
     };
-    tracking_pairs.append_cycle_snapshot(monitor_state.current_cycle, phase, &monitor_state.tracked_pairs)?;
+    tracking_pairs.append_cycle_snapshot(
+        monitor_state.session_cycle_seq,
+        phase,
+        &monitor_state.tracked_pairs,
+        monitor_state.trading_session_utc_date,
+        monitor_state.global_tick,
+    )?;
     
     let elapsed = Local::now() - start_time;
     println!("   ⏱️ 周期完成, 耗时: {}ms", elapsed.num_milliseconds());

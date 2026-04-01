@@ -1,5 +1,5 @@
 // src/tracking.rs
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 
 use crate::market::Market;
 use crate::market_filter::tracked_pair_exceeds_horizon;
@@ -62,34 +62,75 @@ impl TrackedArbitrage {
     }
 }
 
+/// 写入 `desk_events` / 追踪 CSV 时携带的「会话内周期」上下文（单线程捕获，并发任务在 spawn 前 Clone）。
+#[derive(Clone, Copy)]
+pub struct DeskCycleCtx {
+    pub trading_session_utc_date: NaiveDate,
+    pub session_cycle_id: usize,
+    pub global_tick: usize,
+}
+
 /// 监控状态
 pub struct MonitorState {
     pub tracked_pairs: Vec<TrackedArbitrage>,
-    pub current_cycle: usize,
+    /// 单调递增 tick，仅用于「每隔 N tick 做一次全量匹配」调度（**不**随 UTC 日切归零）。
+    pub global_tick: usize,
     pub full_match_interval: usize,
     /// 最近一次全量拉取并过滤后的 PM 池大小（追踪周期沿用，供 CSV 参数列）
     pub last_pm_pool: usize,
     /// 最近一次全量拉取并过滤后的 Kalshi 池大小
     pub last_ks_pool: usize,
+    /// 当前交易会话锚定的 **UTC 日历日**；跨 UTC 零点后由 [`MonitorState::roll_session_if_new_utc_day`] 更新。
+    pub trading_session_utc_date: NaiveDate,
+    /// **仅在同一 `trading_session_utc_date` 内**可横向比较的周期序号；新 UTC 日归零后从 0 重新开始。
+    pub session_cycle_seq: usize,
 }
 
 impl MonitorState {
     pub fn new(full_match_interval: usize) -> Self {
+        let d = Utc::now().date_naive();
         Self {
             tracked_pairs: Vec::new(),
-            current_cycle: 0,
+            global_tick: 0,
             full_match_interval,
             last_pm_pool: 0,
             last_ks_pool: 0,
+            trading_session_utc_date: d,
+            session_cycle_seq: 0,
         }
     }
 
     pub fn should_full_match(&self) -> bool {
-        self.current_cycle % self.full_match_interval == 0
+        self.global_tick % self.full_match_interval == 0
     }
 
-    pub fn next_cycle(&mut self) {
-        self.current_cycle += 1;
+    /// 每个「监控周期」迭代开始时调用：若已进入新 UTC 日，则开启新会话并将 `session_cycle_seq` 置 0。
+    pub fn roll_session_if_new_utc_day(&mut self) {
+        let today = Utc::now().date_naive();
+        if today != self.trading_session_utc_date {
+            self.trading_session_utc_date = today;
+            self.session_cycle_seq = 0;
+        }
+    }
+
+    /// 主循环每次睡眠结束后调用：`global_tick` 与 `session_cycle_seq` 各 +1（新 UTC 日的归零仅在下一周期开头的 [`roll_session_if_new_utc_day`]）。
+    pub fn advance_tick_after_iteration(&mut self) {
+        self.global_tick += 1;
+        self.session_cycle_seq += 1;
+    }
+
+    /// 初始化阶段：完成周期 #0 全量匹配后，将「下一轮追踪」标为会话内第 1 周期（兼容原 `current_cycle` 语义）。
+    pub fn finish_init_advance_scheduling_counters(&mut self) {
+        self.global_tick = 1;
+        self.session_cycle_seq = 1;
+    }
+
+    pub fn desk_cycle_ctx(&self) -> DeskCycleCtx {
+        DeskCycleCtx {
+            trading_session_utc_date: self.trading_session_utc_date,
+            session_cycle_id: self.session_cycle_seq,
+            global_tick: self.global_tick,
+        }
     }
 
     pub fn update_tracked_pairs(&mut self, new_matches: Vec<(Market, Market, f64, String, String, bool)>) {

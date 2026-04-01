@@ -1,5 +1,5 @@
-//! 实盘成交一行一条 JSON（`logs/desk_events.jsonl`），供 `portfolio-charts` 等工具消费。
-//! 每行需含 `time_utc_rfc3339`、`status`、`pair_label`（与 `portfolio_monitor` 约定一致）。
+//! 实盘成交一行一条 JSON（`logs/desk_events.jsonl`），供 `portfolio-charts`、`portfolio-snapshot`、`portfolio-dashboard` 等工具消费。
+//! 固定字段含 `time_utc_rfc3339`、`trading_session_utc_date`（YYYY-MM-DD）、`session_cycle_id`、`global_tick`、`status`、`pair_label` 等。
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -7,7 +7,7 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use anyhow::{Context, Result};
-use chrono::Utc;
+use chrono::{NaiveDate, Utc};
 
 use crate::system_params::DESK_EVENTS_JSONL;
 
@@ -36,7 +36,9 @@ impl DeskEventsLog {
     #[allow(clippy::too_many_arguments)]
     pub fn append(
         &self,
-        cycle_id: usize,
+        trading_session_utc_date: NaiveDate,
+        session_cycle_id: usize,
+        global_tick: usize,
         cycle_phase: &str,
         pair_label: &str,
         pm_market_id: &str,
@@ -58,7 +60,10 @@ impl DeskEventsLog {
         let _g = self.lock.lock().expect("desk_events lock");
         let row = serde_json::json!({
             "time_utc_rfc3339": Utc::now().to_rfc3339(),
-            "cycle_id": cycle_id,
+            "trading_session_utc_date": trading_session_utc_date.format("%Y-%m-%d").to_string(),
+            "session_cycle_id": session_cycle_id,
+            "cycle_id": session_cycle_id,
+            "global_tick": global_tick,
             "cycle_phase": cycle_phase,
             "pair_label": pair_label,
             "pm_market_id": pm_market_id,

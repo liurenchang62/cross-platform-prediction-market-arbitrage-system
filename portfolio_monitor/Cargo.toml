@@ -9,20 +9,24 @@ name = "portfolio_monitor"
 path = "src/lib.rs"
 
 [[bin]]
-name = "portfolio-overview"
-path = "src/bin/overview.rs"
+name = "portfolio-snapshot"
+path = "src/bin/snapshot.rs"
 
 [[bin]]
-name = "portfolio-pairs"
-path = "src/bin/pairs.rs"
+name = "portfolio-cashflow"
+path = "src/bin/cashflow.rs"
 
 [[bin]]
-name = "portfolio-settled"
-path = "src/bin/settled.rs"
+name = "portfolio-profit"
+path = "src/bin/profit.rs"
 
 [[bin]]
-name = "portfolio-charts"
-path = "src/bin/charts.rs"
+name = "portfolio-turnover"
+path = "src/bin/turnover.rs"
+
+[[bin]]
+name = "portfolio-pm-redeem-diagnose"
+path = "src/bin/pm_redeem_diagnose.rs"
 
 [dependencies]
 anyhow = "1.0"
@@ -33,11 +37,19 @@ serde_json = "1"
 toml = "0.8"
 chrono = { version = "0.4", features = ["serde"] }
 csv = "1.3"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 base64 = "0.22"
 rsa = { version = "0.9", features = ["pem", "sha2"] }
 sha2 = "0.10"
 rand = "0.8"
-polymarket-client-sdk = { version = "0.4.4", features = ["clob"] }
+polymarket-client-sdk = { version = "0.4.4", features = ["clob", "data", "ctf"] }
+# 与 polymarket-client-sdk 的 CTF 示例一致：Provider + 本地签名发链上 redeem
+alloy = { version = "1.6.3", default-features = false, features = [
+    "signer-local",
+    "sol-types",
+    "std",
+] }
 alloy-signer-local = "1.8"
+rust_decimal = "1"
 plotters = { version = "0.3", features = ["chrono"] }
+hex = "0.4"

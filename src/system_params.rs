@@ -107,7 +107,7 @@ pub const LIVE_ARBIT_SURPLUS_BUFFER_FRAC_OF_PAIR_CAP: f64 = 0.001;
 
 /// 可接受最小净利润：识别与实盘共用；模型中净利须 **大于** `pair_cap × 本比例`（相对「每对名义上限」）。  
 /// 例：`0.15` = 至少赚到该对名义上限的 **15%**（`pair_cap≈$5` 时约 **$0.75**）。仅在 `system_params` 改此常量即可调门槛。
-pub const LIVE_ARBIT_MIN_NET_PROFIT_FRAC_OF_PAIR_CAP: f64 = 0.15;
+pub const LIVE_ARBIT_MIN_NET_PROFIT_FRAC_OF_PAIR_CAP: f64 = 0.1;
 
 #[inline]
 pub fn live_arbit_surplus_buffer_usd(pair_cap_usdt: f64) -> f64 {

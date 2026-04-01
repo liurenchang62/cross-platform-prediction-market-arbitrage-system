@@ -5,11 +5,13 @@ use alloy_signer_local::PrivateKeySigner;
 use polymarket_client_sdk::auth::Signer as _;
 use polymarket_client_sdk::auth::Normal;
 use polymarket_client_sdk::auth::state::Authenticated;
-use polymarket_client_sdk::clob::types::request::{BalanceAllowanceRequest, TradesRequest};
+use polymarket_client_sdk::clob::types::request::{
+    BalanceAllowanceRequest, MidpointRequest, TradesRequest,
+};
 use polymarket_client_sdk::clob::types::{AssetType, Side, SignatureType};
 use polymarket_client_sdk::clob::{Client as PmClient, Config as PmConfig};
-use polymarket_client_sdk::types::{Decimal, U256};
-use polymarket_client_sdk::POLYGON;
+use polymarket_client_sdk::types::{Address, Decimal, U256};
+use polymarket_client_sdk::{derive_proxy_wallet, derive_safe_wallet, POLYGON};
 
 use crate::system_params;
 
@@ -25,6 +27,29 @@ fn sig_type() -> SignatureType {
         2 => SignatureType::GnosisSafe,
         _ => SignatureType::Eoa,
     }
+}
+
+/// Polymarket **Data API**（`data-api.polymarket.com`）按 `user=` 查询的地址。
+/// 与 CLOB 认证一致：EOA 用私钥地址；Proxy / Safe 用 SDK 推导的钱包地址。
+/// 供 `pm_relayer_automation` / 组合工具读取与 CLOB `connect` 相同的私钥配置。
+pub fn read_polymarket_private_key_hex() -> Result<String> {
+    system_params::load_polymarket_private_key_hex()
+}
+
+pub fn polymarket_data_api_user_address() -> Result<Address> {
+    let hex = system_params::load_polymarket_private_key_hex().context("PM 私钥")?;
+    let signer = PrivateKeySigner::from_str(&hex)
+        .context("PM PrivateKeySigner")?
+        .with_chain_id(Some(POLYGON));
+    let eoa = signer.address();
+    Ok(match sig_type() {
+        SignatureType::Eoa => eoa,
+        SignatureType::Proxy => derive_proxy_wallet(eoa, POLYGON)
+            .context("derive_proxy_wallet：请确认链为 Polygon 且环境 POLYMARKET_SIGNATURE_TYPE=1")?,
+        SignatureType::GnosisSafe => derive_safe_wallet(eoa, POLYGON)
+            .context("derive_safe_wallet：请确认链为 Polygon 且环境 POLYMARKET_SIGNATURE_TYPE=2")?,
+        _ => anyhow::bail!("不支持的 Polymarket SignatureType（请检查 SDK / POLYMARKET_SIGNATURE_TYPE）"),
+    })
 }
 
 pub async fn connect() -> Result<PmClient<Authenticated<Normal>>> {
@@ -45,6 +70,29 @@ fn dec_f64(d: &Decimal) -> f64 {
     d.to_string().parse::<f64>().unwrap_or(f64::NAN)
 }
 
+/// CLOB `balance-allowance` 对 Collateral / Conditional 均为 **micro 计值**（1 USDC 或 1 份份额 = 1e6），与主程序 `polymarket_trade` 一致。
+pub fn clob_micro_to_usd(balance: &Decimal) -> f64 {
+    let div = Decimal::from(1_000_000u64);
+    dec_f64(&(balance / div))
+}
+
+/// Polymarket CLOB `token_id` / `asset_id`（Gamma `clobTokenIds`）应为**非空十进制数字**字符串。
+/// 占位符如 `PASTE_...` 会令 `U256` 解析失败，调用方应先校验或跳过。
+pub fn pm_clob_token_id_valid(token_id: &str) -> bool {
+    let s = token_id.trim();
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
+}
+
+fn token_id_to_u256(token_id: &str) -> Result<U256> {
+    let s = token_id.trim();
+    if !pm_clob_token_id_valid(s) {
+        anyhow::bail!(
+            "pm_buy_token_id 须为非空纯十进制数字（请把 arb_pairs.toml 里占位符换成真实 CLOB token_id）"
+        );
+    }
+    s.parse().context("token_id U256")
+}
+
 pub async fn collateral_balance(client: &PmClient<Authenticated<Normal>>) -> Result<Decimal> {
     let req = BalanceAllowanceRequest::builder()
         .asset_type(AssetType::Collateral)
@@ -53,11 +101,21 @@ pub async fn collateral_balance(client: &PmClient<Authenticated<Normal>>) -> Res
     Ok(r.balance)
 }
 
+pub async fn token_midpoint_price(
+    client: &PmClient<Authenticated<Normal>>,
+    token_id: &str,
+) -> Result<Option<f64>> {
+    let u: U256 = token_id_to_u256(token_id)?;
+    let req = MidpointRequest::builder().token_id(u).build();
+    let r = client.midpoint(&req).await.map_err(|e| anyhow::anyhow!("{}", e))?;
+    Ok(Some(dec_f64(&r.mid)))
+}
+
 pub async fn conditional_shares(
     client: &PmClient<Authenticated<Normal>>,
     token_id: &str,
 ) -> Result<Decimal> {
-    let u: U256 = token_id.parse().context("token_id U256")?;
+    let u: U256 = token_id_to_u256(token_id)?;
     let req = BalanceAllowanceRequest::builder()
         .asset_type(AssetType::Conditional)
         .token_id(u)
@@ -71,7 +129,7 @@ pub async fn all_trades_for_token(
     client: &PmClient<Authenticated<Normal>>,
     token_id: &str,
 ) -> Result<Vec<polymarket_client_sdk::clob::types::response::TradeResponse>> {
-    let u: U256 = token_id.parse().context("token")?;
+    let u: U256 = token_id_to_u256(token_id)?;
     let mut out = Vec::new();
     let req = TradesRequest::builder().asset_id(u).build();
     let page = client.trades(&req, None).await?;
