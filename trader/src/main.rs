@@ -1006,6 +1006,38 @@ async fn validate_arbitrage_pair_post_success(
     println!("        ROI:           {:.1}%", opp.roi_100_percent);
     println!("     ─────────────────────────────────────────────────────────");
 
+    // —— PM 最低委托检测（BOOST 模式）——
+    // 当 opp.contracts × pm_avg < $1.00 时，PM CLOB 最低委托会强制超买。
+    // 策略：以 PM $1.00 为锚反推 Kalshi 目标份数，Kalshi 在余额/深度约束下尽量填满。
+    const PM_CLOB_MIN_USDC: f64 = 1.00;
+    let pm_intended_spend = opp.contracts * opp.pm_avg_slipped;
+    let pm_boost = pm_intended_spend < PM_CLOB_MIN_USDC;
+    // n_boost：PM 花 $1 能买的份数，也是 Kalshi 的目标份数
+    let n_boost: i64 = if pm_boost {
+        (PM_CLOB_MIN_USDC / opp.pm_avg_slipped).floor().max(1.0) as i64
+    } else {
+        0
+    };
+    // Kalshi 预算：覆盖 n_boost 份所需（含 20% 缓冲），余额检查在 place_buy_ioc 内完成
+    let ks_exec_cap = if pm_boost {
+        let needed = n_boost as f64 * opp.kalshi_avg_slipped * 1.20;
+        println!(
+            "   📘 [BOOST] PM 意向花费 ${:.4} < $1.00 → Kalshi 目标 {} 份 / 预算 ${:.2}（余额兜底）",
+            pm_intended_spend, n_boost, needed
+        );
+        needed
+    } else {
+        per_leg_cap_usd
+    };
+    // 覆盖 opp.contracts 给 Kalshi 第一腿
+    let opp_ks: ArbitrageOpportunity = if pm_boost {
+        let mut o = opp.clone();
+        o.contracts = n_boost as f64;
+        o
+    } else {
+        opp.clone()
+    };
+
     // —— 第一腿：Kalshi IOC（网络层仍用 MAX_RETRIES）——
     let mut ks_order_id = String::new();
     let mut ks_client_oid = String::new();
@@ -1018,9 +1050,9 @@ async fn validate_arbitrage_pair_post_success(
             kalshi_cfg,
             &kalshi_market.market_id,
             kalshi_side,
-            opp,
+            &opp_ks,
             &ks_client_oid,
-            per_leg_cap_usd,
+            ks_exec_cap,
         )
         .await
         {
@@ -1149,6 +1181,48 @@ async fn validate_arbitrage_pair_post_success(
                 let rem_f = remaining as f64;
                 let bid_ok = depth_ks_bid + 1e-9 >= rem_f;
                 let ask_ok = depth_pm + 1e-9 >= rem_f;
+
+                // —— BOOST 模式：跳过 H vs U，直接以 $1.00 单次 PM FOK ——
+                if pm_boost {
+                    let n_pm = n_boost;
+                    let Some((_, pm_avg_top)) =
+                        cost_for_exact_contracts(&ladders.pm_asks, n_pm as f64)
+                    else {
+                        eprintln!(
+                            "   ⚠️ [BOOST] PM 阶梯无法精确吃满 n={}，等待簿更新…",
+                            n_pm
+                        );
+                        time::sleep(Duration::from_millis(100)).await;
+                        continue 'second_leg;
+                    };
+                    println!(
+                        "   📘 [BOOST] PM 单次 $1.00 FOK: n_pm={} pm_avg≈{:.6}",
+                        n_pm, pm_avg_top
+                    );
+                    match pm_trader
+                        .buy_outcome_token_fok_n(&pm_token_id, n_pm as f64, pm_avg_top, 1.00)
+                        .await
+                    {
+                        Ok(post) => {
+                            pm_post_responses.push(post);
+                            pm_err.clear();
+                            pm_filled_total += n_pm as f64;
+                            log_contracts = n1_orig as f64;
+                            remaining = 0;
+                            status = "OK";
+                            println!(
+                                "   📗 [BOOST] PM FOK 已提交 $1.00，Kalshi 腿={} PM 腿={}",
+                                n1_orig, n_pm
+                            );
+                        }
+                        Err(e) => {
+                            pm_err = format!("{}", e);
+                            eprintln!("   ⚠️ [BOOST] PM FOK 失败: {}，将重试", e);
+                            time::sleep(Duration::from_millis(120)).await;
+                        }
+                    }
+                    continue 'second_leg;
+                }
 
                 if bid_ok && ask_ok {
                     let h_est = arb_detector.net_profit_pm_hedge_n(
@@ -1391,6 +1465,8 @@ async fn validate_arbitrage_pair_post_success(
         pm_token_id,
         pm_side,
         kalshi_side,
+        &kalshi_market.title,
+        &pm_market.title,
         log_contracts,
         opp.net_profit_100,
         opp.capital_used,

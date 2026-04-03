@@ -619,6 +619,10 @@ impl TossVsMatchMarketValidator {
             || l.contains("toss winner")
             || l.contains("winner of the toss")
             || (l.contains(" toss") && l.contains(" who "))
+            // PM 复合命题：必须同时赢抛硬币 + 赢比赛，与单纯胜负盘不可互配
+            || l.contains("toss match double")
+            || l.contains("toss & match")
+            || l.contains("toss and match")
     }
 
     pub fn allows_pair(pm_title: &str, kalshi_title: &str) -> bool {
@@ -2071,6 +2075,16 @@ mod tests {
         assert!(TossVsMatchMarketValidator::allows_pair(
             "Team A vs Team B - Who wins the toss?",
             "Team A vs Team B - Who wins the toss?"
+        ));
+        // PM "Toss Match Double" 复合命题（赢抛硬币 AND 赢比赛）≠ Kalshi 纯胜负盘
+        assert!(!TossVsMatchMarketValidator::allows_pair(
+            "T20 Central American Championship: Mexico vs Costa Rica - Toss Match Double Costa Rica Winner",
+            "Mexico vs Costa Rica Winner? - Costa Rica"
+        ));
+        // 双边均为 Toss Match Double 可互配
+        assert!(TossVsMatchMarketValidator::allows_pair(
+            "T20 Mexico vs Costa Rica - Toss Match Double Costa Rica Winner",
+            "T20 Mexico vs Costa Rica - Toss Match Double Costa Rica Winner"
         ));
     }
 

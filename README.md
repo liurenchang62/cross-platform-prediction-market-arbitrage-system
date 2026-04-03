@@ -1,148 +1,63 @@
-# Cross-market arbitrage monitor (`arbitrage-monitor`)
+# `trader` — Cross-venue Kalshi ↔ Polymarket execution stack
 
 **English** | [简体中文](README.zh-CN.md)
 
-## Overview
+## What this workspace is
 
-`arbitrage-monitor` is a **Rust** application that discovers cross-venue relationships between **Polymarket** and **Kalshi** prediction markets, keeps a watchlist of high-confidence pairs, and evaluates executable economics from **live order-book data**. After strict validation it can place **live orders** via official production APIs (**Kalshi IOC** buy, **Polymarket CLOB FOK**), logging fills and request summaries to **`logs/desk_events.jsonl`** (JSON Lines; chart/reconcile via **`portfolio_monitor`** binaries).
+**`trader`** is the main **Rust** binary: it matches **Polymarket** and **Kalshi** prediction markets (text similarity + `config/categories.toml`), maintains a tracked pair set, evaluates **live order-book** economics, and can place **production orders** (Kalshi IOC / Polymarket CLOB FOK) after strict validation. Fills and summaries go to **`logs/desk_events.jsonl`**.
 
-The pipeline combines text-based market matching (vector similarity and category rules), scheduled full refreshes and incremental tracking cycles, console output, and that JSONL trade log.
+**`portfolio-monitor`** is a sibling crate: **read-only** portfolio tools (snapshot, cash flows, P&amp;L summary, turnover charts, PM redeem diagnose) and shared **`pm_relayer_automation`** used by `trader` at startup.
 
-Secrets are **not** stored in the repo: Kalshi and Polymarket credentials are read from **environment variables** (and PEM / optional key files on your machine). See **Environment variables** and `.gitignore` (`.env`, `secrets/`).
+Secrets stay in **environment variables** (and local key files); see **`项目命令说明.txt`** for commands and env hints.
 
-## Features
+---
 
-- **Market data**: Loads open markets from the Polymarket Gamma API and the Kalshi Trade API, with configurable pagination and upper bounds.
-- **Matching**: TF-IDF-style text vectors and cosine similarity; optional category constraints and scoring from `config/categories.toml`.
+## Workspace layout
 
-### Matching volume: raw hits vs. final pairs
+| Path | Role |
+|------|------|
+| **`Cargo.toml`** | Workspace members: **`trader`**, **`portfolio_monitor`** |
+| **`trader/`** | Live monitor loop, matching, execution, session risk, Feishu hooks |
+| **`portfolio_monitor/`** | Lib + CLI: `portfolio-snapshot`, `portfolio-cashflow`, `portfolio-profit`, `portfolio-turnover`, `portfolio-pm-redeem-diagnose` |
+| **`config/categories.toml`** | Categories / keywords for classification and matching |
+| **`portfolio_monitor/config/`** | e.g. **`arb_pairs.toml`** (Kalshi ↔ PM mapping for portfolio tools) |
+| **`logs/`** | `desk_events.jsonl`, `tracking_*.csv` (see `trader/src/system_params.rs`) |
+| **`scripts/`** | Optional API smoke scripts |
 
-Full runs typically log three stages: **raw vector hits** (bidirectional Top-K rows, with duplicates), **deduped candidate pairs** `(Polymarket id, Kalshi id)` keeping the best cosine score, then **final pairs** after `ValidationPipeline` rules and the configurable confidence gate. A **small** final count together with a **large** deduped middle (e.g. thousands of candidates reduced to on the order of 10² pairs) usually means the **second pass is doing most of the filtering**, not that matrix matching failed to generate neighbours. Raising recall is a tuning problem (`SIMILARITY_TOP_K`, `SIMILARITY_THRESHOLD`, category coverage in `config/categories.toml`), not a sign the batched matmul path is dropping pairs after dedup.
+Implementation highlights inside **`trader/src/`**: `main.rs` (cycle loop, live gate), `market_matcher.rs`, `arbitrage_detector.rs`, `validation.rs`, `session_risk.rs`, `desk_events.rs`, `kalshi_trade.rs`, `polymarket_trade.rs`, `feishu_push.rs`, `system_params.rs`.
 
-- **Execution-style PnL**: For each candidate pair, costs and net profit for a **notional-capped, depth-walked** buy scenario are derived from **parsed ask ladders** on both venues, plus **venue-accurate taker fees** and **auxiliary friction** (see **Order-book PnL & cost model**).
-- **Tracking**: Maintains a set of tracked pairs across cycles, with periodic full rebuilds and parameter-driven intervals (`src/system_params.rs`).
-- **Live trade log**: The main loop persists **`logs/desk_events.jsonl`** when live trading is enabled.
-- **Live execution**: First leg Kalshi IOC, second leg Polymarket FOK; second leg re-fetches books and re-checks net profit (business attempts capped in `main.rs`). Optional stop-loss path compares relaxed PM hedge vs. Kalshi IOC sell.
-- **Auxiliary tools**: `check_env`, `track_backtest`, and workspace crate **`portfolio_monitor`** (`portfolio-overview`, `portfolio-pairs`, `portfolio-settled`, `portfolio-charts`) for TOML-mapped KS/PM views and charts from `logs/desk_events.jsonl`.
+More on matching: **[docs/MATCHING_VERIFICATION.md](docs/MATCHING_VERIFICATION.md)**.
 
-## Order-book PnL & cost model
-
-The scenario used for reporting (e.g. Top-10 and `net_profit_100`) is defined as follows:
-
-1. **Order-book snapshots**  
-   For a matched pair, the program requests the **current** Polymarket and Kalshi **order books** over HTTP and parses resting liquidity into **ascending ask ladders** `(price, size)`.
-
-2. **Per-leg notional cap (probe) and pair cap**  
-   **`TOTAL_CAPITAL_USD`** × **`PER_LEG_CAP_FRAC_OF_CAPITAL`** gives each leg’s probe cap; **`TOTAL_CAPITAL_USD`** × **`PAIR_CAP_FRAC_OF_CAPITAL`** gives **`pair_cap`** (max combined notional for the pair). See `arb_probe_caps()` in `src/system_params.rs`. If combined cost would exceed `pair_cap`, size **n** is scaled down.
-
-3. **Hedged size**  
-   The scenario size **n** is the **minimum** of the two per-leg fillable contract counts (after scaling to `pair_cap` if needed).
-
-4. **Costs at size n**  
-   **Trading fees** (implementation in `src/fee_model.rs`):
-   - **Kalshi taker**: \( \lceil 100 \cdot 0.07 \cdot m \cdot C \cdot P(1-P) \rceil / 100 \) USD, with series multiplier \(m\) from Kalshi fee schedule; \(P\) in dollars.
-   - **Polymarket taker**: \( C \cdot p \cdot (\text{bps}/10^4) \cdot (p(1-p))^{\text{exponent}} \) USDC with rounding per helper; `fee_bps` from CLOB `fee-rate`, `exponent` from `categories.toml` mapping.
-
-   **Non-trading friction** (also in `system_params` / `fee_model`):
-   - **Assumed on-chain / execution overhead (USD)**: fixed **`LIVE_ARBIT_GAS_ASSUMED_USD`** (small conservative floor; HTTP/CLOB path).
-   - **Friction cost (surplus buffer)**: **`pair_cap` × `LIVE_ARBIT_SURPLUS_BUFFER_FRAC_OF_PAIR_CAP`** (default **0.1%** of `pair_cap`).
-
-   **Net profit** (symbolically):  
-   `gross (n dollars at resolution) − capital_used − fee_PM − fee_KS − (gas_assumed + friction_buffer)`.  
-   An opportunity must satisfy **net > `pair_cap` × `LIVE_ARBIT_MIN_NET_PROFIT_FRAC_OF_PAIR_CAP`** (default **0.2%** of `pair_cap`); see `ArbitrageDetector` in `src/arbitrage_detector.rs`.
-
-**Implementation reference**: `validate_arbitrage_core` / `validate_arbitrage_pair` in `src/main.rs`; `calculate_arbitrage_100usdt`, `validate_opportunity_from_ladders`, slippage helpers in `src/arbitrage_detector.rs`.
-
-## Requirements
-
-- **Rust** 1.70+ (stable recommended, `edition = "2021"`)
-- Network access to the above public APIs (verify against current Kalshi and Polymarket documentation if endpoints or policies change)
+---
 
 ## Quick start
 
 ```bash
-cargo run              # debug
-cargo run --release    # recommended for long runs
+cargo run -p trader --release
 ```
 
-On startup, choose **track-only** vs **live**; live mode requires the environment variables below and confirmation. Ensure **`config/categories.toml`** exists (included in the repository).
+Also useful:
 
-## Optional binaries / workspace tools
-
-| Command | Purpose |
-|--------|---------|
-| `cargo run --bin check_env` | Sanity-check env vars and key loading (masked output). |
-| `cargo run --bin track_backtest` | Replay / analyze `logs/tracking_*.csv` (see bin docs). |
-| `cargo run -p portfolio-monitor --bin portfolio-overview` | Account / mapping overview (see `--help`). |
-| `cargo run -p portfolio-monitor --bin portfolio-charts` | PNG charts from `desk_events.jsonl` + Kalshi settlements. |
-
-## API probe script (Windows)
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\verify_apis.ps1
+```bash
+cargo run -p trader --bin check_env --release    # env / keys sanity check
+cargo run -p portfolio-monitor --bin portfolio-snapshot --release
 ```
 
-Public read-only checks; writes JSON under `tmp_api_probe/` (ignored by git).
+On startup, `trader` runs a **one-time** Polymarket Relayer path (redeem + collateral refresh when `POLYMARKET_SIGNATURE_TYPE=1` and Relayer env is set); it does **not** repeat that every monitor cycle.
 
-## Configuration
+---
 
-| Path | Purpose |
-|------|---------|
-| `config/categories.toml` | Category names, weights, and keywords for classification and matching |
-| `src/system_params.rs` | HTTP/matching/window, reference `TOTAL_CAPITAL_USD`, per-leg/per-pair fractions, gas, friction & min-profit fractions, `desk_events.jsonl` path, env var name constants |
-| `src/fee_model.rs` | Taker fee formulas, `ArbCostParams`, PM exponent table |
+## Requirements
 
-### Environment variables
+- **Rust** stable, **edition 2021**
+- Network access to Kalshi, Polymarket (Gamma / CLOB / Data APIs as implemented)
 
-- **Kalshi (live / balance / orders)**: `KALSHI_API_KEY_ID`, `KALSHI_PRIVATE_KEY_PATH` (PEM file path). Names in `src/system_params.rs`.
-- **Polymarket CLOB**: `POLYMARKET_PRIVATE_KEY` (hex, SDK-compatible) **or** `POLYMARKET_PRIVATE_KEY_PATH` (text file with hex); optional `POLYMARKET_SIGNATURE_TYPE` (`0` / `1` / `2`).
-- **Data (optional)**: `POLYMARKET_TAG_SLUG` for Polymarket tag filtering (`src/clients.rs`).
-
-Do **not** commit `.env` files or `secrets/`; configure system/user environment variables instead.
-
-## Repository layout
-
-```
-Cargo.toml              Workspace (`arbitrage-monitor` + `portfolio-monitor`)
-scripts/
-  verify_apis.ps1       Optional public API shape checks (Windows)
-src/
-  main.rs               Entry point and monitor loop
-  clients.rs            HTTP clients for Polymarket and Kalshi
-  market_matcher.rs     Matching and index construction
-  market_filter.rs      Market filtering helpers
-  text_vectorizer.rs    Text vectorization
-  vector_index.rs       Vector search
-  arbitrage_detector.rs Order-book traversal, sizing, PnL
-  fee_model.rs          Kalshi/PM taker fees, friction helpers
-  kalshi_fee_schedule.rs Kalshi series fee multipliers
-  system_params.rs      Shared tuning constants and env names
-  validation.rs         Validation helpers
-  tracking.rs           Per-cycle monitor state
-  desk_events.rs        Live trade JSONL (`DeskEventsLog`)
-  feishu_push.rs        Feishu summary (bound to main program)
-  trade_reconciliation.rs Live fill reconciliation
-  kalshi_trade.rs       Kalshi production orders
-  polymarket_trade.rs   Polymarket CLOB live orders
-  category_mapper.rs    categories.toml-backed classification
-  bin/
-    check_env.rs
-    track_backtest.rs
-portfolio_monitor/      Lib + `portfolio-overview` / `-pairs` / `-settled` / `-charts`
-config/
-  categories.toml
-docs/
-  MATCHING_VERIFICATION.md
-```
-
-Further detail on matching and indexing: **[docs/MATCHING_VERIFICATION.md](docs/MATCHING_VERIFICATION.md)**.
+---
 
 ## Disclaimer
 
-- Provided for **research and educational use** only; not investment advice.
-- Prediction markets differ in rules, settlement, liquidity, and latency; reported PnL is a **model output** from snapshots and assumptions (fees, friction), and **live results may differ**.
-- Comply with each platform’s terms of service and applicable law.
+Research / educational use. Not investment advice. Live P&amp;L differs from model snapshots; comply with each platform’s terms and applicable law.
 
 ## License
 
-If no `LICENSE` file is present, all rights are reserved; add one if you intend to distribute under open terms.
+If no `LICENSE` file is present, rights reserved unless you add one.

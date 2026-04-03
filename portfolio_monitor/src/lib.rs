@@ -1,6 +1,6 @@
 //! Kalshi / Polymarket 组合工具库（快照、现金流、利润、换手；Relayer 自动化）。
 
-#[path = "../../src/system_params.rs"]
+#[path = "../../trader/src/system_params.rs"]
 mod system_params;
 
 pub mod cashflow;

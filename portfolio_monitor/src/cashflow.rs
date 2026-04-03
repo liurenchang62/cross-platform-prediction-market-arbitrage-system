@@ -1,6 +1,6 @@
 //! 回望 N 天双平台现金流 → `out_dir/cashflow.csv`（每次覆盖）。
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -29,13 +29,26 @@ fn parse_rfc3339(s: &str) -> Option<DateTime<Utc>> {
         .map(|x| x.with_timezone(&Utc))
 }
 
+/// Returns (sorted tickers, map of ticker→title for those already stored in config/desk_events).
 async fn ks_merged_tickers(
     http: &Client,
     ks: &KalshiAuth,
     config: &Path,
     desk: &Path,
-) -> Result<Vec<String>> {
+) -> Result<(Vec<String>, HashMap<String, String>)> {
     let pairs = load_pairs_merged_with_desk_at(config, Some(desk), false)?;
+
+    // Collect titles already stored in the documenting files — no API call needed for these.
+    let known_titles: HashMap<String, String> = pairs
+        .iter()
+        .filter_map(|p| {
+            p.kalshi_title
+                .as_deref()
+                .filter(|t| !t.is_empty())
+                .map(|t| (p.kalshi_ticker.clone(), t.to_string()))
+        })
+        .collect();
+
     let mut set: HashSet<String> = pairs.iter().map(|p| p.kalshi_ticker.clone()).collect();
     let sign_p = "/trade-api/v2/portfolio/positions";
     let url = format!("{}/portfolio/positions?limit=1000", ks.base);
@@ -48,9 +61,9 @@ async fn ks_merged_tickers(
             }
         }
     }
-    let mut v: Vec<String> = set.into_iter().collect();
-    v.sort();
-    Ok(v)
+    let mut tickers: Vec<String> = set.into_iter().collect();
+    tickers.sort();
+    Ok((tickers, known_titles))
 }
 
 async fn fetch_pm_activity(user: polymarket_client_sdk::types::Address) -> Result<Vec<Activity>> {
@@ -131,6 +144,34 @@ fn pm_activity_row(act: &Activity) -> Option<Row> {
     })
 }
 
+/// 生成现金流前尝试触发 PM 赎回；若有赎回成功，等待 Data API 索引。
+/// 任何错误都打印警告后静默跳过，不阻塞现金流生成。
+async fn try_trigger_pm_redeem(http: &Client) {
+    let rpc = crate::pm_relayer_automation::polygon_rpc_for_automation();
+    let relay = crate::pm_relayer_automation::relayer_url_for_automation();
+    println!("检查 PM 可赎回头寸…");
+    match crate::pm_relayer_automation::desk_hydrate_pm_proxy(http, &rpc, &relay, false).await {
+        Ok(rep) => {
+            if rep.redeem_ok > 0 {
+                println!(
+                    "✓ PM {} 笔赎回已上链，等待 Data API 索引（5s）…",
+                    rep.redeem_ok
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            } else if rep.redeem_fail > 0 {
+                eprintln!("⚠ PM {} 笔赎回失败，继续生成现金流", rep.redeem_fail);
+            } else if rep.redeem_skipped > 0 {
+                println!("ℹ {} 笔 PM 头寸尚未结算，跳过赎回", rep.redeem_skipped);
+            } else {
+                println!("ℹ 无 PM 头寸可赎回");
+            }
+        }
+        Err(e) => {
+            eprintln!("⚠ PM 赎回触发失败（{}），继续生成现金流", e);
+        }
+    }
+}
+
 pub async fn run_cashflow(
     config: &Path,
     desk: &Path,
@@ -144,12 +185,28 @@ pub async fn run_cashflow(
     std::fs::create_dir_all(out_dir).ok();
 
     let http = http()?;
+
+    // Step 1: 触发 PM 赎回；若有新赎回成功则稍等 API 更新后再拉取活动记录
+    try_trigger_pm_redeem(&http).await;
+
     let ks = kalshi::load_kalshi()?;
     let pm_user = pm::polymarket_data_api_user_address()?;
-    let tickers = ks_merged_tickers(&http, &ks, config, desk).await?;
+    let (tickers, mut ticker_title) = ks_merged_tickers(&http, &ks, config, desk).await?;
+
+    // For tickers without a stored title, try the Kalshi API; fall back to raw ticker.
+    for ticker in &tickers {
+        if !ticker_title.contains_key(ticker) {
+            let title = kalshi::market_title(&http, &ks, ticker.as_str())
+                .await
+                .unwrap_or_else(|_| ticker.clone());
+            ticker_title.insert(ticker.clone(), title);
+        }
+    }
+
     let mut rows: Vec<Row> = Vec::new();
 
     for ticker in &tickers {
+        let note = ticker_title.get(ticker).cloned().unwrap_or_else(|| ticker.clone());
         let fills = kalshi::all_fills_for_ticker(&http, &ks, ticker.as_str()).await?;
         for f in fills {
             let Some(ts) = parse_rfc3339(f["created_time"].as_str().unwrap_or("")) else {
@@ -181,7 +238,7 @@ pub async fn run_cashflow(
                 behavior: behavior.to_string(),
                 flow,
                 amount,
-                note: ticker.clone(),
+                note: note.clone(),
             });
         }
 
@@ -201,7 +258,7 @@ pub async fn run_cashflow(
                 behavior: "结算流回".to_string(),
                 flow: (if net >= 0.0 { "流入" } else { "流出" }).to_string(),
                 amount: net.abs(),
-                note: ticker.clone(),
+                note: note.clone(),
             });
         }
     }

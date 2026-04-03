@@ -1,5 +1,5 @@
 //! 实盘桌面：Proxy 钱包经 Relayer **批量授权**、**按条件赎回**、**刷新 CLOB Collateral**。  
-//! 由主程序 `arbitrage-monitor` 在**启动进入主循环前**调用一次；不要求独立 CLI。
+//! 由主程序 `trader` 在**启动进入主循环前**调用一次；不要求独立 CLI。
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr as _;

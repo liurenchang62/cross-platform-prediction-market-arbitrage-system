@@ -2,22 +2,33 @@
 
 在项目根目录执行。Windows 可用 `set VAR=value`，PowerShell 可用 `$env:VAR="value"`。以下为典型用法，`--release` 可选。
 
---------------------------------------------------------------------------------
-## 跨平台实盘套利主程序（默认 binary）
-
-功能：Kalshi ↔ Polymarket 实盘监控与套利；仅在**程序启动、进入主监控循环前**自动尝试 Proxy 经 Relayer **赎回可结算头寸**并 **刷新 Polymarket CLOB Collateral**（需 `POLYMARKET_SIGNATURE_TYPE=1` 及 `RELAYER_API_KEY` / `POLYMARKET_API_KEY` 等，见代码 `portfolio_monitor::pm_relayer_automation`）。后续监控周期内不再重复执行。赎回有链上提交时向飞书推送一行摘要（与成交推送共用机器人脚本）。
-
-  cargo run -p arbitrage-monitor --release
+工作区包含两个 crate：**`trader`**（主程序 + 附属 bin）、**`portfolio-monitor`**（组合监控与诊断工具）。
 
 --------------------------------------------------------------------------------
-## 环境自检（根 crate）
+## trader：跨平台实盘主程序（默认 binary）
 
-  cargo run -p arbitrage-monitor --bin check_env --release
+功能：Kalshi ↔ Polymarket 监控与套利；仅在**程序启动、进入主监控循环前**自动尝试 Proxy 经 Relayer **赎回可结算头寸**并 **刷新 Polymarket CLOB Collateral**（需 `POLYMARKET_SIGNATURE_TYPE=1` 及 `RELAYER_API_KEY` / `POLYMARKET_API_KEY` 等，实现见 `portfolio_monitor::pm_relayer_automation`）。后续监控周期内不再重复。链上赎回有提交时可经飞书推送摘要（与成交推送共用机器人脚本）。
+
+  cargo run -p trader --release
 
 --------------------------------------------------------------------------------
-## 追踪回测（根 crate）
+## trader：环境自检
 
-  cargo run -p arbitrage-monitor --bin track_backtest --release
+  cargo run -p trader --bin check_env --release
+
+--------------------------------------------------------------------------------
+## trader：追踪回测（tracking CSV 汇总）
+
+  cargo run -p trader --bin track_backtest --release
+
+--------------------------------------------------------------------------------
+## trader：Polymarket 独立赎回（Relayer redeem + 刷新 Collateral）
+
+  需与主程序相同的 Proxy 环境。默认只做赎回轮；若 allowance 不足可加 `--approve-batch`。
+
+  cargo run -p trader --bin pm_redeem --release
+
+  cargo run -p trader --bin pm_redeem --release -- --approve-batch
 
 --------------------------------------------------------------------------------
 ## portfolio-monitor：统一快照（Kalshi / PM 同构账户摘要 + 对冲对照表）
@@ -29,9 +40,9 @@
   cargo run -p portfolio-monitor --bin portfolio-snapshot --release -- --config <toml> --desk <jsonl>
 
 --------------------------------------------------------------------------------
-## portfolio-monitor：现金流 CSV（stdin 输入回望天数，覆盖写入 out/cashflow.csv）
+## portfolio-monitor：现金流 CSV（stdin 输入回望天数，覆盖写入 cashflow.csv）
 
-  运行后按提示输入整数天数；输出目录默认 `portfolio_monitor/out`，每次运行清空并重写 `cashflow.csv`（时间升序）。
+  运行后按提示输入整数天数；默认输出目录 `portfolio_monitor/out`，每次运行重写 `cashflow.csv`（时间升序）。
 
   cargo run -p portfolio-monitor --bin portfolio-cashflow --release
 
@@ -57,7 +68,7 @@
   cargo run -p portfolio-monitor --bin portfolio-pm-redeem-diagnose --release
 
 --------------------------------------------------------------------------------
-## 相关环境变量（实盘 / PM 自动赎回）
+## 相关环境变量（实盘 / PM Relayer）
 
   POLYMARKET_SIGNATURE_TYPE=1
   POLYMARKET_PRIVATE_KEY 或 POLYMARKET_PRIVATE_KEY_PATH

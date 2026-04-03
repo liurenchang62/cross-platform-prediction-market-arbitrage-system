@@ -9,7 +9,11 @@ use anyhow::{Context, Result};
 use crate::system_params::DESK_EVENTS_JSONL;
 
 fn project_root() -> PathBuf {
+    // CARGO_MANIFEST_DIR = trader/（crate 子目录）；Python 脚本在 workspace 根目录（上一级）
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root exists")
+        .to_path_buf()
 }
 
 fn feishu_script_path() -> PathBuf {

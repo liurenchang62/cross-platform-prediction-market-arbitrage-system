@@ -19,6 +19,12 @@ pub struct ArbPair {
     pub pm_market_id: String,
     pub pm_buy_token_id: String,
     pub strategy: StrategyLegs,
+    /// Human-readable Kalshi market title (stored by desk_events since upgrade; optional in TOML).
+    #[serde(default)]
+    pub kalshi_title: Option<String>,
+    /// Human-readable Polymarket market title (stored by desk_events since upgrade; optional in TOML).
+    #[serde(default)]
+    pub pm_title: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -33,6 +39,10 @@ struct DeskEventLine {
     pm_buy_token_id: String,
     pm_side: String,
     kalshi_side: String,
+    #[serde(default)]
+    kalshi_title: Option<String>,
+    #[serde(default)]
+    pm_title: Option<String>,
 }
 
 pub fn load_mapping(path: &Path) -> Result<Vec<ArbPair>> {
@@ -88,6 +98,8 @@ pub fn augment_pairs_from_desk_events_jsonl(
                 pm_buy_leg: row.pm_side,
                 kalshi_buy_leg: row.kalshi_side,
             },
+            kalshi_title: row.kalshi_title.filter(|s| !s.is_empty()),
+            pm_title: row.pm_title.filter(|s| !s.is_empty()),
         });
         added += 1;
     }

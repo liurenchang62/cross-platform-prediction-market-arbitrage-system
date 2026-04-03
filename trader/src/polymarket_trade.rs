@@ -295,7 +295,13 @@ impl PolymarketClobTrader {
         let spend = Decimal::try_from(spend_usd)
             .ok()
             .context("Decimal::try_from spend_usd")?;
-        let spend = spend.max(Decimal::ONE).round_dp(2);
+        let spend = spend.round_dp(2);
+        if spend < Decimal::ONE {
+            anyhow::bail!(
+                "PM CLOB 最低委托 $1.00，计算金额 ${:.4}；调用方须保证传入金额 ≥ $1",
+                spend
+            );
+        }
 
         let amount = Amount::usdc(spend).map_err(|e| anyhow::anyhow!("Amount::usdc: {}", e))?;
 

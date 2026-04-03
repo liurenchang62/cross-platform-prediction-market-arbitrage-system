@@ -48,7 +48,7 @@ pub const KALSHI_TRADE_API_BASE: &str = "https://api.elections.kalshi.com/trade-
 
 // ==================== 向量化 / 匹配（与原版一致） ====================
 pub const MAX_VOCAB_SIZE: Option<usize> = None;
-pub const SIMILARITY_THRESHOLD: f64 = 0.8;
+pub const SIMILARITY_THRESHOLD: f64 = 0.85;
 pub const SIMILARITY_TOP_K: usize = 15;
 pub const MATCH_MATMUL_CHUNK_ROWS: usize = 512;
 pub const FULL_FETCH_INTERVAL: usize = 180;
