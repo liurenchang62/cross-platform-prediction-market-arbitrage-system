@@ -8,7 +8,7 @@
 
 **`portfolio-monitor`** is a sibling crate: **read-only** portfolio tools (snapshot, cash flows, P&amp;L summary, turnover charts, PM redeem diagnose) and shared **`pm_relayer_automation`** used by `trader` at startup.
 
-Secrets stay in **environment variables** (and local key files); see **`项目命令说明.txt`** for commands and env hints.
+Secrets stay in **environment variables** (and local key files); see **`PROJECT_COMMANDS.txt`** for commands and env hints.
 
 ---
 
@@ -20,13 +20,9 @@ Secrets stay in **environment variables** (and local key files); see **`项目�
 | **`trader/`** | Live monitor loop, matching, execution, session risk, Feishu hooks |
 | **`portfolio_monitor/`** | Lib + CLI: `portfolio-snapshot`, `portfolio-cashflow`, `portfolio-profit`, `portfolio-turnover`, `portfolio-pm-redeem-diagnose` |
 | **`config/categories.toml`** | Categories / keywords for classification and matching |
-| **`portfolio_monitor/config/`** | e.g. **`arb_pairs.toml`** (Kalshi ↔ PM mapping for portfolio tools) |
-| **`logs/`** | `desk_events.jsonl`, `tracking_*.csv` (see `trader/src/system_params.rs`) |
-| **`scripts/`** | Optional API smoke scripts |
+| **`logs/`** | `desk_events.jsonl`, `arb_rounds_store.json`, `trades_cache.txt` (paths in `trader/src/system_params.rs` & `trades_cache.rs`) |
 
 Implementation highlights inside **`trader/src/`**: `main.rs` (cycle loop, live gate), `market_matcher.rs`, `arbitrage_detector.rs`, `validation.rs`, `session_risk.rs`, `desk_events.rs`, `kalshi_trade.rs`, `polymarket_trade.rs`, `feishu_push.rs`, `system_params.rs`.
-
-More on matching: **[docs/MATCHING_VERIFICATION.md](docs/MATCHING_VERIFICATION.md)**.
 
 ---
 

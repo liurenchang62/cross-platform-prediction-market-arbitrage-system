@@ -48,11 +48,15 @@ pub const KALSHI_TRADE_API_BASE: &str = "https://api.elections.kalshi.com/trade-
 
 // ==================== 向量化 / 匹配（与原版一致） ====================
 pub const MAX_VOCAB_SIZE: Option<usize> = None;
-pub const SIMILARITY_THRESHOLD: f64 = 0.85;
+pub const SIMILARITY_THRESHOLD: f64 = 0.90;
 pub const SIMILARITY_TOP_K: usize = 15;
 pub const MATCH_MATMUL_CHUNK_ROWS: usize = 512;
 pub const FULL_FETCH_INTERVAL: usize = 180;
-pub const RESOLUTION_HORIZON_DAYS: i64 = 21;
+pub const RESOLUTION_HORIZON_DAYS: i64 = 7;
+
+/// PM / Kalshi 套利对：`resolution_date`（与终端到期同源）UTC 时刻差 **严格大于** 本天数则识别、追踪均不采纳。
+/// 比较按整秒：`abs(Δ秒) > 天数 × 86400` 即剔除。任一侧无 `resolution_date` 时不做此项剔除。
+pub const MAX_SETTLEMENT_DATE_SKEW_DAYS: i64 = 3;
 
 // ==================== 实盘资金标尺（美元） ====================
 /// 当 [`set_session_reference_capital_usd`] 尚未调用时（单测/工具），`arb_probe_caps` 回退用到的参考总资金。
@@ -76,17 +80,26 @@ pub fn session_reference_capital_usd() -> f64 {
 pub const TOTAL_CAPITAL_USD: f64 = DEFAULT_REFERENCE_CAPITAL_USD;
 
 /// 单市场对最大名义占参考总盘子比例（两腿合计上限因子）。
-pub const PAIR_CAP_FRAC_OF_CAPITAL: f64 = 0.01;
+pub const PAIR_CAP_FRAC_OF_CAPITAL: f64 = 0.03;
 
 /// 单腿探针名义占参考总盘子比例（PM 或 Kalshi 各一腿）。
-pub const PER_LEG_CAP_FRAC_OF_CAPITAL: f64 = 0.005;
+pub const PER_LEG_CAP_FRAC_OF_CAPITAL: f64 = 0.015;
+
+/// 单一套利对在整个会话内允许执行的最大套利轮次（每轮 = 一次 Kalshi 买入 + PM 对冲）。
+/// 超出此次数后即使仍有价差也跳过，防止在单一市场上重复堆仓（尤其应对作废风险）。
+pub const MAX_PAIR_ARB_ROUNDS: u32 = 3;
 
 /// 缓冲资金比例：仅允许动用 (1 − 此值) × 可用余额 参与 Kalshi 侧收缩（与原先纸面「可用比例」语义一致，此处为 30% 缓冲 → 最多用 70%）。
 pub const KALSHI_BALANCE_DEPLOYABLE_FRAC: f64 = 0.70;
 
 // ==================== 第二腿（Kalshi 先成交后）：时间窗 / 卖平限价 ====================
-/// Kalshi 第一腿成交后，第二腿（PM 对冲 + 可选卖平）的最长决策时间（秒）。
+/// Kalshi 第一腿成交后，第二腿（PM 对冲 + 可选卖平）的最长决策时间（秒）。作为硬性外层保险，正常情况由 [`LIVE_PM_FOK_MAX_ATTEMPTS`] 先行退出。
 pub const LIVE_SECOND_LEG_DEADLINE_SECS: u64 = 15;
+
+/// 第二腿 PM FOK 单次循环内最大允许失败次数（含 BOOST 路径）。
+/// 达到此次数后立即 `break 'second_leg`，后续走卖平兜底。
+/// 设计上早于 [`LIVE_SECOND_LEG_DEADLINE_SECS`] 触发（每次约 300-500ms → 5 次 ≈ 1.5-2.5s）。
+pub const LIVE_PM_FOK_MAX_ATTEMPTS: u32 = 5;
 
 /// 仅在「簿上 Kalshi bid 总深度 ≥ 剩余份数」且「PM ask 总深度 ≥ 剩余份数」时，才比较对冲净利 H 与卖平净利 U。  
 /// 若 **H < U − pair_cap×本比例**，则选择卖平 Kalshi（IOC）。比例锚定每对名义上限 `pair_cap`（当前 **0.2%**）。
@@ -96,7 +109,7 @@ pub const LIVE_HEDGE_VS_UNWIND_MARGIN_FRAC_OF_PAIR_CAP: f64 = 0.002;
 pub const STOP_LOSS_KALSHI_SELL_MIN_PRICE_CENTS: i64 = 1;
 
 // ==================== 费用模型：非交易摩擦（HTTP 主路径：极小 Gas 绝对值 + 按每对上限比例缓冲） ====================
-/// Polymarket `GET /fee-rate`（`base_fee`，bps）**拉取失败**时采用的保守替代值：按 **更高** taker 费估算净利，避免用 0 低估或整笔丢弃识别。  
+/// Polymarket `GET /fee-rate`（`base_fee`，bps）**拉取失败**时采用的保守替代值：按 **更高** taker 费估算净利，避免用 0 低估或整笔丢弃识别。
 /// 应 ≥ 常见 `base_fee` 上界；可按实盘观察在 `system_params` 微调。
 pub const PM_TAKER_FEE_BPS_WHEN_FETCH_FAILS: u32 = 250;
 
@@ -105,9 +118,9 @@ pub const LIVE_ARBIT_GAS_ASSUMED_USD: f64 = 0.005;
 /// 盈余缓冲：按 [`arb_probe_caps`] 第二项「每对名义上限」`pair_cap` 收取 `pair_cap × 本比例`（当前 **0.1%**）。
 pub const LIVE_ARBIT_SURPLUS_BUFFER_FRAC_OF_PAIR_CAP: f64 = 0.001;
 
-/// 可接受最小净利润：识别与实盘共用；模型中净利须 **大于** `pair_cap × 本比例`（相对「每对名义上限」）。  
-/// 例：`0.15` = 至少赚到该对名义上限的 **15%**（`pair_cap≈$5` 时约 **$0.75**）。仅在 `system_params` 改此常量即可调门槛。
-pub const LIVE_ARBIT_MIN_NET_PROFIT_FRAC_OF_PAIR_CAP: f64 = 0.1;
+/// 可接受最小净利润比例（ROI 门槛）：识别与实盘共用；模型中 **净利 / 真实估算成本 > 本比例** 才通过。
+/// 与打印的 `roi_100_percent` 同语境（分母均为 capital_used）。例：`0.1` = 净利须超过实际部署资金的 **10%**。
+pub const LIVE_ARBIT_MIN_NET_PROFIT_FRAC_OF_PAIR_CAP: f64 = 0.15;
 
 #[inline]
 pub fn live_arbit_surplus_buffer_usd(pair_cap_usdt: f64) -> f64 {
@@ -263,9 +276,8 @@ pub fn kalshi_orderbook_debug_enabled() -> bool {
 // ==================== 实盘成交日志（JSON Lines，一行一条） ====================
 pub const DESK_EVENTS_JSONL: &str = "logs/desk_events.jsonl";
 
-// ==================== 追踪对与套利快照（回读 `track_backtest`） ====================
-pub const TRACKING_PAIRS_CSV: &str = "logs/tracking_pairs.csv";
-pub const TRACKING_ARB_EVENTS_CSV: &str = "logs/tracking_arbitrage_events.csv";
+/// 每套利对「永久套利轮次」计数文件（JSON，跨会话持久，用于 `MAX_PAIR_ARB_ROUNDS` 执行上限）。
+pub const ARB_ROUNDS_STORE_PATH: &str = "logs/arb_rounds_store.json";
 
 /// 价格追踪周期内并行校验的匹配对数量（固定值，不再通过环境变量调试）。
 pub const ARB_TRACK_CONCURRENCY: usize = 12;

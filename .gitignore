@@ -16,9 +16,6 @@ Thumbs.db
 *.log
 /logs/
 
-# API 探针脚本输出（公开行情 JSON，勿入库）
-/tmp_api_probe/
-
 # portfolio_monitor 制图输出
 /portfolio_monitor/out/
 

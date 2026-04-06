@@ -13,7 +13,7 @@ use serde_json::Value;
 
 use crate::gamma;
 use crate::kalshi;
-use crate::mapping::load_pairs_merged_with_desk_at;
+use crate::mapping::load_pairs_from_desk_events;
 use crate::pm;
 
 fn http() -> Result<Client> {
@@ -69,9 +69,9 @@ fn ks_position_side_upper(p: &Value) -> &'static str {
     }
 }
 
-pub async fn run_snapshot(config: &Path, desk_jsonl: &Path) -> Result<()> {
+pub async fn run_snapshot(desk_jsonl: &Path) -> Result<()> {
     let http = http()?;
-    let mut pairs = load_pairs_merged_with_desk_at(config, Some(desk_jsonl), true)?;
+    let mut pairs = load_pairs_from_desk_events(desk_jsonl, true)?;
     let ks = kalshi::load_kalshi()?;
     let pm_clob = pm::connect().await?;
     let pm_user = pm::polymarket_data_api_user_address()?;
@@ -165,11 +165,7 @@ pub async fn run_snapshot(config: &Path, desk_jsonl: &Path) -> Result<()> {
     println!("{}", "═".repeat(w));
     println!("{:^w$}", "持仓快照 · 统一格式", w = w);
     println!("{}  UTC {}", "═".repeat(w), Utc::now().to_rfc3339());
-    println!(
-        "映射 {} | desk {}",
-        config.display(),
-        desk_jsonl.display()
-    );
+    println!("映射来源（desk_events）: {}", desk_jsonl.display());
     println!();
 
     let block = |title: &str,

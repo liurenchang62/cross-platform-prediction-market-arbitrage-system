@@ -14,7 +14,7 @@ use reqwest::Client;
 use serde_json::Value;
 
 use crate::kalshi::{self, KalshiAuth};
-use crate::mapping::load_pairs_merged_with_desk_at;
+use crate::mapping::load_pairs_from_desk_events;
 use crate::pm;
 
 fn http() -> Result<Client> {
@@ -29,14 +29,13 @@ fn parse_rfc3339(s: &str) -> Option<DateTime<Utc>> {
         .map(|x| x.with_timezone(&Utc))
 }
 
-/// Returns (sorted tickers, map of ticker→title for those already stored in config/desk_events).
+/// Returns (sorted tickers, map of ticker→title for those already stored in desk_events).
 async fn ks_merged_tickers(
     http: &Client,
     ks: &KalshiAuth,
-    config: &Path,
     desk: &Path,
 ) -> Result<(Vec<String>, HashMap<String, String>)> {
-    let pairs = load_pairs_merged_with_desk_at(config, Some(desk), false)?;
+    let pairs = load_pairs_from_desk_events(desk, false)?;
 
     // Collect titles already stored in the documenting files — no API call needed for these.
     let known_titles: HashMap<String, String> = pairs
@@ -172,12 +171,7 @@ async fn try_trigger_pm_redeem(http: &Client) {
     }
 }
 
-pub async fn run_cashflow(
-    config: &Path,
-    desk: &Path,
-    out_dir: &Path,
-    lookback_days: u32,
-) -> Result<()> {
+pub async fn run_cashflow(desk: &Path, out_dir: &Path, lookback_days: u32) -> Result<()> {
     if lookback_days == 0 {
         anyhow::bail!("回望天数须 ≥ 1");
     }
@@ -191,7 +185,7 @@ pub async fn run_cashflow(
 
     let ks = kalshi::load_kalshi()?;
     let pm_user = pm::polymarket_data_api_user_address()?;
-    let (tickers, mut ticker_title) = ks_merged_tickers(&http, &ks, config, desk).await?;
+    let (tickers, mut ticker_title) = ks_merged_tickers(&http, &ks, desk).await?;
 
     // For tickers without a stored title, try the Kalshi API; fall back to raw ticker.
     for ticker in &tickers {

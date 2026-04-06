@@ -290,7 +290,9 @@ impl PolymarketClobTrader {
 
         let cap = per_leg_cap_usd.max(0.0);
         let slip_cost = (n_contracts * pm_avg_slipped * 1.15_f64).max(0.01);
-        let spend_usd = cap.min(slip_cost).max(0.01);
+        // PM CLOB 执行层兜底：$1.00 为平台最低委托金额（全平台统一，无查询接口，见官方文档）。
+        // 识别层已通过 orderbook 深度约束过滤掉不可交易对，此处仅作 safety net 防止极端边界情况。
+        let spend_usd = cap.min(slip_cost).max(1.0_f64);
 
         let spend = Decimal::try_from(spend_usd)
             .ok()

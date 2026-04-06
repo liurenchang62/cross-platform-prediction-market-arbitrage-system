@@ -19,17 +19,12 @@ pub struct ArbPair {
     pub pm_market_id: String,
     pub pm_buy_token_id: String,
     pub strategy: StrategyLegs,
-    /// Human-readable Kalshi market title (stored by desk_events since upgrade; optional in TOML).
+    /// Human-readable Kalshi market title（常见于 `desk_events` 行内字段）
     #[serde(default)]
     pub kalshi_title: Option<String>,
-    /// Human-readable Polymarket market title (stored by desk_events since upgrade; optional in TOML).
+    /// Human-readable Polymarket market title（常见于 `desk_events` 行内字段）
     #[serde(default)]
     pub pm_title: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct FileRoot {
-    pairs: Vec<ArbPair>,
 }
 
 #[derive(Deserialize)]
@@ -43,13 +38,6 @@ struct DeskEventLine {
     kalshi_title: Option<String>,
     #[serde(default)]
     pm_title: Option<String>,
-}
-
-pub fn load_mapping(path: &Path) -> Result<Vec<ArbPair>> {
-    let raw = std::fs::read_to_string(path)
-        .with_context(|| format!("读取映射 {}", path.display()))?;
-    let root: FileRoot = toml::from_str(&raw).context("解析 TOML 映射")?;
-    Ok(root.pairs)
 }
 
 /// 将 `desk_events.jsonl` 中尚未出现在 `pairs` 内的 (Kalshi ticker, PM token) 追加写入。返回新增条数。
@@ -106,20 +94,26 @@ pub fn augment_pairs_from_desk_events_jsonl(
     Ok(added)
 }
 
-pub fn load_pairs_merged_with_desk_at(
-    config: &Path,
-    desk_jsonl: Option<&Path>,
-    announce_if_added: bool,
+/// 仅从 `desk_events.jsonl` 构建 PM↔Kalshi 映射（无 TOML 叠加）。
+pub fn load_pairs_from_desk_events(
+    desk_jsonl: &Path,
+    announce: bool,
 ) -> Result<Vec<ArbPair>> {
-    let mut pairs = load_mapping(config)?;
-    let desk_path = desk_jsonl.unwrap_or_else(|| Path::new(crate::system_params::DESK_EVENTS_JSONL));
-    let desk_added = augment_pairs_from_desk_events_jsonl(&mut pairs, desk_path)?;
-    if announce_if_added && desk_added > 0 {
-        eprintln!(
-            "   ℹ  已从 {} 自动补足 {} 条 PM↔Kalshi 映射",
-            desk_path.display(),
-            desk_added
-        );
+    let mut pairs = Vec::new();
+    augment_pairs_from_desk_events_jsonl(&mut pairs, desk_jsonl)?;
+    if announce {
+        if pairs.is_empty() {
+            eprintln!(
+                "   ℹ  desk_events 未产生映射（文件缺失或无有效行）: {}",
+                desk_jsonl.display()
+            );
+        } else {
+            eprintln!(
+                "   ℹ  PM↔Kalshi 映射 {} 条（desk_events: {}）",
+                pairs.len(),
+                desk_jsonl.display()
+            );
+        }
     }
     Ok(pairs)
 }

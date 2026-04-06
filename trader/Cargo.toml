@@ -3,10 +3,6 @@ name = "check_env"
 path = "src/bin/check_env.rs"
 
 [[bin]]
-name = "track_backtest"
-path = "src/bin/track_backtest.rs"
-
-[[bin]]
 name = "pm_redeem"
 path = "src/bin/pm_redeem.rs"
 
@@ -21,7 +17,7 @@ default-run = "trader"
 portfolio-monitor = { path = "../portfolio_monitor" }
 humantime = "2.1.0"
 # HTTP 客户端
-reqwest = { version = "0.11", features = ["json"] }
+reqwest = { version = "0.11", features = ["json", "blocking"] }
 tokio = { version = "1.0", features = ["full"] }
 
 # 错误处理

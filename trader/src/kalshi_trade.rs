@@ -514,8 +514,9 @@ pub async fn place_buy_ioc(
     }
     let fill_count = match json_order_i64(order, "fill_count") {
         Some(fc) if fc > 0 => fc,
-        Some(_) => anyhow::bail!("Kalshi IOC 未成交（fill_count=0）: {}", text.trim()),
-        None => count,
+        // fill_count=0 或字段缺失均视为未成交；缺失时不能假设全量成交（曾引发幻象成交）
+        Some(_) => anyhow::bail!("Kalshi 买单 IOC 未成交（fill_count=0）: {}", text.trim()),
+        None => anyhow::bail!("Kalshi 买单 IOC 响应缺少 fill_count 字段，视为未成交: {}", text.trim()),
     };
     Ok(KalshiIocResult {
         order_id,
@@ -587,8 +588,9 @@ pub async fn place_sell_ioc(
     }
     let fill_count = match json_order_i64(order, "fill_count") {
         Some(fc) if fc > 0 => fc,
+        // fill_count=0 或字段缺失均视为未成交；缺失时不能假设全量成交
         Some(_) => anyhow::bail!("Kalshi 卖单 IOC 未成交（fill_count=0）: {}", text.trim()),
-        None => count,
+        None => anyhow::bail!("Kalshi 卖单 IOC 响应缺少 fill_count 字段，视为未成交: {}", text.trim()),
     };
     Ok(KalshiIocResult {
         order_id,

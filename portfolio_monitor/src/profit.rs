@@ -13,7 +13,7 @@ use reqwest::Client;
 use serde_json::Value;
 
 use crate::kalshi::{self, KalshiAuth};
-use crate::mapping::load_pairs_merged_with_desk_at;
+use crate::mapping::load_pairs_from_desk_events;
 use crate::pm;
 
 fn http() -> Result<Client> {
@@ -101,10 +101,9 @@ async fn pm_closed_positions(
 async fn ks_tickers_merged(
     http: &Client,
     ks: &KalshiAuth,
-    config: &Path,
     desk: &Path,
 ) -> Result<Vec<String>> {
-    let pairs = load_pairs_merged_with_desk_at(config, Some(desk), false)?;
+    let pairs = load_pairs_from_desk_events(desk, false)?;
     let mut set: HashSet<String> = pairs.iter().map(|p| p.kalshi_ticker.clone()).collect();
     let sign_p = "/trade-api/v2/portfolio/positions";
     let url = format!("{}/portfolio/positions?limit=1000", ks.base);
@@ -122,7 +121,7 @@ async fn ks_tickers_merged(
     Ok(v)
 }
 
-pub async fn run_profit(config: &Path, desk: &Path) -> Result<()> {
+pub async fn run_profit(desk: &Path) -> Result<()> {
     let w = 56;
     println!("{}", "═".repeat(w));
     println!("{:^w$}", "利润统计（全历史）", w = w);
@@ -134,7 +133,7 @@ pub async fn run_profit(config: &Path, desk: &Path) -> Result<()> {
     let pm_clob = pm::connect().await?;
     let pm_user = pm::polymarket_data_api_user_address()?;
 
-    let tickers = ks_tickers_merged(&http, &ks, config, desk).await?;
+    let tickers = ks_tickers_merged(&http, &ks, desk).await?;
     let mut ks_settle_real = 0.0_f64;
     let mut ks_fees_fills = 0.0_f64;
     for t in &tickers {
@@ -148,7 +147,7 @@ pub async fn run_profit(config: &Path, desk: &Path) -> Result<()> {
         }
     }
 
-    let pairs = load_pairs_merged_with_desk_at(config, Some(desk), false)?;
+    let pairs = load_pairs_from_desk_events(desk, false)?;
     let mut pm_fees = 0.0_f64;
     for p in &pairs {
         if !pm::pm_clob_token_id_valid(&p.pm_buy_token_id) {

@@ -1,8 +1,33 @@
 // src/tracking.rs
 use chrono::{DateTime, NaiveDate, Utc};
+use std::collections::HashMap;
 
 use crate::market::Market;
-use crate::market_filter::tracked_pair_exceeds_horizon;
+use crate::market_filter::{pair_settlement_dates_skew_exceeds, tracked_pair_exceeds_horizon};
+use crate::system_params::MAX_SETTLEMENT_DATE_SKEW_DAYS;
+
+/// 从磁盘加载套利轮次计数（pair_id → 已执行轮次）。文件不存在或解析失败时返回空 map。
+pub fn load_arb_rounds_store(path: &str) -> HashMap<String, u32> {
+    match std::fs::read_to_string(path) {
+        Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
+        Err(_) => HashMap::new(),
+    }
+}
+
+/// 将套利轮次计数写入磁盘（JSON）。写失败时仅打印警告，不 panic。
+pub fn flush_arb_rounds_store(store: &HashMap<String, u32>, path: &str) {
+    if let Some(parent) = std::path::Path::new(path).parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    match serde_json::to_string_pretty(store) {
+        Ok(json) => {
+            if let Err(e) = std::fs::write(path, json) {
+                eprintln!("⚠️  arb_rounds_store 写入失败 {path}: {e}");
+            }
+        }
+        Err(e) => eprintln!("⚠️  arb_rounds_store 序列化失败: {e}"),
+    }
+}
 
 /// Polymarket / Kalshi 二元侧（YES/NO）取反，用于同一匹配对下「另一腿」方向（PM 买 YES+KS 买 NO 与 PM 买 NO+KS 买 YES）。
 pub fn flip_binary_side(side: &str) -> Option<&'static str> {
@@ -31,6 +56,8 @@ pub struct TrackedArbitrage {
     pub best_profit: f64,
     pub last_check: DateTime<Utc>,
     pub active: bool,
+    /// 本会话内该套利对已执行的套利轮次数（每次成功下 Kalshi 买单 +1）。
+    pub arb_rounds_executed: u32,
 }
 
 impl TrackedArbitrage {
@@ -58,6 +85,7 @@ impl TrackedArbitrage {
             best_profit: 0.0,
             last_check: Utc::now(),
             active: true,
+            arb_rounds_executed: 0,
         }
     }
 }
@@ -84,6 +112,8 @@ pub struct MonitorState {
     pub trading_session_utc_date: NaiveDate,
     /// **仅在同一 `trading_session_utc_date` 内**可横向比较的周期序号；新 UTC 日归零后从 0 重新开始。
     pub session_cycle_seq: usize,
+    /// 跨会话永久套利轮次计数（pair_id → 已执行轮次），由 `arb_rounds_store.json` 持久化。
+    pub arb_rounds_store: HashMap<String, u32>,
 }
 
 impl MonitorState {
@@ -97,7 +127,43 @@ impl MonitorState {
             last_ks_pool: 0,
             trading_session_utc_date: d,
             session_cycle_seq: 0,
+            arb_rounds_store: HashMap::new(),
         }
+    }
+
+    /// 从磁盘加载永久套利轮次计数；应在程序启动、`MonitorState::new()` 后立即调用。
+    pub fn load_rounds_from_disk(&mut self, path: &str) {
+        self.arb_rounds_store = load_arb_rounds_store(path);
+        println!(
+            "📂 arb_rounds_store 加载：{} 个套利对有历史轮次记录（路径: {}）",
+            self.arb_rounds_store.len(),
+            path
+        );
+    }
+
+    /// 将 pair_id 对应的轮次 +1，同步到 `tracked_pairs`（若存在），并立即刷盘。
+    /// 供**并发路径**或循环外调用（此时无借用冲突）。返回更新后的新轮次数。
+    pub fn commit_pair_round(&mut self, pair_id: &str, store_path: &str) -> u32 {
+        let count = self.arb_rounds_store.entry(pair_id.to_string()).or_insert(0);
+        *count += 1;
+        let new_count = *count;
+        if let Some(tp) = self.tracked_pairs.iter_mut().find(|p| p.pair_id == pair_id) {
+            tp.arb_rounds_executed = new_count;
+        }
+        flush_arb_rounds_store(&self.arb_rounds_store, store_path);
+        new_count
+    }
+
+    /// 批量将已在循环内更新好的 (pair_id, new_count) 写入 store 并一次性刷盘。
+    /// 供**顺序遍历** `tracked_pairs.iter_mut()` 的循环**结束后**调用，避免借用冲突。
+    pub fn persist_round_counts_batch(&mut self, updates: &[(String, u32)], store_path: &str) {
+        if updates.is_empty() {
+            return;
+        }
+        for (pid, count) in updates {
+            self.arb_rounds_store.insert(pid.clone(), *count);
+        }
+        flush_arb_rounds_store(&self.arb_rounds_store, store_path);
     }
 
     pub fn should_full_match(&self) -> bool {
@@ -139,19 +205,21 @@ impl MonitorState {
             pair.active = false;
         }
 
-        // 添加新的匹配对
+        // 添加新的匹配对，并从持久 store 同步历史轮次
         for (pm, kalshi, similarity, pm_side, kalshi_side, needs_inversion) in new_matches {
             let pair_id = oriented_track_id(&pm.market_id, &kalshi.market_id, &pm_side, &kalshi_side);
+            let stored_rounds = self.arb_rounds_store.get(&pair_id).copied().unwrap_or(0);
             if let Some(existing) = self.tracked_pairs.iter_mut().find(|p| p.pair_id == pair_id) {
                 existing.active = true;
                 existing.similarity = similarity;
                 existing.pm_side = pm_side;
                 existing.kalshi_side = kalshi_side;
                 existing.needs_inversion = needs_inversion;
+                existing.arb_rounds_executed = stored_rounds;
             } else {
-                self.tracked_pairs.push(TrackedArbitrage::new(
-                    pm, kalshi, similarity, pm_side, kalshi_side, needs_inversion
-                ));
+                let mut ta = TrackedArbitrage::new(pm, kalshi, similarity, pm_side, kalshi_side, needs_inversion);
+                ta.arb_rounds_executed = stored_rounds;
+                self.tracked_pairs.push(ta);
             }
         }
 
@@ -163,6 +231,17 @@ impl MonitorState {
     pub fn prune_tracked_beyond_resolution_horizon(&mut self, now: DateTime<Utc>) {
         self.tracked_pairs.retain(|p| {
             !tracked_pair_exceeds_horizon(&p.pm_market, &p.kalshi_market, now)
+        });
+    }
+
+    /// 剔除 PM/Kalshi 到期时刻差严格大于 [`MAX_SETTLEMENT_DATE_SKEW_DAYS`] 的追踪对（与识别阶段同源规则）。
+    pub fn prune_tracked_settlement_skew_too_wide(&mut self) {
+        self.tracked_pairs.retain(|p| {
+            !pair_settlement_dates_skew_exceeds(
+                &p.pm_market,
+                &p.kalshi_market,
+                MAX_SETTLEMENT_DATE_SKEW_DAYS,
+            )
         });
     }
 }

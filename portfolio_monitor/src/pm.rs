@@ -87,7 +87,7 @@ fn token_id_to_u256(token_id: &str) -> Result<U256> {
     let s = token_id.trim();
     if !pm_clob_token_id_valid(s) {
         anyhow::bail!(
-            "pm_buy_token_id 须为非空纯十进制数字（请把 arb_pairs.toml 里占位符换成真实 CLOB token_id）"
+            "pm_buy_token_id 须为非空纯十进制数字（desk_events 或链上数据源须为真实 CLOB token_id）"
         );
     }
     s.parse().context("token_id U256")

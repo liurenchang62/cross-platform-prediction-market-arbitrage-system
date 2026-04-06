@@ -4,6 +4,7 @@
 mod system_params;
 
 pub mod cashflow;
+pub mod http_client_env;
 pub mod gamma;
 pub mod kalshi;
 pub mod mapping;
@@ -13,4 +14,4 @@ pub mod profit;
 pub mod snapshot_report;
 pub mod turnover;
 
-pub use mapping::{load_mapping, ArbPair, StrategyLegs};
+pub use mapping::{load_pairs_from_desk_events, ArbPair, StrategyLegs};

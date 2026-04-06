@@ -164,13 +164,9 @@ pub struct PolymarketClient {
 
 impl PolymarketClient {
     pub fn new() -> Self {
-        let http_client = Client::builder()
-            .timeout(Duration::from_secs(10))
-            .pool_max_idle_per_host(10)
-            .pool_idle_timeout(Duration::from_secs(90))
-            .build()
+        let http_client = portfolio_monitor::http_client_env::build_http_client(Duration::from_secs(10))
             .unwrap_or_else(|_| Client::new());
-        
+
         Self { http_client }
     }
 
@@ -427,11 +423,7 @@ impl KalshiClient {
 
     /// 自定义 Trade API 根 URL（须含 `/trade-api/v2`，无末尾 `/`）。
     pub fn new_with_base_url(base_url: impl AsRef<str>) -> Self {
-        let http_client = Client::builder()
-            .timeout(Duration::from_secs(10))
-            .pool_max_idle_per_host(10)
-            .pool_idle_timeout(Duration::from_secs(90))
-            .build()
+        let http_client = portfolio_monitor::http_client_env::build_http_client(Duration::from_secs(10))
             .unwrap_or_else(|_| Client::new());
 
         let base = base_url.as_ref().trim_end_matches('/').to_string();
@@ -496,15 +488,11 @@ impl KalshiClient {
         
         while all_markets.len() < KALSHI_MAX_MARKETS {
             page_count += 1;
-            
-            // 第一次请求直接调用，不经过重试
-            let result = if cursor.is_empty() {
-                self.fetch_markets_page("", limit).await
-            } else {
-                self.request_with_retry(|| async {
-                    self.fetch_markets_page(&cursor, limit).await
-                }).await
-            };
+
+            let cur = cursor.clone();
+            let result = self
+                .request_with_retry(|| async { self.fetch_markets_page(&cur, limit).await })
+                .await;
             
             match result {
                 Ok((markets, next_cursor)) => {

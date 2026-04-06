@@ -1,23 +1,52 @@
-//! 成功实盘成交后调用项目根目录 `【消息推送】飞书转发.py` 推送摘要（失败仅打日志，不中断主流程）。
+//! 飞书群自定义机器人文本推送（`msg_type: text`）。失败仅打日志，不中断主流程。
+//!
+//! 与历史 Python 脚本行为对齐：若机器人启用「关键词」校验，正文需含 `【机器人】`（发送前自动补上）。
+//! Webhook / Authorization 可通过环境变量覆盖（便于不把密钥写死在仓库）：`FEISHU_WEBHOOK`、`FEISHU_BOT_AUTHORIZATION`。
 
-use std::io::Write;
-use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
+use once_cell::sync::Lazy;
+use reqwest::blocking::Client;
+use serde::Serialize;
 
 use crate::system_params::DESK_EVENTS_JSONL;
+use crate::trades_cache;
 
-fn project_root() -> PathBuf {
-    // CARGO_MANIFEST_DIR = trader/（crate 子目录）；Python 脚本在 workspace 根目录（上一级）
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("workspace root exists")
-        .to_path_buf()
+/// 机器人若开启「关键词」校验，正文需包含此串（与旧脚本一致）。
+const FEISHU_KEYWORD: &str = "【机器人】";
+
+/// 默认 webhook（可被 `FEISHU_WEBHOOK` 覆盖）。
+const DEFAULT_FEISHU_WEBHOOK: &str =
+    "https://open.feishu.cn/open-apis/bot/v2/hook/646392d3-c205-41fc-b7c0-01a342eac341";
+/// 默认 `Authorization` 请求头值（可被 `FEISHU_BOT_AUTHORIZATION` 覆盖）。
+const DEFAULT_FEISHU_AUTHORIZATION: &str = "tooilGCilgCxxhlub0Qtbb";
+
+static FEISHU_CLIENT: Lazy<Client> = Lazy::new(|| {
+    Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .expect("feishu reqwest client")
+});
+
+#[derive(Serialize)]
+struct FeishuTextPayload {
+    msg_type: &'static str,
+    content: FeishuTextContent,
 }
 
-fn feishu_script_path() -> PathBuf {
-    project_root().join("【消息推送】飞书转发.py")
+#[derive(Serialize)]
+struct FeishuTextContent {
+    text: String,
+}
+
+fn feishu_webhook() -> String {
+    std::env::var("FEISHU_WEBHOOK").unwrap_or_else(|_| DEFAULT_FEISHU_WEBHOOK.to_string())
+}
+
+fn feishu_authorization() -> String {
+    std::env::var("FEISHU_BOT_AUTHORIZATION")
+        .unwrap_or_else(|_| DEFAULT_FEISHU_AUTHORIZATION.to_string())
 }
 
 /// 第一腿成交且第二腿有明确结果时推送导师端飞书。
@@ -28,12 +57,7 @@ pub fn feishu_should_notify(status: &str) -> bool {
     )
 }
 
-/// 通过 **stdin** 将整段 UTF-8 摘要传给脚本（避免 Windows 命令行长度限制）。
 pub fn push_trade_summary_to_feishu(summary: &str) -> Result<()> {
-    let script = feishu_script_path();
-    if !script.exists() {
-        anyhow::bail!("飞书脚本不存在: {:?}", script);
-    }
     let summary = summary.trim().replace('\r', "");
     if summary.is_empty() {
         anyhow::bail!("飞书摘要为空");
@@ -42,69 +66,41 @@ pub fn push_trade_summary_to_feishu(summary: &str) -> Result<()> {
         anyhow::bail!("飞书摘要过长 (>8000)，请缩短");
     }
 
-    let attempts: &[(&str, &[&str])] = &[
-        ("py", &["-3", "-u"]),
-        ("python", &["-u"]),
-        ("python3", &["-u"]),
-    ];
+    let text = if summary.contains(FEISHU_KEYWORD) {
+        summary
+    } else {
+        format!("{FEISHU_KEYWORD}{summary}")
+    };
 
-    let mut last: Option<String> = None;
-    for (exe, prefix) in attempts {
-        let mut cmd = Command::new(exe);
-        for p in *prefix {
-            cmd.arg(p);
-        }
-        cmd.arg(&script);
-        cmd.arg("-");
-        cmd.stdin(Stdio::piped());
-        cmd.stdout(Stdio::piped());
-        cmd.stderr(Stdio::piped());
-        cmd.current_dir(project_root());
-        cmd.env("PYTHONUTF8", "1");
+    let payload = FeishuTextPayload {
+        msg_type: "text",
+        content: FeishuTextContent { text },
+    };
 
-        let mut child = match cmd.spawn() {
-            Ok(c) => c,
-            Err(e) => {
-                last = Some(format!("{} 启动失败: {}", exe, e));
-                continue;
-            }
-        };
-        let mut stdin = match child.stdin.take() {
-            Some(s) => s,
-            None => {
-                last = Some(format!("{} 无 stdin", exe));
-                continue;
-            }
-        };
-        stdin
-            .write_all(summary.as_bytes())
-            .with_context(|| format!("写入飞书脚本 stdin ({exe})"))?;
-        drop(stdin);
+    let webhook = feishu_webhook();
+    let resp = FEISHU_CLIENT
+        .post(&webhook)
+        .header("Authorization", feishu_authorization())
+        .header("Content-Type", "application/json")
+        .json(&payload)
+        .send()
+        .with_context(|| format!("飞书 webhook 请求 ({webhook})"))?;
 
-        let out = child
-            .wait_with_output()
-            .with_context(|| format!("等待飞书子进程 ({exe})"))?;
-        if out.status.success() {
-            let s = String::from_utf8_lossy(&out.stdout);
-            if !s.trim().is_empty() {
-                println!("   [飞书] {}", s.trim());
-            }
-            return Ok(());
-        }
-        last = Some(format!(
-            "{} exit={} stderr={}",
-            exe,
-            out.status,
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
+    let status = resp.status();
+    let body = resp.text().context("读取飞书响应体")?;
+    if !status.is_success() {
+        anyhow::bail!("飞书 HTTP {}: {}", status, body.trim());
     }
-    anyhow::bail!(
-        "飞书推送失败（需 Python3 + requests，且仓库根目录有 飞书转发.py）。详情: {:?}",
-        last
-    )
+
+    if !body.trim().is_empty() {
+        let line = format!("   [飞书] {}", body.trim());
+        println!("{}", line);
+        trades_cache::append_line(&line);
+    }
+    Ok(())
 }
 
-/// 生成飞书文本（关键词由 Python 侧确保包含「【机器人】」）。
+/// 生成飞书文本（关键词由 [`push_trade_summary_to_feishu`] 在发送前保证包含「【机器人】」）。
 #[allow(clippy::too_many_arguments)]
 pub fn format_trade_summary(
     pair_label: &str,

@@ -8,7 +8,7 @@
 
 **`portfolio-monitor`** 是同工作区下的配套 crate：**只读**组合工具（快照、现金流、利润汇总、换手图、PM 赎回诊断）以及供 `trader` 启动时调用的 **`pm_relayer_automation`** 库逻辑。
 
-密钥通过**环境变量**（及本机私钥文件）配置；具体命令与环境说明见 **`项目命令说明.txt`**。
+密钥通过**环境变量**（及本机私钥文件）配置；具体命令与环境说明见 **`PROJECT_COMMANDS.txt`**。
 
 ---
 
@@ -20,13 +20,9 @@
 | **`trader/`** | 实盘主循环、匹配、下单、会话风控、飞书推送等 |
 | **`portfolio_monitor/`** | 库 + 独立工具：`portfolio-snapshot`、`portfolio-cashflow`、`portfolio-profit`、`portfolio-turnover`、`portfolio-pm-redeem-diagnose` |
 | **`config/categories.toml`** | 分类与关键词，参与匹配 |
-| **`portfolio_monitor/config/`** | 如 **`arb_pairs.toml`**（组合工具用的 KS↔PM 映射） |
-| **`logs/`** | `desk_events.jsonl`、`tracking_*.csv`（路径常量见 `trader/src/system_params.rs`） |
-| **`scripts/`** | 可选 API 探针脚本 |
+| **`logs/`** | `desk_events.jsonl`、`arb_rounds_store.json`、`trades_cache.txt`（路径见 `system_params.rs` 与 `trades_cache.rs`） |
 
 核心实现位于 **`trader/src/`**：`main.rs`、`market_matcher.rs`、`arbitrage_detector.rs`、`validation.rs`、`session_risk.rs`、`desk_events.rs`、`kalshi_trade.rs`、`polymarket_trade.rs`、`feishu_push.rs`、`system_params.rs` 等。
-
-匹配与索引细节：**[docs/MATCHING_VERIFICATION.md](docs/MATCHING_VERIFICATION.md)**。
 
 ---
 

@@ -5,9 +5,26 @@
 工作区包含两个 crate：**`trader`**（主程序 + 附属 bin）、**`portfolio-monitor`**（组合监控与诊断工具）。
 
 --------------------------------------------------------------------------------
+## 网络：HTTP(S) 代理（可选）
+
+程序里通过 `portfolio_monitor::http_client_env` 构建的 `reqwest::Client` 会读取环境变量（与常见 CLI 习惯一致）：**`HTTPS_PROXY` / `https_proxy` / `ALL_PROXY` / `all_proxy` / `HTTP_PROXY` / `http_proxy`**。值一般为 `http://主机:端口`；若只写 `主机:端口`（无 `http://`），构建客户端时会自动补上 `http://`。
+
+设置示例（把地址换成你自己的本地或远程代理；仅当前终端会话生效）：
+
+  # PowerShell
+  $env:HTTPS_PROXY = "http://你的代理地址"
+  $env:HTTP_PROXY  = "http://你的代理地址"
+
+  # cmd
+  set HTTPS_PROXY=http://你的代理地址
+  set HTTP_PROXY=http://你的代理地址
+
+生效时通常会在标准错误里看到 **`🌐 reqwest 使用代理:`**。**Polymarket CLOB 官方 SDK** 是否走上述变量取决于 SDK 本身；若只有 CLOB 鉴权失败，需在代理规则或 SDK 侧单独处理。
+
+--------------------------------------------------------------------------------
 ## trader：跨平台实盘主程序（默认 binary）
 
-功能：Kalshi ↔ Polymarket 监控与套利；仅在**程序启动、进入主监控循环前**自动尝试 Proxy 经 Relayer **赎回可结算头寸**并 **刷新 Polymarket CLOB Collateral**（需 `POLYMARKET_SIGNATURE_TYPE=1` 及 `RELAYER_API_KEY` / `POLYMARKET_API_KEY` 等，实现见 `portfolio_monitor::pm_relayer_automation`）。后续监控周期内不再重复。链上赎回有提交时可经飞书推送摘要（与成交推送共用机器人脚本）。
+功能：Kalshi ↔ Polymarket 监控与套利；仅在**程序启动、进入主监控循环前**自动尝试 Proxy 经 Relayer **赎回可结算头寸**并 **刷新 Polymarket CLOB Collateral**（需 `POLYMARKET_SIGNATURE_TYPE=1` 及 `RELAYER_API_KEY` / `POLYMARKET_API_KEY` 等，实现见 `portfolio_monitor::pm_relayer_automation`）。后续监控周期内不再重复。链上赎回有提交时可经飞书推送摘要（与成交推送共用 `trader::feishu_push`）。
 
   cargo run -p trader --release
 
@@ -15,11 +32,6 @@
 ## trader：环境自检
 
   cargo run -p trader --bin check_env --release
-
---------------------------------------------------------------------------------
-## trader：追踪回测（tracking CSV 汇总）
-
-  cargo run -p trader --bin track_backtest --release
 
 --------------------------------------------------------------------------------
 ## trader：Polymarket 独立赎回（Relayer redeem + 刷新 Collateral）
@@ -33,11 +45,11 @@
 --------------------------------------------------------------------------------
 ## portfolio-monitor：统一快照（Kalshi / PM 同构账户摘要 + 对冲对照表）
 
-  默认配置 `portfolio_monitor/config/arb_pairs.toml`，桌面事件 `logs/desk_events.jsonl`（用于补全映射）。
+  PM↔Kalshi 映射**仅**从 `logs/desk_events.jsonl` 读取（`--desk` 可改路径）。
 
   cargo run -p portfolio-monitor --bin portfolio-snapshot --release
 
-  cargo run -p portfolio-monitor --bin portfolio-snapshot --release -- --config <toml> --desk <jsonl>
+  cargo run -p portfolio-monitor --bin portfolio-snapshot --release -- --desk <jsonl>
 
 --------------------------------------------------------------------------------
 ## portfolio-monitor：现金流 CSV（stdin 输入回望天数，覆盖写入 cashflow.csv）
@@ -77,4 +89,4 @@
   POLYGON_RPC_URL（可选）
   POLYMARKET_RELAYER_URL（可选，默认 relayer-v2.polymarket.com）
 
-飞书推送依赖仓库根目录 `【消息推送】飞书转发.py` 与 Python3。
+飞书推送由 `trader/src/feishu_push.rs` 内直接 POST；可选 `FEISHU_WEBHOOK`、`FEISHU_BOT_AUTHORIZATION` 覆盖默认 webhook 与请求头（不设置则使用源码内默认值）。

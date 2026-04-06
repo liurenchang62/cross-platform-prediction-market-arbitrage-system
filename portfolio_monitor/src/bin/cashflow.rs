@@ -9,8 +9,6 @@ use clap::Parser;
 #[derive(Parser)]
 #[command(name = "portfolio-cashflow")]
 struct Args {
-    #[arg(long, default_value = "portfolio_monitor/config/arb_pairs.toml")]
-    config: PathBuf,
     #[arg(long, default_value = "logs/desk_events.jsonl")]
     desk: PathBuf,
     #[arg(long, default_value = "portfolio_monitor/out")]
@@ -42,5 +40,5 @@ async fn main() -> Result<()> {
         Some(d) => d,
         None => prompt_days()?,
     };
-    portfolio_monitor::cashflow::run_cashflow(&args.config, &args.desk, &args.out, days).await
+    portfolio_monitor::cashflow::run_cashflow(&args.desk, &args.out, days).await
 }

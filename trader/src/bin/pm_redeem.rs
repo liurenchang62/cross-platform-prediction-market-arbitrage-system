@@ -13,7 +13,6 @@ use std::time::Duration;
 
 use anyhow::Result;
 use clap::Parser;
-use reqwest::Client;
 
 #[derive(Parser)]
 #[command(name = "pm_redeem")]
@@ -30,9 +29,7 @@ struct Args {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    let http = Client::builder()
-        .timeout(Duration::from_secs(180))
-        .build()?;
+    let http = portfolio_monitor::http_client_env::build_http_client(Duration::from_secs(180))?;
     let rpc = args.rpc_url.unwrap_or_else(
         portfolio_monitor::pm_relayer_automation::polygon_rpc_for_automation,
     );

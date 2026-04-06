@@ -285,7 +285,8 @@ impl ArbitrageDetector {
         let gas_amount = gas_assumed_usd + surplus_buffer_usd;
         let net_profit_100 = gross - capital_used - fees_amount - gas_amount;
 
-        if net_profit_100 <= self.min_profit_usd(pair_cap_usdt) {
+        // 门槛锚定 capital_used（与 ROI 分母一致）：净利 / 真实成本 >= min_frac 才执行。
+        if capital_used <= 0.0 || net_profit_100 <= capital_used * self.min_net_profit_frac_of_pair_cap {
             return None;
         }
         let roi_100 = if capital_used > 0.0 {
@@ -1132,6 +1133,14 @@ pub fn validate_opportunity_from_ladders(
     pair_cap_usdt: f64,
     cost: &ArbCostParams,
 ) -> Option<ArbitrageOpportunity> {
+    // Guard A：PM ask 总深度不足 1 整数份 → Kalshi 最低委托为 1 合约（官方文档 count minimum:1），
+    // PM 侧同样无法成交不足 1 份的订单，直接跳过。纯 orderbook 约束，与平台最低委托金额无关。
+    // 在 calculate_arbitrage_100usdt 之前检查，省掉完整的利润计算。
+    let pm_ask_depth = total_size_buy_ladder(&ladders.pm_asks);
+    if pm_ask_depth < 1.0 {
+        return None;
+    }
+
     let pm_optimal = orderbook_best_ask_price(&ladders.pm_asks)?;
     let kalshi_optimal = orderbook_best_ask_price(&ladders.ks_asks)?;
 
