@@ -29,6 +29,233 @@ fn parse_rfc3339(s: &str) -> Option<DateTime<Utc>> {
         .map(|x| x.with_timezone(&Utc))
 }
 
+/// 与一笔 desk 套利回合对应的**真实发单笔数**（与 `desk_events` 中 `orders_*` 一致）。
+#[derive(Clone, Copy, Default)]
+struct ArbOrdCounts {
+    ks_buy: u32,
+    ks_unwind: u32,
+    pm: u32,
+}
+
+struct DeskRoundFull {
+    t: DateTime<Utc>,
+    kalshi_title: String,
+    pm_title: String,
+    cnt: ArbOrdCounts,
+}
+
+/// 从 `desk_events.jsonl` 建立索引：Kalshi `order_id` 精确匹配；PM Activity 无 `order_id` 时按 `pm_title`+时间启发式匹配。
+#[derive(Default)]
+struct DeskArbIndex {
+    by_kalshi_order: HashMap<String, ArbOrdCounts>,
+    rounds: Vec<DeskRoundFull>,
+}
+
+impl DeskArbIndex {
+    const MAX_SEC_AFTER_DESK: i64 = 4 * 3600;
+
+    fn ingest_json_line(&mut self, v: &Value) {
+        let Some(t) = v
+            .get("time_utc_rfc3339")
+            .and_then(|x| x.as_str())
+            .and_then(parse_rfc3339)
+        else {
+            return;
+        };
+
+        let ks_buy = v
+            .get("orders_kalshi_buy")
+            .and_then(|x| x.as_u64())
+            .map(|x| x as u32)
+            .unwrap_or_else(|| {
+                u32::from(
+                    v.get("kalshi_order_id")
+                        .and_then(|x| x.as_str())
+                        .is_some_and(|s| !s.is_empty()),
+                )
+            });
+        let ks_unwind = v
+            .get("orders_kalshi_unwind_sell")
+            .and_then(|x| x.as_u64())
+            .map(|x| x as u32)
+            .unwrap_or_else(|| {
+                v.get("kalshi_unwind_order_ids")
+                    .and_then(|x| x.as_array())
+                    .map(|a| a.len() as u32)
+                    .unwrap_or(0)
+            });
+        let pm = v
+            .get("orders_polymarket")
+            .and_then(|x| x.as_u64())
+            .map(|x| x as u32)
+            .unwrap_or_else(|| pm_order_len_from_response_json(v));
+
+        let cnt = ArbOrdCounts {
+            ks_buy,
+            ks_unwind,
+            pm,
+        };
+
+        if let Some(oid) = v
+            .get("kalshi_order_id")
+            .and_then(|x| x.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            self.by_kalshi_order.insert(oid.to_string(), cnt);
+        }
+        if let Some(arr) = v.get("kalshi_unwind_order_ids").and_then(|x| x.as_array()) {
+            for id in arr {
+                if let Some(s) = id.as_str().filter(|s| !s.is_empty()) {
+                    self.by_kalshi_order.insert(s.to_string(), cnt);
+                }
+            }
+        }
+
+        let kalshi_title = v
+            .get("kalshi_title")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
+        let pm_title = v
+            .get("pm_title")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        if !kalshi_title.is_empty() || !pm_title.is_empty() {
+            self.rounds.push(DeskRoundFull {
+                t,
+                kalshi_title,
+                pm_title,
+                cnt,
+            });
+        }
+    }
+
+    fn lookup_kalshi_title(&self, note: &str, t: DateTime<Utc>) -> Option<ArbOrdCounts> {
+        let mut best_t: Option<DateTime<Utc>> = None;
+        let mut best_c: Option<ArbOrdCounts> = None;
+        for r in &self.rounds {
+            if r.kalshi_title != note {
+                continue;
+            }
+            if r.t > t {
+                continue;
+            }
+            let dt = (t - r.t).num_seconds();
+            if dt > Self::MAX_SEC_AFTER_DESK {
+                continue;
+            }
+            if best_t.map(|bt| r.t > bt).unwrap_or(true) {
+                best_t = Some(r.t);
+                best_c = Some(r.cnt);
+            }
+        }
+        best_c
+    }
+
+    fn lookup_pm_title(&self, title: &str, t: DateTime<Utc>) -> Option<ArbOrdCounts> {
+        titles_match_latest(self.rounds.iter(), |r| r.pm_title.as_str() == title, t)
+    }
+
+    fn arb_columns_for_row(&self, r: &Row) -> (String, String, String) {
+        let fmt = |c: ArbOrdCounts| {
+            (
+                c.ks_buy.to_string(),
+                c.ks_unwind.to_string(),
+                c.pm.to_string(),
+            )
+        };
+        match r.platform {
+            "Kalshi" => {
+                if r.behavior == "买入" || r.behavior == "卖出" {
+                    if let Some(ref oid) = r.kalshi_fill_order_id {
+                        if let Some(c) = self.by_kalshi_order.get(oid) {
+                            return fmt(*c);
+                        }
+                    }
+                }
+                if r.behavior == "结算流回" {
+                    if let Some(c) = self.lookup_kalshi_title(&r.note, r.t) {
+                        return fmt(c);
+                    }
+                }
+            }
+            "Polymarket" => {
+                if !r.note.is_empty() {
+                    if let Some(c) = self.lookup_pm_title(&r.note, r.t) {
+                        return fmt(c);
+                    }
+                }
+            }
+            _ => {}
+        }
+        (String::new(), String::new(), String::new())
+    }
+}
+
+fn titles_match_latest<'a, I, F>(rounds: I, title_ok: F, t: DateTime<Utc>) -> Option<ArbOrdCounts>
+where
+    I: Iterator<Item = &'a DeskRoundFull>,
+    F: Fn(&'a DeskRoundFull) -> bool,
+{
+    let mut best_t: Option<DateTime<Utc>> = None;
+    let mut best_c: Option<ArbOrdCounts> = None;
+    for r in rounds {
+        if !title_ok(r) {
+            continue;
+        }
+        if r.t > t {
+            continue;
+        }
+        let dt = (t - r.t).num_seconds();
+        if dt > DeskArbIndex::MAX_SEC_AFTER_DESK {
+            continue;
+        }
+        if best_t.map(|bt| r.t > bt).unwrap_or(true) {
+            best_t = Some(r.t);
+            best_c = Some(r.cnt);
+        }
+    }
+    best_c
+}
+
+fn pm_order_len_from_response_json(desk_line: &Value) -> u32 {
+    let Some(raw) = desk_line
+        .get("polymarket_response_json")
+        .and_then(|x| x.as_str())
+    else {
+        return 0;
+    };
+    let Ok(inner) = serde_json::from_str::<Value>(raw) else {
+        return 0;
+    };
+    inner
+        .get("polymarket_orders")
+        .and_then(|x| x.as_array())
+        .map(|a| a.len() as u32)
+        .unwrap_or(0)
+}
+
+fn load_desk_arb_index(desk_jsonl: &Path) -> DeskArbIndex {
+    let mut idx = DeskArbIndex::default();
+    let Ok(txt) = std::fs::read_to_string(desk_jsonl) else {
+        return idx;
+    };
+    for line in txt.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        idx.ingest_json_line(&v);
+    }
+    idx.rounds.sort_by_key(|r| r.t);
+    idx
+}
+
 /// Returns (sorted tickers, map of ticker→title for those already stored in desk_events).
 async fn ks_merged_tickers(
     http: &Client,
@@ -107,6 +334,8 @@ struct Row {
     flow: String,
     amount: f64,
     note: String,
+    /// Kalshi fills API 的 `order_id`；仅买卖成交行用于与 desk 对齐。
+    kalshi_fill_order_id: Option<String>,
 }
 
 fn pm_activity_row(act: &Activity) -> Option<Row> {
@@ -140,6 +369,7 @@ fn pm_activity_row(act: &Activity) -> Option<Row> {
         flow: flow.to_string(),
         amount,
         note: act.title.as_deref().unwrap_or("").to_string(),
+        kalshi_fill_order_id: None,
     })
 }
 
@@ -198,6 +428,7 @@ pub async fn run_cashflow(desk: &Path, out_dir: &Path, lookback_days: u32) -> Re
     }
 
     let mut rows: Vec<Row> = Vec::new();
+    let desk_idx = load_desk_arb_index(desk);
 
     for ticker in &tickers {
         let note = ticker_title.get(ticker).cloned().unwrap_or_else(|| ticker.clone());
@@ -226,6 +457,12 @@ pub async fn run_cashflow(desk: &Path, out_dir: &Path, lookback_days: u32) -> Re
                 Some("sell") => ("流入".to_string(), (leg - fee).max(0.0)),
                 _ => continue,
             };
+            let kalshi_fill_order_id = f
+                .get("order_id")
+                .or_else(|| f.get("orderId"))
+                .and_then(|x| x.as_str())
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
             rows.push(Row {
                 t: ts,
                 platform: "Kalshi",
@@ -233,6 +470,7 @@ pub async fn run_cashflow(desk: &Path, out_dir: &Path, lookback_days: u32) -> Re
                 flow,
                 amount,
                 note: note.clone(),
+                kalshi_fill_order_id,
             });
         }
 
@@ -253,6 +491,7 @@ pub async fn run_cashflow(desk: &Path, out_dir: &Path, lookback_days: u32) -> Re
                 flow: (if net >= 0.0 { "流入" } else { "流出" }).to_string(),
                 amount: net.abs(),
                 note: note.clone(),
+                kalshi_fill_order_id: None,
             });
         }
     }
@@ -280,8 +519,12 @@ pub async fn run_cashflow(desk: &Path, out_dir: &Path, lookback_days: u32) -> Re
         "flow",
         "amount_usd",
         "note",
+        "arb_ord_kalshi_buy",
+        "arb_ord_kalshi_unwind",
+        "arb_ord_polymarket",
     ])?;
     for r in rows {
+        let (ab, au, ap) = desk_idx.arb_columns_for_row(&r);
         w.write_record([
             &r.t.to_rfc3339(),
             r.platform,
@@ -289,6 +532,9 @@ pub async fn run_cashflow(desk: &Path, out_dir: &Path, lookback_days: u32) -> Re
             &r.flow,
             &format!("{:.6}", r.amount),
             &r.note,
+            &ab,
+            &au,
+            &ap,
         ])?;
     }
     w.flush()?;

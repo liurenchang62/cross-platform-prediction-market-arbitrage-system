@@ -289,10 +289,16 @@ impl PolymarketClobTrader {
         let signer = self.local_signer()?;
 
         let cap = per_leg_cap_usd.max(0.0);
-        let slip_cost = (n_contracts * pm_avg_slipped * 1.15_f64).max(0.01);
-        // PM CLOB 执行层兜底：$1.00 为平台最低委托金额（全平台统一，无查询接口，见官方文档）。
-        // 识别层已通过 orderbook 深度约束过滤掉不可交易对，此处仅作 safety net 防止极端边界情况。
-        let spend_usd = cap.min(slip_cost).max(1.0_f64);
+        let slip_cost = n_contracts * pm_avg_slipped * 1.15_f64;
+        let spend_usd = cap.min(slip_cost);
+        // 识别层（arbitrage_detector）应已过滤掉 PM 委托金额 < $1.00 的对；
+        // 此处硬拒绝而非静默 max($1) 超买，防止识别漏网时多买导致套利比例失衡。
+        if spend_usd < 1.0 {
+            anyhow::bail!(
+                "PM 委托金额估算 ${:.4} 低于平台最低 $1.00（n={:.2} 份 × avg=${:.4} × 1.15）；此对应在识别阶段被过滤",
+                spend_usd, n_contracts, pm_avg_slipped
+            );
+        }
 
         let spend = Decimal::try_from(spend_usd)
             .ok()
@@ -300,7 +306,7 @@ impl PolymarketClobTrader {
         let spend = spend.round_dp(2);
         if spend < Decimal::ONE {
             anyhow::bail!(
-                "PM CLOB 最低委托 $1.00，计算金额 ${:.4}；调用方须保证传入金额 ≥ $1",
+                "PM CLOB 最低委托 $1.00，舍入后金额 ${:.4}",
                 spend
             );
         }

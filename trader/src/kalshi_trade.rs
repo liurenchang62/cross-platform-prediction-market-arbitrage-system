@@ -375,7 +375,10 @@ fn json_order_i64(order: &Value, key: &str) -> Option<i64> {
     order.get(key).and_then(|v| {
         v.as_i64()
             .or_else(|| v.as_f64().map(|x| x as i64))
-            .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+            // 整数字符串 "10"
+            .or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok()))
+            // 浮点字符串 "10.00"（Kalshi fill_count_fp 格式）
+            .or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()).map(|x| x as i64))
     })
 }
 
@@ -512,11 +515,14 @@ pub async fn place_buy_ioc(
     if order_id.is_empty() {
         anyhow::bail!("响应无 order_id: {}", text);
     }
-    let fill_count = match json_order_i64(order, "fill_count") {
+    // Kalshi API 曾用 fill_count（整数），现已改为 fill_count_fp（字符串浮点，如 "10.00"）；两者均尝试。
+    let fill_count = match json_order_i64(order, "fill_count")
+        .or_else(|| json_order_i64(order, "fill_count_fp"))
+    {
         Some(fc) if fc > 0 => fc,
         // fill_count=0 或字段缺失均视为未成交；缺失时不能假设全量成交（曾引发幻象成交）
         Some(_) => anyhow::bail!("Kalshi 买单 IOC 未成交（fill_count=0）: {}", text.trim()),
-        None => anyhow::bail!("Kalshi 买单 IOC 响应缺少 fill_count 字段，视为未成交: {}", text.trim()),
+        None => anyhow::bail!("Kalshi 买单 IOC 响应缺少 fill_count/fill_count_fp 字段，视为未成交: {}", text.trim()),
     };
     Ok(KalshiIocResult {
         order_id,
@@ -586,11 +592,14 @@ pub async fn place_sell_ioc(
     if order_id.is_empty() {
         anyhow::bail!("响应无 order_id: {}", text);
     }
-    let fill_count = match json_order_i64(order, "fill_count") {
+    // Kalshi API 曾用 fill_count（整数），现已改为 fill_count_fp（字符串浮点，如 "10.00"）；两者均尝试。
+    let fill_count = match json_order_i64(order, "fill_count")
+        .or_else(|| json_order_i64(order, "fill_count_fp"))
+    {
         Some(fc) if fc > 0 => fc,
         // fill_count=0 或字段缺失均视为未成交；缺失时不能假设全量成交
         Some(_) => anyhow::bail!("Kalshi 卖单 IOC 未成交（fill_count=0）: {}", text.trim()),
-        None => anyhow::bail!("Kalshi 卖单 IOC 响应缺少 fill_count 字段，视为未成交: {}", text.trim()),
+        None => anyhow::bail!("Kalshi 卖单 IOC 响应缺少 fill_count/fill_count_fp 字段，视为未成交: {}", text.trim()),
     };
     Ok(KalshiIocResult {
         order_id,

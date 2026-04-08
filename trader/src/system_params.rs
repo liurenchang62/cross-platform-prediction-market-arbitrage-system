@@ -58,6 +58,10 @@ pub const RESOLUTION_HORIZON_DAYS: i64 = 7;
 /// 比较按整秒：`abs(Δ秒) > 天数 × 86400` 即剔除。任一侧无 `resolution_date` 时不做此项剔除。
 pub const MAX_SETTLEMENT_DATE_SKEW_DAYS: i64 = 3;
 
+/// 任一侧 `resolution_date` 距 now 不足此分钟数的市场对直接跳过，不检测、不下单。
+/// 防止在即将结算的市场上执行套利（价格已反映结算共识，且执行途中被结算风险真实存在）。
+pub const IMMINENT_RESOLUTION_SKIP_MINS: i64 = 30;
+
 // ==================== 实盘资金标尺（美元） ====================
 /// 当 [`set_session_reference_capital_usd`] 尚未调用时（单测/工具），`arb_probe_caps` 回退用到的参考总资金。
 pub const DEFAULT_REFERENCE_CAPITAL_USD: f64 = 500.0;
@@ -85,8 +89,8 @@ pub const PAIR_CAP_FRAC_OF_CAPITAL: f64 = 0.03;
 /// 单腿探针名义占参考总盘子比例（PM 或 Kalshi 各一腿）。
 pub const PER_LEG_CAP_FRAC_OF_CAPITAL: f64 = 0.015;
 
-/// 单一套利对在整个会话内允许执行的最大套利轮次（每轮 = 一次 Kalshi 买入 + PM 对冲）。
-/// 超出此次数后即使仍有价差也跳过，防止在单一市场上重复堆仓（尤其应对作废风险）。
+/// 单一定向套利对（`pair_id`）累计允许的最大成功套利轮次（每轮约为一轮完整执行），由 `arb_rounds_store.json` 跨会话持久化。
+/// 达到上限后即使仍有价差也跳过，防止在单一市场上重复堆仓（尤其应对作废风险）。
 pub const MAX_PAIR_ARB_ROUNDS: u32 = 3;
 
 /// 缓冲资金比例：仅允许动用 (1 − 此值) × 可用余额 参与 Kalshi 侧收缩（与原先纸面「可用比例」语义一致，此处为 30% 缓冲 → 最多用 70%）。
@@ -276,8 +280,14 @@ pub fn kalshi_orderbook_debug_enabled() -> bool {
 // ==================== 实盘成交日志（JSON Lines，一行一条） ====================
 pub const DESK_EVENTS_JSONL: &str = "logs/desk_events.jsonl";
 
-/// 每套利对「永久套利轮次」计数文件（JSON，跨会话持久，用于 `MAX_PAIR_ARB_ROUNDS` 执行上限）。
+/// 每套利对套利轮次 + PM/Kalshi 两侧 `resolution_date`（RFC3339）记录；任一侧到期即从文件中剔除，避免 NBA 等同标不同场次撞 `pair_id`。
 pub const ARB_ROUNDS_STORE_PATH: &str = "logs/arb_rounds_store.json";
 
+/// Kalshi 第一腿成交后第二腿彻底失败（对冲与卖平均未完全成交）时，将裸仓信息追加写入此文件，便于手动核查。
+pub const NAKED_POSITIONS_JSONL: &str = "logs/naked_positions.jsonl";
+
 /// 价格追踪周期内并行校验的匹配对数量（固定值，不再通过环境变量调试）。
-pub const ARB_TRACK_CONCURRENCY: usize = 12;
+pub const ARB_TRACK_CONCURRENCY: usize = 40;
+
+/// 全量重匹配最小挂钟间隔（秒）。追踪周期 sleep 改为 2s 后，不能再用 tick 计数——改为直接测经过时间。
+pub const FULL_FETCH_INTERVAL_WALL_SECS: u64 = 90 * 60;

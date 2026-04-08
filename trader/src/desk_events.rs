@@ -1,5 +1,6 @@
 //! 实盘成交一行一条 JSON（`logs/desk_events.jsonl`），供 `portfolio-turnover` 等组合工具消费。
 //! 固定字段含 `time_utc_rfc3339`、`trading_session_utc_date`（YYYY-MM-DD）、`session_cycle_id`、`global_tick`、`status`、`pair_label` 等。
+//! `orders_*`：本回合**真正发出的委托**笔数（Kalshi 首腿买、窗末卖平、PM 第二腿 FOK 每次 post 各计 1）。
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -58,8 +59,13 @@ impl DeskEventsLog {
         ks_error: &str,
         kalshi_unwind_order_ids: &[String],
         status: &str,
+        polymarket_order_count: usize,
     ) -> Result<()> {
         let _g = self.lock.lock().expect("desk_events lock");
+        let orders_kalshi_buy = u64::from(!kalshi_order_id.is_empty());
+        let orders_kalshi_unwind_sell = kalshi_unwind_order_ids.len() as u64;
+        let orders_polymarket = polymarket_order_count as u64;
+        let orders_kalshi_total = orders_kalshi_buy + orders_kalshi_unwind_sell;
         let row = serde_json::json!({
             "time_utc_rfc3339": Utc::now().to_rfc3339(),
             "trading_session_utc_date": trading_session_utc_date.format("%Y-%m-%d").to_string(),
@@ -85,6 +91,10 @@ impl DeskEventsLog {
             "ks_error": ks_error,
             "kalshi_unwind_order_ids": kalshi_unwind_order_ids,
             "status": status,
+            "orders_kalshi_buy": orders_kalshi_buy,
+            "orders_kalshi_unwind_sell": orders_kalshi_unwind_sell,
+            "orders_kalshi_total": orders_kalshi_total,
+            "orders_polymarket": orders_polymarket,
         });
         let line = serde_json::to_string(&row).context("序列化 desk 事件")?;
         let mut f = OpenOptions::new()

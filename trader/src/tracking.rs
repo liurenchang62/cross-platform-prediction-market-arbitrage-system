@@ -1,21 +1,51 @@
 // src/tracking.rs
 use chrono::{DateTime, NaiveDate, Utc};
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use crate::market::Market;
 use crate::market_filter::{pair_settlement_dates_skew_exceeds, tracked_pair_exceeds_horizon};
-use crate::system_params::MAX_SETTLEMENT_DATE_SKEW_DAYS;
+use crate::system_params::{FULL_FETCH_INTERVAL_WALL_SECS, MAX_SETTLEMENT_DATE_SKEW_DAYS};
 
-/// 从磁盘加载套利轮次计数（pair_id → 已执行轮次）。文件不存在或解析失败时返回空 map。
-pub fn load_arb_rounds_store(path: &str) -> HashMap<String, u32> {
-    match std::fs::read_to_string(path) {
-        Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
-        Err(_) => HashMap::new(),
-    }
+/// 单条 `arb_rounds_store` 记录：以 `oriented_track_id`（pm_market_id + kalshi_ticker + 两侧方向）为唯一键，
+/// 仅记录累计成交轮次，供日志与调试使用。
+/// 键已含市场 ID，NBA 等不同场次（ticker 不同）天然隔离，无需按到期日清除。
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct ArbRoundsStoreEntry {
+    #[serde(default)]
+    pub rounds: u32,
 }
 
-/// 将套利轮次计数写入磁盘（JSON）。写失败时仅打印警告，不 panic。
-pub fn flush_arb_rounds_store(store: &HashMap<String, u32>, path: &str) {
+/// 从磁盘加载套利轮次 store。兼容旧格式 `{"pair_id": 3}`（纯数字）和新格式 `{"pair_id": {"rounds": 3}}`。
+/// 文件不存在或解析失败时返回空 map。
+pub fn load_arb_rounds_store(path: &str) -> HashMap<String, ArbRoundsStoreEntry> {
+    let Ok(s) = std::fs::read_to_string(path) else {
+        return HashMap::new();
+    };
+    let Ok(val) = serde_json::from_str::<serde_json::Value>(&s) else {
+        return HashMap::new();
+    };
+    let Some(obj) = val.as_object() else {
+        return HashMap::new();
+    };
+    let mut out: HashMap<String, ArbRoundsStoreEntry> = HashMap::new();
+    for (k, v) in obj {
+        let rounds = match v {
+            serde_json::Value::Number(n) => n.as_u64().unwrap_or(0) as u32,
+            serde_json::Value::Object(_) => {
+                serde_json::from_value::<ArbRoundsStoreEntry>(v.clone())
+                    .unwrap_or_default()
+                    .rounds
+            }
+            _ => continue,
+        };
+        out.insert(k.clone(), ArbRoundsStoreEntry { rounds });
+    }
+    out
+}
+
+/// 将 store 写入磁盘（JSON）。写失败时仅打印警告，不 panic。
+pub fn flush_arb_rounds_store(store: &HashMap<String, ArbRoundsStoreEntry>, path: &str) {
     if let Some(parent) = std::path::Path::new(path).parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -101,9 +131,13 @@ pub struct DeskCycleCtx {
 /// 监控状态
 pub struct MonitorState {
     pub tracked_pairs: Vec<TrackedArbitrage>,
-    /// 单调递增 tick，仅用于「每隔 N tick 做一次全量匹配」调度（**不**随 UTC 日切归零）。
+    /// 单调递增 tick，用于日志与会话周期序号（不再用于全量匹配调度）。
     pub global_tick: usize,
+    /// 废弃：仅保留以免 `MonitorState::new(FULL_FETCH_INTERVAL)` 调用处报错，实际不再用于调度。
     pub full_match_interval: usize,
+    /// 挂钟：上次完成全量匹配的时刻，用于 [`should_full_match`] 的 90 分钟判断。
+    /// 初始化为 `Instant::now()`；启动时初始全量匹配完成后须调用 [`mark_full_match_done`] 重置。
+    pub last_full_match_at: Instant,
     /// 最近一次全量拉取并过滤后的 PM 池大小（追踪周期沿用，供 CSV 参数列）
     pub last_pm_pool: usize,
     /// 最近一次全量拉取并过滤后的 Kalshi 池大小
@@ -112,8 +146,8 @@ pub struct MonitorState {
     pub trading_session_utc_date: NaiveDate,
     /// **仅在同一 `trading_session_utc_date` 内**可横向比较的周期序号；新 UTC 日归零后从 0 重新开始。
     pub session_cycle_seq: usize,
-    /// 跨会话永久套利轮次计数（pair_id → 已执行轮次），由 `arb_rounds_store.json` 持久化。
-    pub arb_rounds_store: HashMap<String, u32>,
+    /// 跨会话套利轮次 + 两侧到期时间（RFC3339），由 `arb_rounds_store.json` 持久化。
+    pub arb_rounds_store: HashMap<String, ArbRoundsStoreEntry>,
 }
 
 impl MonitorState {
@@ -123,6 +157,7 @@ impl MonitorState {
             tracked_pairs: Vec::new(),
             global_tick: 0,
             full_match_interval,
+            last_full_match_at: Instant::now(),
             last_pm_pool: 0,
             last_ks_pool: 0,
             trading_session_utc_date: d,
@@ -131,7 +166,13 @@ impl MonitorState {
         }
     }
 
-    /// 从磁盘加载永久套利轮次计数；应在程序启动、`MonitorState::new()` 后立即调用。
+    /// 每次全量匹配完成后调用，重置挂钟计时器。
+    pub fn mark_full_match_done(&mut self) {
+        self.last_full_match_at = Instant::now();
+    }
+
+    /// 从磁盘加载套利轮次 store。应在程序启动、`MonitorState::new()` 后立即调用。
+    /// 键为 `oriented_track_id`（含市场 ID），不再按到期日清除——不同游戏/场次 ticker 不同，不会碰撞。
     pub fn load_rounds_from_disk(&mut self, path: &str) {
         self.arb_rounds_store = load_arb_rounds_store(path);
         println!(
@@ -141,12 +182,32 @@ impl MonitorState {
         );
     }
 
+    /// 用于全量匹配前的上限判断：同时看持久化 store 与内存中的追踪列表。
+    /// 进程首轮全量匹配时 `tracked_pairs` 仍为空，若只读列表会忽略已恢复的计数。
+    pub fn arb_rounds_for_pair_id(&self, pair_id: &str) -> u32 {
+        let from_store = self
+            .arb_rounds_store
+            .get(pair_id)
+            .map(|e| e.rounds)
+            .unwrap_or(0);
+        let from_tracked = self
+            .tracked_pairs
+            .iter()
+            .find(|p| p.pair_id == pair_id)
+            .map(|p| p.arb_rounds_executed)
+            .unwrap_or(0);
+        from_store.max(from_tracked)
+    }
+
     /// 将 pair_id 对应的轮次 +1，同步到 `tracked_pairs`（若存在），并立即刷盘。
     /// 供**并发路径**或循环外调用（此时无借用冲突）。返回更新后的新轮次数。
     pub fn commit_pair_round(&mut self, pair_id: &str, store_path: &str) -> u32 {
-        let count = self.arb_rounds_store.entry(pair_id.to_string()).or_insert(0);
-        *count += 1;
-        let new_count = *count;
+        let e = self
+            .arb_rounds_store
+            .entry(pair_id.to_string())
+            .or_insert_with(ArbRoundsStoreEntry::default);
+        e.rounds += 1;
+        let new_count = e.rounds;
         if let Some(tp) = self.tracked_pairs.iter_mut().find(|p| p.pair_id == pair_id) {
             tp.arb_rounds_executed = new_count;
         }
@@ -161,13 +222,18 @@ impl MonitorState {
             return;
         }
         for (pid, count) in updates {
-            self.arb_rounds_store.insert(pid.clone(), *count);
+            self.arb_rounds_store
+                .entry(pid.clone())
+                .or_insert_with(ArbRoundsStoreEntry::default)
+                .rounds = *count;
         }
         flush_arb_rounds_store(&self.arb_rounds_store, store_path);
     }
 
+    /// 距上次全量匹配超过 `FULL_FETCH_INTERVAL_WALL_SECS` 秒时返回 `true`。
+    /// 不依赖 tick / sleep 间隔，当 sleep 从 30s 缩短为 2s 后仍保持 90 分钟重匹配节奏。
     pub fn should_full_match(&self) -> bool {
-        self.global_tick % self.full_match_interval == 0
+        self.last_full_match_at.elapsed() >= Duration::from_secs(FULL_FETCH_INTERVAL_WALL_SECS)
     }
 
     /// 每个「监控周期」迭代开始时调用：若已进入新 UTC 日，则开启新会话并将 `session_cycle_seq` 置 0。
@@ -208,7 +274,11 @@ impl MonitorState {
         // 添加新的匹配对，并从持久 store 同步历史轮次
         for (pm, kalshi, similarity, pm_side, kalshi_side, needs_inversion) in new_matches {
             let pair_id = oriented_track_id(&pm.market_id, &kalshi.market_id, &pm_side, &kalshi_side);
-            let stored_rounds = self.arb_rounds_store.get(&pair_id).copied().unwrap_or(0);
+            let stored_rounds = self
+                .arb_rounds_store
+                .get(&pair_id)
+                .map(|e| e.rounds)
+                .unwrap_or(0);
             if let Some(existing) = self.tracked_pairs.iter_mut().find(|p| p.pair_id == pair_id) {
                 existing.active = true;
                 existing.similarity = similarity;

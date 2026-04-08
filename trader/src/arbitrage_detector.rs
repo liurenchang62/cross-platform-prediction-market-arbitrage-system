@@ -47,6 +47,8 @@ pub struct ArbitrageOpportunity {
     pub roi_100_percent: f64,
     pub orderbook_pm_top5: Vec<(f64, f64)>,
     pub orderbook_kalshi_top5: Vec<(f64, f64)>,
+    /// 识别阶段拉取的 PM fee rate（bps），执行阶段直接复用，避免在两腿之间额外发起 HTTP 请求。
+    pub pm_fee_bps: u32,
 }
 
 #[derive(Clone)]
@@ -276,6 +278,15 @@ impl ArbitrageDetector {
             kalshi_avg = a2;
             capital_used = c_pm + c_ks;
         }
+
+        // PM CLOB 最低委托 $1.00：若按当前 n 和 pm_avg 估算的实际下单金额不足，此对无法执行 PM 对冲，直接跳过。
+        // 公式与 polymarket_trade::buy_outcome_token_fok_n 一致：spend = min(per_leg_cap, n×pm_avg×1.15)
+        // 这里 capital_usdt 即 per_leg_cap（调用方传入单腿上限）。
+        let pm_spend_est = (c_pm * 1.15_f64).min(capital_usdt);
+        if pm_spend_est < 1.0 {
+            return None;
+        }
+
         let gross = n * 1.0;
         let fee_pm = polymarket_taker_fee_usdc_round(n, pm_avg, cost.pm_fee_bps, cost.pm_exponent);
         let fee_ks = kalshi_taker_fee_usd_round_up(n, kalshi_avg, cost.ks_taker_fee_multiplier);
@@ -334,6 +345,7 @@ impl ArbitrageDetector {
             roi_100_percent: roi_100,
             orderbook_pm_top5,
             orderbook_kalshi_top5,
+            pm_fee_bps: 0, // 由 validate_arbitrage_core 在返回前填入
         })
     }
 
@@ -423,6 +435,7 @@ impl ArbitrageDetector {
             roi_100_percent: 0.0,
             orderbook_pm_top5: Vec::new(),
             orderbook_kalshi_top5: Vec::new(),
+            pm_fee_bps: 0,
         })
     }
 
@@ -504,6 +517,7 @@ impl ArbitrageDetector {
             roi_100_percent: 0.0,
             orderbook_pm_top5: Vec::new(),
             orderbook_kalshi_top5: Vec::new(),
+            pm_fee_bps: 0,
         })
     }
 
@@ -587,6 +601,7 @@ impl ArbitrageDetector {
                     roi_100_percent: 0.0,
                     orderbook_pm_top5: Vec::new(),
                     orderbook_kalshi_top5: Vec::new(),
+                    pm_fee_bps: 0,
                 });
             }
         }
@@ -634,6 +649,7 @@ impl ArbitrageDetector {
                     roi_100_percent: 0.0,
                     orderbook_pm_top5: Vec::new(),
                     orderbook_kalshi_top5: Vec::new(),
+                    pm_fee_bps: 0,
                 });
             }
         }

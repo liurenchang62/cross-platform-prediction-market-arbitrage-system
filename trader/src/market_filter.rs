@@ -5,7 +5,7 @@
 use chrono::{DateTime, Duration, Utc};
 
 use crate::market::Market;
-use crate::system_params::RESOLUTION_HORIZON_DAYS;
+use crate::system_params::{IMMINENT_RESOLUTION_SKIP_MINS, RESOLUTION_HORIZON_DAYS};
 
 /// 若市场有 `resolution_date`（同上解析标准）且该时间 **严格晚于** `now + horizon_days`，则剔除。
 pub fn filter_markets_by_resolution_horizon(
@@ -40,6 +40,15 @@ pub fn tracked_pair_exceeds_horizon(
         .map(|dt| dt > cutoff)
         .unwrap_or(false);
     pm_far || ks_far
+}
+
+/// 任一侧 `resolution_date` 在 `now + IMMINENT_RESOLUTION_SKIP_MINS` 之内则返回 `true`（即将结算，跳过）。
+/// 无 `resolution_date` 的市场不触发此过滤（视为不会很快结算）。
+pub fn pair_resolves_imminently(pm: &Market, ks: &Market, now: DateTime<Utc>) -> bool {
+    let cutoff = now + Duration::minutes(IMMINENT_RESOLUTION_SKIP_MINS);
+    let pm_soon = pm.resolution_date.map(|dt| dt <= cutoff).unwrap_or(false);
+    let ks_soon = ks.resolution_date.map(|dt| dt <= cutoff).unwrap_or(false);
+    pm_soon || ks_soon
 }
 
 /// 两侧均有到期时刻且 **严格宽于** `max_days`（整日等价：`abs(Δ秒) > max_days×86400`）时返回 `true`。`max_days ≤ 0` 视为不启用。
