@@ -279,3 +279,98 @@ pub const ARB_TRACK_CONCURRENCY: usize = 40;
 
 /// 全量重匹配最小挂钟间隔（秒）。追踪周期 sleep 改为 2s 后，不能再用 tick 计数——改为直接测经过时间。
 pub const FULL_FETCH_INTERVAL_WALL_SECS: u64 = 90 * 60;
+
+// ==================== env 文件加载（备用凭证来源） ====================
+/// 默认凭证文件路径（相对于工作目录）。
+pub const ENV_CREDENTIALS_PATH: &str = "env/credentials.env";
+
+/// 从 `env/credentials.env` 加载凭证到环境变量。
+///
+/// 规则：
+/// - `#` 开头或空行跳过
+/// - `KEY=VALUE` 格式解析（`=` 两侧不 trim，VALUE 可含 `=`）
+/// - 若 `KEY` 已在环境变量中存在（非空），**不覆盖**（系统/用户态注入优先）
+/// - 文件不存在时静默跳过（不报错）
+///
+/// 应在 `main()` 最开始、任何凭证读取之前调用。
+pub fn load_env_file_if_missing() {
+    load_env_file_from_path(ENV_CREDENTIALS_PATH);
+}
+
+/// 可测试的内部实现，接受任意路径。
+pub fn load_env_file_from_path(path: &str) {
+    let contents = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(_) => return, // 文件不存在或无权限：静默跳过
+    };
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some(eq) = line.find('=') {
+            let key = &line[..eq];
+            let value = &line[eq + 1..];
+            if key.is_empty() {
+                continue;
+            }
+            // 仅在环境变量未设置时注入
+            if std::env::var(key).map(|v| v.is_empty()).unwrap_or(true) {
+                // SAFETY: 单线程启动阶段调用，main() 最开始执行，无并发风险。
+                unsafe { std::env::set_var(key, value); }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod env_file_tests {
+    use super::*;
+
+    #[test]
+    fn parse_skips_comments_and_empty() {
+        // 写临时文件，不访问真实密钥
+        let dir = std::env::temp_dir();
+        let path = dir.join("test_creds_skip.env");
+        std::fs::write(&path, "# comment\n\nFOO_TEST_SKIP=bar\n").unwrap();
+        // 确保 key 不存在
+        unsafe { std::env::remove_var("FOO_TEST_SKIP"); }
+        load_env_file_from_path(path.to_str().unwrap());
+        assert_eq!(std::env::var("FOO_TEST_SKIP").unwrap(), "bar");
+        // cleanup
+        unsafe { std::env::remove_var("FOO_TEST_SKIP"); }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn existing_env_var_not_overwritten() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("test_creds_nooverwrite.env");
+        std::fs::write(&path, "FOO_TEST_NOOW=from_file\n").unwrap();
+        unsafe { std::env::set_var("FOO_TEST_NOOW", "from_env"); }
+        load_env_file_from_path(path.to_str().unwrap());
+        assert_eq!(std::env::var("FOO_TEST_NOOW").unwrap(), "from_env");
+        // cleanup
+        unsafe { std::env::remove_var("FOO_TEST_NOOW"); }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn missing_file_is_silently_ignored() {
+        // 应不 panic
+        load_env_file_from_path("/nonexistent/path/that/does/not/exist.env");
+    }
+
+    #[test]
+    fn value_with_equals_sign_preserved() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("test_creds_eq.env");
+        std::fs::write(&path, "FOO_TEST_EQ=val=ue\n").unwrap();
+        unsafe { std::env::remove_var("FOO_TEST_EQ"); }
+        load_env_file_from_path(path.to_str().unwrap());
+        assert_eq!(std::env::var("FOO_TEST_EQ").unwrap(), "val=ue");
+        // cleanup
+        unsafe { std::env::remove_var("FOO_TEST_EQ"); }
+        let _ = std::fs::remove_file(&path);
+    }
+}

@@ -60,7 +60,7 @@ use crate::system_params::{
     MAX_SETTLEMENT_DATE_SKEW_DAYS, SIMILARITY_THRESHOLD, STOP_LOSS_KALSHI_SELL_MIN_PRICE_CENTS,
     arb_probe_caps, kalshi_orderbook_debug_enabled, require_live_orders_allowed,
     set_live_arbitrage_orders_allowed,
-    POLYMARKET_SIGNATURE_TYPE_ENV,
+    POLYMARKET_SIGNATURE_TYPE_ENV, load_env_file_if_missing,
 };
 use crate::tracking_log::print_arbitrage_detection_books;
 use crate::session_risk::SessionRiskHandle;
@@ -384,6 +384,8 @@ impl TrackingArbDiag {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // 优先从 env/credentials.env 加载缺失的凭证（系统环境变量已设置则不覆盖）
+    load_env_file_if_missing();
     println!("🚀 跨平台套利监控");
     prompt_confirm_live()?;
     set_live_arbitrage_orders_allowed(true);

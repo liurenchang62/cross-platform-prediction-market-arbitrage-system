@@ -164,7 +164,7 @@ pub struct PolymarketClient {
 
 impl PolymarketClient {
     pub fn new() -> Self {
-        let http_client = portfolio_monitor::http_client_env::build_http_client(Duration::from_secs(10))
+        let http_client = portfolio_monitor::http_client_env::build_http_client(Duration::from_secs(30))
             .unwrap_or_else(|_| Client::new());
 
         Self { http_client }
@@ -423,7 +423,7 @@ impl KalshiClient {
 
     /// 自定义 Trade API 根 URL（须含 `/trade-api/v2`，无末尾 `/`）。
     pub fn new_with_base_url(base_url: impl AsRef<str>) -> Self {
-        let http_client = portfolio_monitor::http_client_env::build_http_client(Duration::from_secs(10))
+        let http_client = portfolio_monitor::http_client_env::build_http_client(Duration::from_secs(30))
             .unwrap_or_else(|_| Client::new());
 
         let base = base_url.as_ref().trim_end_matches('/').to_string();
