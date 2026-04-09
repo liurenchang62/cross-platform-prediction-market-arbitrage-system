@@ -28,6 +28,10 @@ path = "src/bin/turnover.rs"
 name = "portfolio-pm-redeem-diagnose"
 path = "src/bin/pm_redeem_diagnose.rs"
 
+[[bin]]
+name = "arb-reconcile"
+path = "src/bin/arb_reconcile.rs"
+
 [dependencies]
 anyhow = "1.0"
 tokio = { version = "1", features = ["full"] }

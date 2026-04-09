@@ -161,22 +161,39 @@ pub async fn print_live_pair_reconciliation(
     }
 
     // —— Polymarket ——
+    // BUY 订单：making=USDC支付，taking=token收到；SELL 订单：making=token卖出，taking=USDC收到。
+    // pm_buy_tokens  = 各 BUY 订单 taking_amount 之和（token）
+    // pm_sell_tokens = 各 SELL 订单 making_amount 之和（token）
+    // pm_shares_total = trade API 返回的成交量（可能延迟，仅供参考）
     let mut pm_shares_total = 0.0_f64;
     let mut pm_fee_sum = 0.0_f64;
-    let mut pm_take_sum = 0.0_f64;
+    let mut pm_buy_tokens = 0.0_f64;
+    let mut pm_sell_tokens = 0.0_f64;
+    let mut pm_buy_cost = 0.0_f64;
+    let mut pm_sell_usdc = 0.0_f64;
     if pm_posts.is_empty() {
         crate::trade_out!("     📘 Polymarket：（本窗口无成功 post_order 返回）");
     } else {
         for (i, post) in pm_posts.iter().enumerate() {
-            pm_take_sum += decimal_to_f64(&post.taking_amount);
+            let taking = decimal_to_f64(&post.taking_amount);
+            let making = decimal_to_f64(&post.making_amount);
+            // 用 side 字段区分 BUY/SELL，无 side 字段时按 making < taking 启发判断（BUY 时 making≈USDC < taking≈token）
+            let is_buy = making < taking || taking > 1.0;
+            if is_buy {
+                pm_buy_tokens += taking;
+                pm_buy_cost   += making;
+            } else {
+                pm_sell_tokens += making;
+                pm_sell_usdc   += taking;
+            }
             crate::trade_out!(
-                "     📘 Polymarket 第 {} 笔 orderID={} success={} status={:?} taking_amt={} making_amt={} trade_ids={}",
+                "     📘 PM 第 {} 笔 orderID={} success={} status={:?} making={} taking={} trade_ids={}",
                 i + 1,
                 post.order_id,
                 post.success,
                 post.status,
-                post.taking_amount,
                 post.making_amount,
+                post.taking_amount,
                 post.trade_ids.len()
             );
             match pm_trader.fetch_trades_for_post_order(pm_token_id, post).await {
@@ -200,20 +217,15 @@ pub async fn print_live_pair_reconciliation(
             }
         }
         crate::trade_out!(
-            "     📘 PM 合计：taking_amount 合≈{:.6} 成交量≈{:.4} 份 手续费(按 bps 估)≈${:.6}",
-            pm_take_sum, pm_shares_total, pm_fee_sum
+            "     📘 PM 合计：买入token≈{:.4} 支付USDC≈${:.4} | 卖出token≈{:.4} 回收USDC≈${:.4} | trade成交量≈{:.4} 份 手续费(估)≈${:.6}",
+            pm_buy_tokens, pm_buy_cost, pm_sell_tokens, pm_sell_usdc, pm_shares_total, pm_fee_sum
         );
     }
+    // 下方 OK 路径用 pm_buy_tokens 作为 pm_take_sum（BUY token 数），pm_buy_cost 作为成本
+    let pm_take_sum = pm_buy_tokens;
 
-    if matches!(
-        status,
-        "UNWIND_COMPARE" | "UNWIND_TIMEOUT" | "UNWIND_TIMEOUT_PARTIAL" | "UNWIND_TIMEOUT_FAIL"
-    ) {
-        let round = ks_buy_cash + ks_unwind_cash;
-        crate::trade_out!("     📌 **平仓摘要**：Kalshi 买+卖 fills 现金流(估)合计≈${:.4}（负为净支出）；PM 侧 taking 合≈${:.4}。", round, pm_take_sum);
-        crate::trade_out!("        若仅卖平未对冲 PM，盈亏主要在 Kalshi 价差；请与交易所对账。");
-    } else if status == "OK" || status == "PARTIAL_PM_PROGRESS" {
-        let matched = ks_buy_contracts.min(pm_shares_total);
+    if status == "OK" || status == "RECONCILE_KS" || status == "RECONCILE_PM" {
+        let matched = ks_buy_contracts.min(pm_take_sum);
         if matched > 1e-6 && pm_take_sum.is_finite() && ks_buy_cash.is_finite() {
             let payout = matched * 1.0;
             let cash_out_est = -ks_buy_cash + pm_take_sum;

@@ -421,8 +421,8 @@ pub async fn place_buy_ioc(
         anyhow::bail!("Kalshi 腿方向应为 YES/NO，当前: {}", kalshi_side_upper);
     }
 
-    let raw_cents = (opp.kalshi_avg_slipped * 100.0).ceil() as i64;
-    let price_cents = raw_cents.clamp(1, 99);
+    // 使用识别阶段计算的 worst-ask 限价（阶梯最差价位），保证能成交 n 份
+    let price_cents = opp.ks_limit_cents.clamp(1, 99);
 
     let max_by_leg_cap = if per_leg_cap_usd > 0.0 && price_cents > 0 {
         let leg_cents = (per_leg_cap_usd * 100.0).floor().max(1.0) as i64;

@@ -12,6 +12,25 @@ use chrono::{NaiveDate, Utc};
 
 use crate::system_params::DESK_EVENTS_JSONL;
 
+/// 执行层原始数据，用于 arb_reconcile 三时点对比（所有计算在 reconcile 工具中完成，不影响交易流程）。
+#[derive(Debug, Clone, Default)]
+pub struct ExecRaw {
+    /// Kalshi IOC 实际成交份数（整数）
+    pub ks_fill_count: i64,
+    /// Kalshi IOC 成交限价（美分），如 45 = $0.45/份；实际成交价 ≤ 此值（上界估算）
+    pub ks_fill_price_cents: i64,
+    /// PM FAK 实际收到的 token 数（= taking_amount，可为小数；buying YES/NO 时 taking 是 token）
+    pub pm_fill_tokens: f64,
+    /// PM FAK 实际支付的 USDC（= making_amount；buying YES/NO 时 making 是 USDC）
+    pub pm_cost_usdc: f64,
+    /// 识别阶段估算 ROI%（来自 ArbitrageOpportunity.roi_100_percent）
+    pub roi_model: f64,
+    /// PM 手续费率（bps），识别阶段拉取，用于 reconcile 计算费用构成
+    pub pm_fee_bps: u32,
+    /// Kalshi 手续费乘数，识别阶段查费率表，用于 reconcile 计算费用构成
+    pub ks_fee_multiplier: f64,
+}
+
 pub struct DeskEventsLog {
     lock: Mutex<()>,
 }
@@ -60,6 +79,7 @@ impl DeskEventsLog {
         kalshi_unwind_order_ids: &[String],
         status: &str,
         polymarket_order_count: usize,
+        exec: &ExecRaw,
     ) -> Result<()> {
         let _g = self.lock.lock().expect("desk_events lock");
         let orders_kalshi_buy = u64::from(!kalshi_order_id.is_empty());
@@ -95,6 +115,14 @@ impl DeskEventsLog {
             "orders_kalshi_unwind_sell": orders_kalshi_unwind_sell,
             "orders_kalshi_total": orders_kalshi_total,
             "orders_polymarket": orders_polymarket,
+            // ── 执行层原始数据（arb_reconcile 三时点对比用） ──
+            "ks_fill_count": exec.ks_fill_count,
+            "ks_fill_price_cents": exec.ks_fill_price_cents,
+            "pm_fill_tokens": exec.pm_fill_tokens,
+            "pm_cost_usdc": exec.pm_cost_usdc,
+            "roi_model": exec.roi_model,
+            "pm_fee_bps": exec.pm_fee_bps,
+            "ks_fee_multiplier": exec.ks_fee_multiplier,
         });
         let line = serde_json::to_string(&row).context("序列化 desk 事件")?;
         let mut f = OpenOptions::new()

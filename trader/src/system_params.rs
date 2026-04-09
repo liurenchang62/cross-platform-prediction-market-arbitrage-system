@@ -96,20 +96,8 @@ pub const MAX_PAIR_ARB_ROUNDS: u32 = 3;
 /// 缓冲资金比例：仅允许动用 (1 − 此值) × 可用余额 参与 Kalshi 侧收缩（与原先纸面「可用比例」语义一致，此处为 30% 缓冲 → 最多用 70%）。
 pub const KALSHI_BALANCE_DEPLOYABLE_FRAC: f64 = 0.70;
 
-// ==================== 第二腿（Kalshi 先成交后）：时间窗 / 卖平限价 ====================
-/// Kalshi 第一腿成交后，第二腿（PM 对冲 + 可选卖平）的最长决策时间（秒）。作为硬性外层保险，正常情况由 [`LIVE_PM_FOK_MAX_ATTEMPTS`] 先行退出。
-pub const LIVE_SECOND_LEG_DEADLINE_SECS: u64 = 15;
-
-/// 第二腿 PM FOK 单次循环内最大允许失败次数（含 BOOST 路径）。
-/// 达到此次数后立即 `break 'second_leg`，后续走卖平兜底。
-/// 设计上早于 [`LIVE_SECOND_LEG_DEADLINE_SECS`] 触发（每次约 300-500ms → 5 次 ≈ 1.5-2.5s）。
-pub const LIVE_PM_FOK_MAX_ATTEMPTS: u32 = 5;
-
-/// 仅在「簿上 Kalshi bid 总深度 ≥ 剩余份数」且「PM ask 总深度 ≥ 剩余份数」时，才比较对冲净利 H 与卖平净利 U。  
-/// 若 **H < U − pair_cap×本比例**，则选择卖平 Kalshi（IOC）。比例锚定每对名义上限 `pair_cap`（当前 **0.2%**）。
-pub const LIVE_HEDGE_VS_UNWIND_MARGIN_FRAC_OF_PAIR_CAP: f64 = 0.002;
-
-/// Kalshi IOC **卖出**（卖平剩余敞口）：最低可接受限价（美分/份）。`1` 表示尽量按可见 bid 撮合。
+// ==================== 卖平限价 ====================
+/// Kalshi IOC **卖出**（对账卖平敞口）：最低可接受限价（美分/份）。`1` 表示尽量按可见 bid 撮合。
 pub const STOP_LOSS_KALSHI_SELL_MIN_PRICE_CENTS: i64 = 1;
 
 // ==================== 费用模型：非交易摩擦（HTTP 主路径：极小 Gas 绝对值 + 按每对上限比例缓冲） ====================
@@ -124,7 +112,7 @@ pub const LIVE_ARBIT_SURPLUS_BUFFER_FRAC_OF_PAIR_CAP: f64 = 0.001;
 
 /// 可接受最小净利润比例（ROI 门槛）：识别与实盘共用；模型中 **净利 / 真实估算成本 > 本比例** 才通过。
 /// 与打印的 `roi_100_percent` 同语境（分母均为 capital_used）。例：`0.1` = 净利须超过实际部署资金的 **10%**。
-pub const LIVE_ARBIT_MIN_NET_PROFIT_FRAC_OF_PAIR_CAP: f64 = 0.15;
+pub const LIVE_ARBIT_MIN_NET_PROFIT_FRAC_OF_PAIR_CAP: f64 = 0.1;
 
 #[inline]
 pub fn live_arbit_surplus_buffer_usd(pair_cap_usdt: f64) -> f64 {

@@ -276,57 +276,49 @@ impl PolymarketClobTrader {
             .map(|s| s.with_chain_id(Some(POLYGON)))
     }
 
-    /// 第二腿：按目标份数 `n_contracts` 与当前 PM 侧加权均价 `pm_avg_slipped` 估 USDC 花费（含 15% 缓冲，与 smoke 一致），
-    /// 并满足 CLOB 市价买 ≥$1、2 位小数。
-    pub async fn buy_outcome_token_fok_n(
+    /// 第二腿（并行）：限价 FAK 买单，精确控制份数与最高可接受价格。
+    /// `limit_price` = 识别阶段 PM ask 阶梯的 worst-ask（`pm_limit_price`），保证在价格未恶化时能成交 `n` 份。
+    /// FAK（Fill-and-Kill）= IOC：在 ≤ limit_price 的档位尽量成交，剩余立即取消。
+    /// making_amount = 实际成交 token 数，taking_amount = 实际 USDC 花费（含手续费）。
+    pub async fn buy_outcome_token_limit_fak_n(
         &self,
         token_id: &str,
-        n_contracts: f64,
-        pm_avg_slipped: f64,
-        per_leg_cap_usd: f64,
+        n: i64,
+        limit_price: f64,
     ) -> Result<PostOrderResponse> {
-        require_live_orders_allowed().context("Polymarket buy_outcome_token_fok_n")?;
+        require_live_orders_allowed().context("Polymarket buy_outcome_token_limit_fak_n")?;
         let signer = self.local_signer()?;
 
-        let cap = per_leg_cap_usd.max(0.0);
-        let slip_cost = n_contracts * pm_avg_slipped * 1.15_f64;
-        let spend_usd = cap.min(slip_cost);
-        // 识别层（arbitrage_detector）应已过滤掉 PM 委托金额 < $1.00 的对；
-        // 此处硬拒绝而非静默 max($1) 超买，防止识别漏网时多买导致套利比例失衡。
-        if spend_usd < 1.0 {
+        let notional = n as f64 * limit_price;
+        if notional < 1.0 {
             anyhow::bail!(
-                "PM 委托金额估算 ${:.4} 低于平台最低 $1.00（n={:.2} 份 × avg=${:.4} × 1.15）；此对应在识别阶段被过滤",
-                spend_usd, n_contracts, pm_avg_slipped
+                "PM 委托名义金额 ${:.4}（{} 份 × ${:.4}）低于平台最低 $1.00",
+                notional, n, limit_price
             );
         }
-
-        let spend = Decimal::try_from(spend_usd)
-            .ok()
-            .context("Decimal::try_from spend_usd")?;
-        let spend = spend.round_dp(2);
-        if spend < Decimal::ONE {
-            anyhow::bail!(
-                "PM CLOB 最低委托 $1.00，舍入后金额 ${:.4}",
-                spend
-            );
-        }
-
-        let amount = Amount::usdc(spend).map_err(|e| anyhow::anyhow!("Amount::usdc: {}", e))?;
 
         let token_u256: U256 = token_id
             .parse()
             .map_err(|e| anyhow::anyhow!("token_id → U256: {}", e))?;
 
+        let price_dec = Decimal::try_from(limit_price)
+            .ok()
+            .context("limit_price → Decimal")?
+            .round_dp(2);
+
+        let size_dec = Decimal::from(n as u64);
+
         let order = self
             .client
-            .market_order()
+            .limit_order()
             .token_id(token_u256)
-            .amount(amount)
             .side(Side::Buy)
-            .order_type(OrderType::FOK)
+            .price(price_dec)
+            .size(size_dec)
+            .order_type(OrderType::FAK)
             .build()
             .await
-            .map_err(|e| anyhow::anyhow!("build market_order: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("build limit_order (buy): {}", e))?;
 
         let signed = self
             .client
@@ -337,6 +329,46 @@ impl PolymarketClobTrader {
         self.client
             .post_order(signed)
             .await
-            .map_err(|e| anyhow::anyhow!("post_order: {}", e))
+            .map_err(|e| anyhow::anyhow!("post_order (buy limit): {}", e))
+    }
+
+    /// 事后对账：FAK 市价卖出多余的 outcome token。
+    /// SELL 语义：making_amount = 卖出的 token 数；taking_amount = 收到的 USDC（与 BUY 方向相反）。
+    pub async fn sell_outcome_token_fak(
+        &self,
+        token_id: &str,
+        n: i64,
+    ) -> Result<PostOrderResponse> {
+        require_live_orders_allowed().context("Polymarket sell_outcome_token_fak")?;
+        let signer = self.local_signer()?;
+
+        let token_u256: U256 = token_id
+            .parse()
+            .map_err(|e| anyhow::anyhow!("token_id → U256: {}", e))?;
+
+        let size_dec = Decimal::from(n as u64);
+        let amount = Amount::shares(size_dec).map_err(|e| anyhow::anyhow!("Amount::shares: {}", e))?;
+
+        let order = self
+            .client
+            .market_order()
+            .token_id(token_u256)
+            .amount(amount)
+            .side(Side::Sell)
+            .order_type(OrderType::FAK)
+            .build()
+            .await
+            .map_err(|e| anyhow::anyhow!("build market_order (sell): {}", e))?;
+
+        let signed = self
+            .client
+            .sign(&signer, order)
+            .await
+            .map_err(|e| anyhow::anyhow!("sign: {}", e))?;
+
+        self.client
+            .post_order(signed)
+            .await
+            .map_err(|e| anyhow::anyhow!("post_order (sell): {}", e))
     }
 }

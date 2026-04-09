@@ -3,6 +3,7 @@
 #[path = "../../trader/src/system_params.rs"]
 mod system_params;
 
+pub mod arb_reconcile;
 pub mod cashflow;
 pub mod http_client_env;
 pub mod gamma;

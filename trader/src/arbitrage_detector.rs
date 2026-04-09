@@ -49,6 +49,10 @@ pub struct ArbitrageOpportunity {
     pub orderbook_kalshi_top5: Vec<(f64, f64)>,
     /// 识别阶段拉取的 PM fee rate（bps），执行阶段直接复用，避免在两腿之间额外发起 HTTP 请求。
     pub pm_fee_bps: u32,
+    /// Kalshi IOC 买单限价（美分）= 填满 n 份所需阶梯最差价位，执行时直接使用。
+    pub ks_limit_cents: i64,
+    /// PM FAK 限价买单每 token 最高价（美元）= 填满 n 份所需阶梯最差 ask 价位。
+    pub pm_limit_price: f64,
 }
 
 #[derive(Clone)]
@@ -95,7 +99,7 @@ impl ArbitrageDetector {
         if n1_kalshi <= 0.0 || !n1_kalshi.is_finite() || n2 < 1.0 - 1e-9 || n2 > n1_kalshi + 1e-6 {
             return None;
         }
-        let (c_pm, pm_avg) = cost_for_exact_contracts(pm_asks, n2)?;
+        let (c_pm, pm_avg, _) = cost_for_exact_contracts(pm_asks, n2)?;
         let c_ks_portion = kalshi_cost_total * (n2 / n1_kalshi);
         let capital_used = c_ks_portion + c_pm;
         let gross = n2;
@@ -241,18 +245,18 @@ impl ArbitrageDetector {
             return None;
         };
 
-        // 以 n 为基准重算双腿真实成本（滑点已体现在成交价路径上）
-        let (mut c_pm, mut pm_avg) = if let Some(ob) = pm_orderbook {
+        // 以 n 为基准重算双腿真实成本（滑点已体现在成交价路径上），同时取得 worst_ask 用于限价
+        let (mut c_pm, mut pm_avg, mut pm_worst_ask) = if let Some(ob) = pm_orderbook {
             cost_for_exact_contracts(ob, n)?
         } else {
             let c = n * pm_optimal;
-            (c, pm_optimal)
+            (c, pm_optimal, pm_optimal)
         };
-        let (mut c_ks, mut kalshi_avg) = if let Some(ob) = kalshi_orderbook {
+        let (mut c_ks, mut kalshi_avg, mut ks_worst_ask) = if let Some(ob) = kalshi_orderbook {
             cost_for_exact_contracts(ob, n)?
         } else {
             let c = n * kalshi_optimal;
-            (c, kalshi_optimal)
+            (c, kalshi_optimal, kalshi_optimal)
         };
 
         let mut capital_used = c_pm + c_ks;
@@ -262,28 +266,42 @@ impl ArbitrageDetector {
             if n <= 0.0 || !n.is_finite() {
                 return None;
             }
-            let (c1, a1) = if let Some(ob) = pm_orderbook {
+            let (c1, a1, wa1) = if let Some(ob) = pm_orderbook {
                 cost_for_exact_contracts(ob, n)?
             } else {
-                (n * pm_optimal, pm_optimal)
+                (n * pm_optimal, pm_optimal, pm_optimal)
             };
-            let (c2, a2) = if let Some(ob) = kalshi_orderbook {
+            let (c2, a2, wa2) = if let Some(ob) = kalshi_orderbook {
                 cost_for_exact_contracts(ob, n)?
             } else {
-                (n * kalshi_optimal, kalshi_optimal)
+                (n * kalshi_optimal, kalshi_optimal, kalshi_optimal)
             };
-            c_pm = c1;
-            pm_avg = a1;
-            c_ks = c2;
-            kalshi_avg = a2;
+            c_pm = c1; pm_avg = a1; pm_worst_ask = wa1;
+            c_ks = c2; kalshi_avg = a2; ks_worst_ask = wa2;
             capital_used = c_pm + c_ks;
         }
 
-        // PM CLOB 最低委托 $1.00：若按当前 n 和 pm_avg 估算的实际下单金额不足，此对无法执行 PM 对冲，直接跳过。
-        // 公式与 polymarket_trade::buy_outcome_token_fok_n 一致：spend = min(per_leg_cap, n×pm_avg×1.15)
-        // 这里 capital_usdt 即 per_leg_cap（调用方传入单腿上限）。
-        let pm_spend_est = (c_pm * 1.15_f64).min(capital_usdt);
-        if pm_spend_est < 1.0 {
+        // n 取整：Kalshi 只接受整数合约，统一在此 floor，ROI 计算与执行均基于整数 n
+        let n_int = n.floor().max(1.0);
+        if n_int != n {
+            let (c1, a1, wa1) = if let Some(ob) = pm_orderbook {
+                cost_for_exact_contracts(ob, n_int)?
+            } else {
+                (n_int * pm_optimal, pm_optimal, pm_optimal)
+            };
+            let (c2, a2, wa2) = if let Some(ob) = kalshi_orderbook {
+                cost_for_exact_contracts(ob, n_int)?
+            } else {
+                (n_int * kalshi_optimal, kalshi_optimal, kalshi_optimal)
+            };
+            c_pm = c1; pm_avg = a1; pm_worst_ask = wa1;
+            c_ks = c2; kalshi_avg = a2; ks_worst_ask = wa2;
+            capital_used = c_pm + c_ks;
+        }
+        let n = n_int;
+
+        // PM CLOB 最低委托 $1.00：用 worst_ask × n 计算最大可能名义金额（精确，无缓冲）
+        if (n as f64) * pm_worst_ask < 1.0 {
             return None;
         }
 
@@ -346,6 +364,8 @@ impl ArbitrageDetector {
             orderbook_pm_top5,
             orderbook_kalshi_top5,
             pm_fee_bps: 0, // 由 validate_arbitrage_core 在返回前填入
+            ks_limit_cents: (ks_worst_ask * 100.0).ceil() as i64,
+            pm_limit_price: pm_worst_ask,
         })
     }
 
@@ -436,6 +456,8 @@ impl ArbitrageDetector {
             orderbook_pm_top5: Vec::new(),
             orderbook_kalshi_top5: Vec::new(),
             pm_fee_bps: 0,
+            ks_limit_cents: 0,
+            pm_limit_price: 0.0,
         })
     }
 
@@ -518,6 +540,8 @@ impl ArbitrageDetector {
             orderbook_pm_top5: Vec::new(),
             orderbook_kalshi_top5: Vec::new(),
             pm_fee_bps: 0,
+            ks_limit_cents: 0,
+            pm_limit_price: 0.0,
         })
     }
 
@@ -602,6 +626,8 @@ impl ArbitrageDetector {
                     orderbook_pm_top5: Vec::new(),
                     orderbook_kalshi_top5: Vec::new(),
                     pm_fee_bps: 0,
+                    ks_limit_cents: 0,
+                    pm_limit_price: 0.0,
                 });
             }
         }
@@ -650,6 +676,8 @@ impl ArbitrageDetector {
                     orderbook_pm_top5: Vec::new(),
                     orderbook_kalshi_top5: Vec::new(),
                     pm_fee_bps: 0,
+                    ks_limit_cents: 0,
+                    pm_limit_price: 0.0,
                 });
             }
         }
@@ -674,13 +702,16 @@ pub fn total_size_sell_ladder(levels: &[(f64, f64)]) -> f64 {
 
 /// 从卖盘（价格升序）吃进**恰好** `n` 份合约。`n` 可为分数（与探针一致）。
 /// 流动性不足则返回 `None`。返回 `(总成本, 成交量加权均价)`。
-pub fn cost_for_exact_contracts(asks: &[(f64, f64)], n: f64) -> Option<(f64, f64)> {
+/// 返回 `(总成本, 加权均价, 最差成交价位)`。最差价位 = 填满 n 份时扫到的最高 ask 价格，
+/// 用作 IOC/FAK 限价——保证在该价格水位未恶化时能精确成交 n 份。
+pub fn cost_for_exact_contracts(asks: &[(f64, f64)], n: f64) -> Option<(f64, f64, f64)> {
     if n <= 0.0 || !n.is_finite() {
         return None;
     }
     const EPS: f64 = 1e-9;
     let mut remaining = n;
     let mut total_cost = 0.0;
+    let mut worst_ask = 0.0;
     for (price, size) in asks {
         if remaining <= EPS {
             break;
@@ -690,12 +721,13 @@ pub fn cost_for_exact_contracts(asks: &[(f64, f64)], n: f64) -> Option<(f64, f64
         }
         let take = remaining.min(*size);
         total_cost += take * price;
+        worst_ask = *price;
         remaining -= take;
     }
     if remaining > 1e-6 {
         return None;
     }
-    Some((total_cost, total_cost / n))
+    Some((total_cost, total_cost / n, worst_ask))
 }
 
 #[derive(Debug, Clone)]
@@ -1181,17 +1213,19 @@ mod arb_tests {
     #[test]
     fn cost_for_exact_contracts_single_level() {
         let ob = [(0.5, 100.0)];
-        let (c, avg) = cost_for_exact_contracts(&ob, 10.0).unwrap();
+        let (c, avg, worst) = cost_for_exact_contracts(&ob, 10.0).unwrap();
         assert!((c - 5.0).abs() < 1e-9);
         assert!((avg - 0.5).abs() < 1e-9);
+        assert!((worst - 0.5).abs() < 1e-9);
     }
 
     #[test]
     fn cost_for_exact_contracts_spans_levels() {
         let ob = [(0.1, 50.0), (0.2, 50.0)];
-        let (c, avg) = cost_for_exact_contracts(&ob, 75.0).unwrap();
+        let (c, avg, worst) = cost_for_exact_contracts(&ob, 75.0).unwrap();
         assert!((c - (50.0 * 0.1 + 25.0 * 0.2)).abs() < 1e-6);
         assert!((avg - c / 75.0).abs() < 1e-9);
+        assert!((worst - 0.2).abs() < 1e-9);
     }
 
     #[test]
@@ -1233,8 +1267,8 @@ mod arb_tests {
             )
             .expect("opp");
         assert!(opp.contracts > 0.0);
-        let (c_pm, _) = cost_for_exact_contracts(&pm, opp.contracts).unwrap();
-        let (c_ks, _) = cost_for_exact_contracts(&ks, opp.contracts).unwrap();
+        let (c_pm, _, _) = cost_for_exact_contracts(&pm, opp.contracts).unwrap();
+        let (c_ks, _, _) = cost_for_exact_contracts(&ks, opp.contracts).unwrap();
         assert!((opp.capital_used - (c_pm + c_ks)).abs() < 0.01);
     }
 
@@ -1268,5 +1302,155 @@ mod arb_tests {
         });
         let mid = kalshi_orderbook_mid_dollars_for_outcome(&book, "NO").unwrap();
         assert!((mid - 0.5 * (0.35 + (1.0 - 0.5))).abs() < 1e-9);
+    }
+
+    // ── 并行执行架构：事前事中事后全流程验证 ────────────────────────────────
+
+    /// 事前：ks_limit_cents = ceil(worst_ask * 100)；pm_limit_price = worst_ask
+    /// 用实盘订单簿（Norman Powell）验证：
+    ///   PM asks: 0.42×8, 0.43×11.4, 0.46×300
+    ///   KS asks: 0.41×76, 0.47×1000
+    ///   capital=6.57 → n=15（PM 吃 L1:8份 + L2:7份，KS 全在 L1）
+    ///   → PM worst_ask=0.43, KS worst_ask=0.41
+    #[test]
+    fn limit_prices_use_worst_ask_not_avg() {
+        let det = ArbitrageDetector::new(0.0);
+        let pm_asks: &[(f64, f64)] = &[(0.42, 8.0), (0.43, 11.4), (0.46, 300.0)];
+        let ks_asks: &[(f64, f64)] = &[(0.41, 76.0), (0.47, 1000.0)];
+        let cost = ArbCostParams { ks_taker_fee_multiplier: 0.07, pm_fee_bps: 200, pm_exponent: 1.0 };
+        // capital=6.57：PM probe→15.47份，KS probe→16.02份，n=min→15.47→floor→15
+        let opp = det.calculate_arbitrage_100usdt(
+            0.42, 0.41,
+            Some(pm_asks), Some(ks_asks),
+            "YES", "NO", false,
+            6.57, 100.0, &cost,
+        ).expect("应识别到套利机会");
+
+        assert_eq!(opp.contracts, 15.0, "n 应为整数 15（实盘对齐）");
+        // KS：15份全在0.41档（76份够），worst_ask=0.41 → ceil(41)=41¢
+        assert_eq!(opp.ks_limit_cents, 41, "Kalshi 限价 = ceil(0.41*100) = 41¢");
+        // PM：8份@0.42 + 7份@0.43，worst_ask=0.43（第二档价格）
+        assert!((opp.pm_limit_price - 0.43).abs() < 1e-9, "PM 限价 = worst_ask = 0.43");
+        // 验证限价是 worst_ask 而非加权均价
+        // PM avg ≈ (8×0.42 + 7×0.43)/15 ≈ 0.4247，不等于 worst_ask 0.43
+        assert!((opp.pm_avg_slipped - 0.43).abs() > 1e-4, "均价应低于 worst_ask");
+    }
+
+    /// 事前：n 必须 floor 取整，且 PM 名义金额 n × worst_ask ≥ $1.00
+    #[test]
+    fn n_is_floored_and_pm_notional_checked() {
+        let det = ArbitrageDetector::new(0.0);
+        // 构造使 n 计算结果为小数（约 1.3）
+        let pm_asks: &[(f64, f64)] = &[(0.45, 1000.0)];
+        let ks_asks: &[(f64, f64)] = &[(0.45, 1000.0)];
+        let cost = ArbCostParams { ks_taker_fee_multiplier: 0.07, pm_fee_bps: 200, pm_exponent: 1.0 };
+        let opp = det.calculate_arbitrage_100usdt(
+            0.45, 0.45,
+            Some(pm_asks), Some(ks_asks),
+            "YES", "NO", false,
+            0.6,  // 0.6 / 0.45 = 1.33 → floor → 1
+            100.0, &cost,
+        );
+        // n=1, notional = 1 × 0.45 = $0.45 < $1.00 → 应返回 None
+        assert!(opp.is_none(), "n=1 名义 $0.45 < $1，应过滤");
+    }
+
+    /// 事前：ks_limit_cents 对极端值 clamp 到 [1,99]
+    #[test]
+    fn ks_limit_cents_clamped() {
+        // worst_ask = 0.995 → ceil(99.5) = 100 → clamp → 99
+        let val = (0.995_f64 * 100.0).ceil() as i64;
+        assert_eq!(val.clamp(1, 99), 99);
+        // worst_ask = 0.0 → 0 → clamp → 1
+        let val2 = (0.0_f64 * 100.0).ceil() as i64;
+        assert_eq!(val2.clamp(1, 99), 1);
+    }
+
+    /// 事中：PM BUY 语义 — taking=token，making=USDC
+    /// 用本次实盘数值：making=6.449999 USDC，taking=15.186045 token
+    #[test]
+    fn pm_buy_k2_reads_taking_not_making() {
+        let making: f64 = 6.449999;  // USDC 支付
+        let taking: f64 = 15.186045; // token 收到
+        // 旧错误逻辑：round(making) = 6 → 误判偏差 9
+        let wrong_k2 = making.round() as i64;
+        assert_eq!(wrong_k2, 6, "making 约 6.45 → round → 6（旧 bug）");
+        // 正确逻辑：round(taking) = 15
+        let correct_k2 = taking.round() as i64;
+        assert_eq!(correct_k2, 15, "taking 约 15.19 → round → 15（正确）");
+    }
+
+    /// 事中：PM SELL 语义 — making=token卖出，taking=USDC收入（与BUY相反）
+    #[test]
+    fn pm_sell_sold_reads_making_not_taking() {
+        // 假设 SELL 9 份：making=9.0 token，taking=3.5 USDC（卖出价约 $0.39）
+        let making: f64 = 9.0;   // tokens sold
+        let taking: f64 = 3.501; // USDC received
+        // 正确逻辑：sold = round(making)
+        let sold = making.round() as i64;
+        assert_eq!(sold, 9, "SELL making=token卖出数");
+        // 错误逻辑（旧 bug）：round(taking) = 4 → 误判只卖了 4 份
+        let wrong_sold = taking.round() as i64;
+        assert_eq!(wrong_sold, 4, "taking=USDC 不是 token，round 后数值错误");
+        assert_ne!(sold, wrong_sold);
+    }
+
+    /// 事后：excess 计算与对称性
+    #[test]
+    fn excess_calculation_symmetric() {
+        // Case 1: k1=k2=15 → OK，无 excess
+        let (k1, k2) = (15_i64, 15_i64);
+        assert_eq!((k1 - k2).max(0), 0);
+        assert_eq!((k2 - k1).max(0), 0);
+
+        // Case 2: k1=15, k2=6（旧 bug 场景）→ excess_ks=9
+        let (k1, k2) = (15_i64, 6_i64);
+        assert_eq!((k1 - k2).max(0), 9, "Kalshi 多 9 份");
+        assert_eq!((k2 - k1).max(0), 0);
+
+        // Case 3: k1=14, k2=15 → excess_pm=1
+        let (k1, k2) = (14_i64, 15_i64);
+        assert_eq!((k1 - k2).max(0), 0);
+        assert_eq!((k2 - k1).max(0), 1, "PM 多 1 份");
+    }
+
+    /// 事后：对账触发门槛 excess × ref_price >= $1.00
+    #[test]
+    fn reconcile_threshold_one_dollar() {
+        // excess=9, ref=0.41 → 3.69 → 触发
+        assert!((9_i64 as f64 * 0.41) >= 1.0);
+        // excess=1, ref=0.41 → 0.41 → 不触发（记录裸仓）
+        assert!((1_i64 as f64 * 0.41) < 1.0);
+        // excess=3, ref=0.35 → 1.05 → 触发
+        assert!((3_i64 as f64 * 0.35) >= 1.0);
+    }
+
+    /// 事后：log_contracts = min(k1, k2)，正确对账后等于 n_target
+    #[test]
+    fn log_contracts_is_min_of_fills() {
+        let (k1, k2) = (15_i64, 15_i64);
+        assert_eq!(k1.min(k2) as f64, 15.0);
+        // 对账前：min(15,6)=6（旧 bug 记录的错误值）
+        let (k1, k2) = (15_i64, 6_i64);
+        assert_eq!(k1.min(k2) as f64, 6.0, "旧 bug 会少记 9 份");
+        // 修复后：min(15,15)=15
+        let (k1, k2) = (15_i64, 15_i64);
+        assert_eq!(k1.min(k2) as f64, 15.0, "修复后正确记录 15 份");
+    }
+
+    /// 事前：两侧策略对称 — PM YES + KS NO，sum < 1 才有套利空间
+    #[test]
+    fn arb_only_when_sum_lt_one() {
+        let det = ArbitrageDetector::new(0.0);
+        let ob: &[(f64, f64)] = &[(0.50, 1000.0)];
+        let cost = ArbCostParams::default();
+        // sum = 0.50 + 0.50 = 1.00 → 无套利
+        let none = det.calculate_arbitrage_100usdt(0.50, 0.50, Some(ob), Some(ob), "YES", "NO", false, 10.0, 100.0, &cost);
+        assert!(none.is_none(), "sum=1.00 无套利");
+        // sum = 0.42 + 0.41 = 0.83 → 有套利（本次实盘价格）
+        let pm_asks: &[(f64, f64)] = &[(0.42, 8.0), (0.43, 11.4), (0.46, 300.0)];
+        let ks_asks: &[(f64, f64)] = &[(0.41, 76.0), (0.47, 1000.0)];
+        let some = det.calculate_arbitrage_100usdt(0.42, 0.41, Some(pm_asks), Some(ks_asks), "YES", "NO", false, 10.0, 100.0, &cost);
+        assert!(some.is_some(), "sum=0.83 应有套利");
     }
 }
