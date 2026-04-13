@@ -60,7 +60,7 @@ pub const MAX_SETTLEMENT_DATE_SKEW_DAYS: i64 = 3;
 
 /// 任一侧 `resolution_date` 距 now 不足此分钟数的市场对直接跳过，不检测、不下单。
 /// 防止在即将结算的市场上执行套利（价格已反映结算共识，且执行途中被结算风险真实存在）。
-pub const IMMINENT_RESOLUTION_SKIP_MINS: i64 = 30;
+pub const IMMINENT_RESOLUTION_SKIP_MINS: i64 = 10;
 
 // ==================== 实盘资金标尺（美元） ====================
 /// 当 [`set_session_reference_capital_usd`] 尚未调用时（单测/工具），`arb_probe_caps` 回退用到的参考总资金。
@@ -254,6 +254,10 @@ fn extract_hex_private_key_line(text: &str) -> Result<String> {
     Ok(raw.to_string())
 }
 
+// ==================== 实盘开关 ====================
+/// `true` = 正常下单实盘交易；`false` = 仅追踪监控，检测到机会时打印但**不下单**。
+pub const LIVE_TRADING_ON: bool = true;
+
 // ==================== 调试（环境变量） ====================
 /// 为 `true` 时，追踪周期结束额外打印 Kalshi 订单簿拉取细分与阶梯失败抽样（不致刷屏，每类最多数条）。
 /// PowerShell: `$env:KALSHI_ORDERBOOK_DEBUG="1"`
@@ -276,6 +280,10 @@ pub const NAKED_POSITIONS_JSONL: &str = "logs/naked_positions.jsonl";
 
 /// 价格追踪周期内并行校验的匹配对数量（固定值，不再通过环境变量调试）。
 pub const ARB_TRACK_CONCURRENCY: usize = 40;
+
+/// Kalshi 订单簿拉取速率上限（每秒最多发出的请求数）。
+/// Kalshi REST API 约为 10 req/s；保守设 8 防触发 429。
+pub const KALSHI_OB_RATE_LIMIT_PER_SEC: usize = 8;
 
 /// 全量重匹配最小挂钟间隔（秒）。追踪周期 sleep 改为 2s 后，不能再用 tick 计数——改为直接测经过时间。
 pub const FULL_FETCH_INTERVAL_WALL_SECS: u64 = 90 * 60;

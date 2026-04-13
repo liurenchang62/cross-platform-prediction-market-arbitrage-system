@@ -8,7 +8,7 @@ use crate::system_params::{
 };
 use crate::category_vectorizer::{CategoryVectorizer, CategoryVectorizerManager};
 use crate::text_vectorizer::{TextVectorizer, VectorizerConfig};
-use crate::validation::{second_screen_try_match, ValidationPipeline};
+use crate::validation::{second_screen_try_match_with_reason, ValidationPipeline};
 use rayon::prelude::*;
 use tokio::task;
 
@@ -564,36 +564,56 @@ impl MarketMatcher {
             .collect();
         merged.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
         let merged_len = merged.len();
-        let mut second_screen_outcomes: Vec<(usize, Option<Option<crate::validation::MatchInfo>>)> =
+
+        // 二筛：并行执行，同时收集被拒绝对的诊断原因（每对都执行一次带原因版）
+        let mut second_screen_outcomes: Vec<(usize, Option<Option<crate::validation::MatchInfo>>, Option<String>)> =
             (0..merged_len)
                 .into_par_iter()
                 .map(|k| {
                     let (pm_id, ks_id, sim, cat) = &merged[k];
                     let Some(pm_arc) = polymarket_cache.get(pm_id.as_str()) else {
-                        return (k, None);
+                        return (k, None, None);
                     };
                     let Some(ks_arc) = kalshi_cache.get(ks_id.as_str()) else {
-                        return (k, None);
+                        return (k, None, None);
                     };
-                    let mi = second_screen_try_match(
+                    let mut reason: Option<String> = Some(String::new()); // 触发原因记录
+                    let mi = crate::validation::second_screen_try_match_with_reason(
                         pm_arc.title.as_str(),
                         ks_arc.title.as_str(),
                         *sim,
                         cat.as_str(),
+                        &mut reason,
                     );
-                    (k, Some(mi))
+                    (k, Some(mi), reason)
                 })
                 .collect();
-        second_screen_outcomes.sort_by_key(|(idx, _)| *idx);
+        second_screen_outcomes.sort_by_key(|(idx, _, _)| *idx);
+
+        // 收集被拒绝样本（按原因分组，每组最多 3 个样本）
+        let mut reject_by_reason: std::collections::BTreeMap<String, Vec<(String, String, f64)>> =
+            std::collections::BTreeMap::new();
 
         let mut seen_accepted: HashSet<(String, String)> = HashSet::new();
         for k in 0..merged_len {
             let (pm_id, ks_id, sim, _cat) = &merged[k];
-            let (_, outcome) = &second_screen_outcomes[k];
+            let (_, outcome, reason) = &second_screen_outcomes[k];
             match outcome {
                 None => {}
                 Some(None) => {
                     validation_pipeline.filtered_count += 1;
+                    // 记录拒绝原因样本
+                    if let (Some(r), Some(pm_arc), Some(ks_arc)) = (
+                        reason.as_ref(),
+                        polymarket_cache.get(pm_id.as_str()),
+                        kalshi_cache.get(ks_id.as_str()),
+                    ) {
+                        let key = r.clone();
+                        let entry = reject_by_reason.entry(key).or_default();
+                        if entry.len() < 3 {
+                            entry.push((pm_arc.title.clone(), ks_arc.title.clone(), *sim));
+                        }
+                    }
                 }
                 Some(Some(match_info)) => {
                     let key = (pm_id.clone(), ks_id.clone());
@@ -623,6 +643,14 @@ impl MarketMatcher {
                             match_info.kalshi_side.clone(),
                             match_info.needs_inversion,
                         ));
+                    } else {
+                        // 二筛通过但 confidence 不够
+                        let entry = reject_by_reason
+                            .entry(format!("LowConfidence({:.3}<{:.3})", confidence.overall_score, config.similarity_threshold))
+                            .or_default();
+                        if entry.len() < 3 {
+                            entry.push((pm_arc.title.clone(), ks_arc.title.clone(), confidence.overall_score));
+                        }
                     }
                 }
             }
@@ -641,6 +669,39 @@ impl MarketMatcher {
             n_unique_pairs,
             all_matches.len()
         );
+
+        // 打印二筛拒绝原因摘要（按出现次数降序，每种原因展示 ≤2 个样本）
+        if !reject_by_reason.is_empty() {
+            // 用完整计数：重新扫一次（样本最多3个，但计数要准确）
+            let mut reason_counts: std::collections::BTreeMap<String, usize> =
+                std::collections::BTreeMap::new();
+            for (_, outcome, reason) in &second_screen_outcomes {
+                if matches!(outcome, Some(None)) {
+                    if let Some(r) = reason.as_ref() {
+                        *reason_counts.entry(r.clone()).or_default() += 1;
+                    }
+                }
+            }
+            // 加 LowConfidence
+            for (reason, samples) in &reject_by_reason {
+                if reason.starts_with("LowConfidence") {
+                    reason_counts.entry(reason.clone()).or_insert(samples.len());
+                }
+            }
+            let mut sorted_reasons: Vec<_> = reason_counts.iter().collect();
+            sorted_reasons.sort_by(|a, b| b.1.cmp(a.1));
+            println!("\n   🔎 二筛拒绝原因摘要（{} 种，共 {} 对被拒）：",
+                sorted_reasons.len(), validation_pipeline.filtered_count);
+            for (reason, count) in sorted_reasons.iter().take(15) {
+                println!("      [{:>3}对] {}", count, reason);
+                if let Some(samples) = reject_by_reason.get(*reason) {
+                    for (pm, ks, sim) in samples.iter().take(2) {
+                        println!("             sim={:.3} PM:「{}」", sim, pm);
+                        println!("                    KS:「{}」", ks);
+                    }
+                }
+            }
+        }
 
         (all_matches, validation_pipeline)
     }

@@ -414,6 +414,8 @@ const KALSHI_DEFAULT_BASE: &str = "https://api.elections.kalshi.com/trade-api/v2
 pub struct KalshiClient {
     http_client: Client,
     base_url: String,
+    /// 订单簿令牌桶：容量 = KALSHI_OB_RATE_LIMIT_PER_SEC，每个令牌被取走后 1 秒归还。
+    ob_rate_limiter: std::sync::Arc<tokio::sync::Semaphore>,
 }
 
 impl KalshiClient {
@@ -431,6 +433,9 @@ impl KalshiClient {
         Self {
             http_client,
             base_url: base,
+            ob_rate_limiter: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                KALSHI_OB_RATE_LIMIT_PER_SEC,
+            )),
         }
     }
 
@@ -692,6 +697,14 @@ impl KalshiClient {
                 format!("{}…(+{}B)", &t[..max], t.len() - max)
             }
         }
+
+        // 令牌桶限速：acquire_owned 取走一个令牌，1 秒后异步归还，确保 ≤ KALSHI_OB_RATE_LIMIT_PER_SEC req/s。
+        let permit = self.ob_rate_limiter.clone().acquire_owned().await
+            .expect("Kalshi ob rate limiter closed");
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            drop(permit);
+        });
 
         let url = format!("{}/markets/{}/orderbook", self.base_url, ticker);
         let response = match self.http_client.get(&url).send().await {

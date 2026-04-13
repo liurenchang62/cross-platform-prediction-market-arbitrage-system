@@ -14,8 +14,9 @@ static ELECTORAL_NTH_PLACE_RE: Lazy<Regex> = Lazy::new(|| {
 });
 
 /// 安全词列表（单方有日期时放行）
-const SAFE_WORDS: [&str; 6] = [
-    "next", "upcoming", "today", "tonight", "future", "current"
+const SAFE_WORDS: [&str; 8] = [
+    "next", "upcoming", "today", "tonight", "future", "current",
+    "this week", "weekly",
 ];
 
 /// 体育比分关键词
@@ -1288,20 +1289,41 @@ fn extract_pm_stat_phrase(title: &str) -> Option<String> {
     extract_number(title)?;
     let tail = title.rsplit(':').next()?.trim();
     let low_tail = tail.to_lowercase();
-    let cut = if let Some(i) = tail.find("O/U") {
-        i
-    } else if let Some(i) = low_tail.find(" over ") {
-        i
+
+    // Format 1: "Stat O/U N.5" → text before "O/U"
+    if let Some(i) = tail.find("O/U") {
+        let phrase = tail[..i].trim();
+        if !phrase.is_empty() {
+            return Some(phrase.to_lowercase());
+        }
+    }
+
+    // Determine keyword position and length for " over " / " under "
+    let (kw_start, kw_len) = if let Some(i) = low_tail.find(" over ") {
+        (i, 6) // len(" over ")
     } else if let Some(i) = low_tail.find(" under ") {
-        i
+        (i, 7) // len(" under ")
     } else {
         return None;
     };
-    let phrase = tail[..cut].trim();
+
+    // Format 2: "Player over N.5 Stat" — try to extract words AFTER the number
+    let after_kw = tail[kw_start + kw_len..].trim();
+    // Skip the leading number (digits, dot, spaces) to reach the stat label
+    let stat_start = after_kw
+        .find(|c: char| c.is_alphabetic())
+        .unwrap_or(after_kw.len());
+    let stat_after_num = after_kw[stat_start..].trim();
+    if !stat_after_num.is_empty() {
+        return Some(stat_after_num.to_lowercase());
+    }
+
+    // Format 3 (legacy): "Stat over/under N" → text before keyword
+    let phrase = tail[..kw_start].trim();
     if phrase.is_empty() {
         return None;
     }
-    Some(phrase.to_string())
+    Some(phrase.to_lowercase())
 }
 
 /// Kalshi 第一处 `N+ …` 或 `N- …`（球员 prop）后的统计语文，直到 ` - ` 或行尾。
@@ -1365,6 +1387,20 @@ impl StatMarketValidator {
     /// 双方均为技术统计市场
     pub fn is_stat_market_pair(pm_title: &str, kalshi_title: &str) -> bool {
         Self::extract_pm_stat(pm_title).is_some() && Self::extract_ks_stat(kalshi_title).is_some()
+    }
+
+    pub(crate) fn extract_pm_stat_debug(title: &str) -> String {
+        match Self::extract_pm_stat(title) {
+            Some((ph, num, over)) => format!("{ph} {num} {}", if over { "over" } else { "under" }),
+            None => "?".to_string(),
+        }
+    }
+
+    pub(crate) fn extract_ks_stat_debug(title: &str) -> String {
+        match Self::extract_ks_stat(title) {
+            Some((ph, num, plus)) => format!("{ph} {num}{}", if plus { "+" } else { "-" }),
+            None => "?".to_string(),
+        }
     }
 
     /// 验证：统计语文一致且阈值匹配
@@ -1535,21 +1571,47 @@ impl DateValidator {
         SAFE_WORDS.iter().any(|&w| text_lower.contains(w))
     }
     
+    /// 仅当两侧均有完整「月+日」时才做严格比对；若任一侧只有年份（month=0/day=0），
+    /// 视为「无具体日期」，不产生冲突，直接放行。
     pub fn dates_match(d1: &DateInfo, d2: &DateInfo) -> bool {
         if d1.month > 0 && d1.day > 0 && d2.month > 0 && d2.day > 0 {
             return d1.month == d2.month && d1.day == d2.day;
         }
-        false
+        // 任一侧为年份占位（Kalshi "04/11/2026" → 只提取到 year=2026, month=0）：
+        // 无法比对具体日期，视为不冲突，放行给后续字段比对。
+        true
     }
-    
+
     pub fn validate(&self, pm_title: &str, kalshi_title: &str) -> bool {
         let pm_date = Self::extract_date(pm_title);
         let kalshi_date = Self::extract_date(kalshi_title);
-        
+
+        // 辅助：是否提取到完整月+日
+        let has_specific = |d: &DateInfo| d.month > 0 && d.day > 0;
+
         match (pm_date, kalshi_date) {
-            (Some(pm), Some(ks)) => Self::dates_match(&pm, &ks),
-            (Some(_), None) => Self::has_safe_word(pm_title),
-            (None, Some(_)) => Self::has_safe_word(kalshi_title),
+            (Some(ref pm), Some(ref ks)) => {
+                if has_specific(pm) && has_specific(ks) {
+                    // 两侧均有完整日期：必须吻合
+                    Self::dates_match(pm, ks)
+                } else {
+                    // 至少一侧为年份占位：不能判冲突，放行
+                    true
+                }
+            }
+            // 一侧有完整月+日，另一侧无日期：
+            //   - 年份占位（锦标赛名含年）：不产生冲突，放行
+            //   - 完整月+日：检查两边任一有 safe word（包括 PM 里的 "this week"）
+            (Some(ref pm), None) => {
+                if has_specific(pm) {
+                    Self::has_safe_word(pm_title) || Self::has_safe_word(kalshi_title)
+                } else { true }
+            }
+            (None, Some(ref ks)) => {
+                if has_specific(ks) {
+                    Self::has_safe_word(pm_title) || Self::has_safe_word(kalshi_title)
+                } else { true }
+            }
             (None, None) => true,
         }
     }
@@ -1598,25 +1660,30 @@ impl NumberComparator {
     }
     
     pub fn compare_numbers(nums1: &[NumberInfo], nums2: &[NumberInfo]) -> bool {
-        if nums1.is_empty() != nums2.is_empty() {
+        // 只比较有语义的阈值数字（非年份）；年份仅作"标签"，不参与兑付条件比对。
+        let specific1: Vec<_> = nums1.iter().filter(|n| !n.is_year).collect();
+        let specific2: Vec<_> = nums2.iter().filter(|n| !n.is_year).collect();
+
+        // 一侧有阈值数字，另一侧没有 → 兑付条件不对称，拒绝
+        // 例：PM "Hole in One?"(无阈值) vs Kalshi "3+ holes-in-one"(阈值3) → 拒绝
+        if specific1.is_empty() != specific2.is_empty() {
             return false;
         }
-        
-        if nums1.is_empty() && nums2.is_empty() {
+
+        // 两侧均无阈值数字（如纯胜负市场、仅含年份）→ 放行（由其他 validator 判断）
+        if specific1.is_empty() && specific2.is_empty() {
             return true;
         }
-        
-        for n1 in nums1 {
-            for n2 in nums2 {
-                if n1.is_year != n2.is_year {
-                    continue;
-                }
+
+        // 两侧均有阈值数字 → 要求至少一对在 ±0.5 内吻合
+        for n1 in &specific1 {
+            for n2 in &specific2 {
                 if (n1.value - n2.value).abs() <= 0.5 {
                     return true;
                 }
             }
         }
-        
+
         false
     }
 }
@@ -1716,7 +1783,34 @@ impl ElectoralPropositionValidator {
     }
 }
 
-/// 无二筛统计副作用（不写 `filtered_count` / `retained_samples`）；与 [`ValidationPipeline::validate`] 判定逻辑一致，  
+/// 轮次限定词检测器：一侧含 "first round" / "round 1" 等限定词而另一侧没有时拒绝。
+/// 典型误配：PM "win the presidential election"（赢整个大选）vs
+///           Kalshi "win the first round of the presidential election"（只赢第一轮）。
+/// 结算条件不同步，不应套利。
+pub struct ElectionRoundQualifierValidator;
+
+impl ElectionRoundQualifierValidator {
+    fn has_round_qualifier(text: &str) -> bool {
+        let t = text.to_lowercase();
+        t.contains("first round")
+            || t.contains("1st round")
+            || t.contains("round 1")
+            || t.contains("round one")
+            || t.contains("second round")
+            || t.contains("2nd round")
+            || t.contains("round 2")
+            || t.contains("round two")
+            || t.contains("first ballot")
+            || t.contains("second ballot")
+    }
+
+    /// 两侧的轮次限定词必须一致（都有或都没有）；若一侧有另一侧没有 → 拒绝。
+    pub fn allows_pair(pm_title: &str, kalshi_title: &str) -> bool {
+        Self::has_round_qualifier(pm_title) == Self::has_round_qualifier(kalshi_title)
+    }
+}
+
+/// 无二筛统计副作用（不写 `filtered_count` / `retained_samples`）；与 [`ValidationPipeline::validate`] 判定逻辑一致，
 /// 供统一二筛阶段 **并行** 批处理后按序回写统计。
 pub(crate) fn second_screen_try_match(
     pm_title: &str,
@@ -1724,90 +1818,113 @@ pub(crate) fn second_screen_try_match(
     similarity: f64,
     category: &str,
 ) -> Option<MatchInfo> {
+    second_screen_try_match_with_reason(pm_title, kalshi_title, similarity, category, &mut None)
+}
+
+/// 带拒绝原因输出的二筛（仅诊断用途）。
+pub(crate) fn second_screen_try_match_with_reason(
+    pm_title: &str,
+    kalshi_title: &str,
+    similarity: f64,
+    category: &str,
+    reject_reason: &mut Option<String>,
+) -> Option<MatchInfo> {
+    macro_rules! reject {
+        ($reason:expr) => {{
+            if reject_reason.is_some() {
+                *reject_reason = Some($reason.to_string());
+            }
+            return None;
+        }};
+    }
     let date_validator = DateValidator::new();
 
     if GarbageMarketDetector::is_garbage_sports_market(pm_title)
         || GarbageMarketDetector::is_garbage_sports_market(kalshi_title)
     {
-        return None;
+        reject!("GarbageMarket");
     }
 
     if !date_validator.validate(pm_title, kalshi_title) {
-        return None;
+        reject!("DateValidator");
     }
 
     if !WeatherValidator::regions_match(pm_title, kalshi_title) {
-        return None;
+        reject!("WeatherRegion");
     }
     if !WeatherValidator::fahrenheit_or_below_buckets_match(pm_title, kalshi_title) {
-        return None;
+        reject!("WeatherBucket");
     }
 
     if EntertainmentChartValidator::is_billboard_spotify_cross(pm_title, kalshi_title) {
-        return None;
+        reject!("BillboardSpotifyCross");
     }
     if !EntertainmentChartValidator::allows_pair(pm_title, kalshi_title) {
-        return None;
+        reject!("EntertainmentChart");
     }
 
     if !EsportsGameValidator::game_numbers_match(pm_title, kalshi_title) {
-        return None;
+        reject!("EsportsGameNumbers");
     }
     if !EsportsGameValidator::single_vs_total_match(pm_title, kalshi_title) {
-        return None;
+        reject!("EsportsSingleVsTotal");
     }
     if !EsportsGameValidator::handicap_vs_total_maps_match(pm_title, kalshi_title) {
-        return None;
+        reject!("EsportsHandicapVsTotalMaps");
     }
     if !EsportsGameValidator::single_vs_series_match(pm_title, kalshi_title) {
-        return None;
+        reject!("EsportsSingleVsSeries");
     }
     if !EsportsGameValidator::map_winner_vs_whole_match_match(pm_title, kalshi_title) {
-        return None;
+        reject!("EsportsMapVsWhole");
     }
 
     if !SportsSingleVsFinalsValidator::single_vs_finals_match(pm_title, kalshi_title) {
-        return None;
+        reject!("SportsSingleVsFinals");
     }
 
     if !HandicapVsSingleWinnerValidator::handicap_vs_single_winner_match(pm_title, kalshi_title) {
-        return None;
+        reject!("HandicapVsSingleWinner");
     }
 
     if !ExactScoreVsGoalsTotalsValidator::allows_pair(pm_title, kalshi_title) {
-        return None;
+        reject!("ExactScoreVsGoalsTotals");
     }
 
     if !EsportsTournamentWinnerVsSportsGoalsValidator::allows_pair(pm_title, kalshi_title) {
-        return None;
+        reject!("EsportsTournamentVsSportsGoals");
     }
 
     if !TournamentOutrightVsMatchValidator::allows_pair(pm_title, kalshi_title) {
-        return None;
+        reject!("TournamentOutrightVsMatch");
     }
 
     if !TeamSidePropVsMatchWinnerValidator::allows_pair(pm_title, kalshi_title) {
-        return None;
+        reject!("TeamSidePropVsMatchWinner");
     }
 
     if !FinalsConsistencyValidator::finals_consistency_match(pm_title, kalshi_title) {
-        return None;
+        reject!("FinalsConsistency");
     }
 
     if !DrawVsWinnerValidator::allows_pair(pm_title, kalshi_title) {
-        return None;
+        reject!("DrawVsWinner");
     }
 
     if !BracketAdvanceVsSingleGameValidator::allows_pair(pm_title, kalshi_title) {
-        return None;
+        reject!("BracketAdvanceVsSingleGame");
     }
 
     if !TossVsMatchMarketValidator::allows_pair(pm_title, kalshi_title) {
-        return None;
+        reject!("TossVsMatch");
     }
 
     if !ElectoralPropositionValidator::allows_pair(pm_title, kalshi_title) {
-        return None;
+        reject!("ElectoralProposition");
+    }
+
+    if !ElectionRoundQualifierValidator::allows_pair(pm_title, kalshi_title) {
+        reject!("ElectionRoundQualifier");
     }
 
     if let Some((pm_side, kalshi_side, needs_inversion)) =
@@ -1830,7 +1947,7 @@ pub(crate) fn second_screen_try_match(
         extract_ks_stat_phrase_from_kalshi(kalshi_title),
     ) {
         if !stat_phrases_same_semantics(&pp, &kp) {
-            return None;
+            reject!(format!("StatPhraseMismatch(pm={pp:?} ks={kp:?})"));
         }
     }
 
@@ -1862,25 +1979,32 @@ pub(crate) fn second_screen_try_match(
                 needs_inversion,
             });
         }
-        return None;
+        // 能识别为 stat pair 但阈值不对齐
+        let pm_info = StatMarketValidator::extract_pm_stat_debug(pm_title);
+        let ks_info = StatMarketValidator::extract_ks_stat_debug(kalshi_title);
+        reject!(format!("StatThresholdMismatch(pm={pm_info} ks={ks_info})"));
     }
 
     let pm_map_winner_line = EsportsGameValidator::is_single_map_winner(pm_title)
         || EsportsGameValidator::is_single_game_winner(pm_title);
     let ks_map_winner_line = EsportsGameValidator::is_single_map_winner(kalshi_title);
     if pm_map_winner_line && ks_map_winner_line {
-        return None;
+        reject!("EsportsMapWinner");
     }
 
     let pm_numbers = NumberComparator::extract_numbers(pm_title);
     let kalshi_numbers = NumberComparator::extract_numbers(kalshi_title);
 
     if pm_numbers.is_empty() && kalshi_numbers.is_empty() {
-        return None;
+        reject!("NoNumbers");
     }
 
     if !NumberComparator::compare_numbers(&pm_numbers, &kalshi_numbers) {
-        return None;
+        reject!(format!(
+            "NumberMismatch(pm={:?} ks={:?})",
+            pm_numbers.iter().map(|n| n.value).collect::<Vec<_>>(),
+            kalshi_numbers.iter().map(|n| n.value).collect::<Vec<_>>(),
+        ));
     }
 
     Some(MatchInfo {
@@ -2578,5 +2702,149 @@ mod tests {
             "Tobias Harris: Rebounds O/U 5.5",
             "Tobias Harris: 6+ rebounds - Tobias Harris: 6+"
         ).is_some()); // 正确：O/U 5.5 Over ↔ 6+
+    }
+
+    // ── DateValidator 修复：年份占位不应拒绝有效对 ──────────────────────────────
+    #[test]
+    fn date_validator_year_only_vs_month_day_allows() {
+        let dv = DateValidator::new();
+        // Kalshi 数字格式日期 "4/11/2026" → 只提取到 year=2026（month=0,day=0）
+        // PM 含 "April 11" → 提取 month=4, day=11
+        // 不应被拒绝
+        assert!(dv.validate(
+            "LeBron James over 25.5 points (April 11)",
+            "LeBron James 25.5+ points - 04/11/2026"
+        ), "year-only Kalshi date should not block April 11 PM date");
+    }
+
+    #[test]
+    fn date_validator_both_year_only_allows() {
+        let dv = DateValidator::new();
+        // 两侧都只有年份（如 "NBA Playoffs 2026"）→ 应放行
+        assert!(dv.validate(
+            "NBA Playoffs 2026: Celtics to win",
+            "NBA Playoffs: Celtics Win 2026"
+        ), "both year-only should not block");
+    }
+
+    #[test]
+    fn date_validator_conflicting_month_day_rejects() {
+        let dv = DateValidator::new();
+        // 两侧均有完整日期且不一致 → 应拒绝
+        assert!(!dv.validate(
+            "LeBron James over 25.5 points (April 11)",
+            "LeBron James 25.5+ points (April 12)"
+        ), "conflicting full dates should be rejected");
+    }
+
+    #[test]
+    fn date_validator_same_month_day_allows() {
+        let dv = DateValidator::new();
+        assert!(dv.validate(
+            "Celtics vs Pacers: Winner (April 19)",
+            "NBA: Celtics at Pacers - April 19"
+        ), "matching full dates should be allowed");
+    }
+
+    // ── compare_numbers：年份不参与阈值比对 ──────────────────────────────────
+    #[test]
+    fn compare_numbers_rejects_threshold_asymmetry() {
+        // PM 无阈值，Kalshi 有阈值 3 → 拒绝（Masters hole-in-one 误配案例）
+        let pm = NumberComparator::extract_numbers("The Masters 2026: Hole in One?");
+        let ks = NumberComparator::extract_numbers("Will there be 3+ holes-in-one at the 2026 Masters Tournament?");
+        assert!(!NumberComparator::compare_numbers(&pm, &ks),
+            "asymmetric threshold (none vs 3+) should be rejected");
+    }
+
+    #[test]
+    fn compare_numbers_rejects_threshold_asymmetry_2plus() {
+        let pm = NumberComparator::extract_numbers("The Masters 2026: Hole in One?");
+        let ks = NumberComparator::extract_numbers("Will there be 2+ holes-in-one at the 2026 Masters Tournament?");
+        assert!(!NumberComparator::compare_numbers(&pm, &ks),
+            "asymmetric threshold (none vs 2+) should be rejected");
+    }
+
+    #[test]
+    fn compare_numbers_allows_matching_thresholds() {
+        // 两侧阈值相同（25.5 ≈ 25）→ 放行
+        let pm = NumberComparator::extract_numbers("LeBron James Over 25.5 Points 2026");
+        let ks = NumberComparator::extract_numbers("LeBron James 25+ points - 04/11/2026");
+        assert!(NumberComparator::compare_numbers(&pm, &ks),
+            "matching thresholds (25.5 vs 25) should be allowed");
+    }
+
+    #[test]
+    fn compare_numbers_rejects_mismatched_thresholds() {
+        // 两侧阈值不同（25.5 vs 30）→ 拒绝
+        let pm = NumberComparator::extract_numbers("LeBron James Over 25.5 Points 2026");
+        let ks = NumberComparator::extract_numbers("LeBron James 30+ points - 04/11/2026");
+        assert!(!NumberComparator::compare_numbers(&pm, &ks),
+            "mismatched thresholds (25.5 vs 30) should be rejected");
+    }
+
+    #[test]
+    fn compare_numbers_allows_year_only_both_sides() {
+        // 两侧只有年份，无阈值 → 放行（纯胜负市场）
+        let pm = NumberComparator::extract_numbers("NBA Playoffs 2026: Celtics to win");
+        let ks = NumberComparator::extract_numbers("NBA: Celtics Win Series 2026");
+        assert!(NumberComparator::compare_numbers(&pm, &ks),
+            "year-only both sides should be allowed");
+    }
+
+    // ── ElectionRoundQualifierValidator ──────────────────────────────────────
+    #[test]
+    fn election_round_qualifier_rejects_asymmetric() {
+        // Kalshi 有 "first round"，PM 没有 → 拒绝（秘鲁大选误配原案例）
+        assert!(!ElectionRoundQualifierValidator::allows_pair(
+            "Will Keiko Fujimori win the 2026 Peruvian presidential election?",
+            "Will Keiko Fujimori win the first round of the 2026 Peruvian presidential election?",
+        ));
+        // 反向也一样
+        assert!(!ElectionRoundQualifierValidator::allows_pair(
+            "Win the first round of the election?",
+            "Win the election?",
+        ));
+    }
+
+    #[test]
+    fn election_round_qualifier_allows_symmetric() {
+        // 两侧都有 → OK
+        assert!(ElectionRoundQualifierValidator::allows_pair(
+            "Will X win the first round of the election?",
+            "Will X win the first round of the election? - X",
+        ));
+        // 两侧都没有 → OK
+        assert!(ElectionRoundQualifierValidator::allows_pair(
+            "Will Keiko Fujimori win the 2026 Peruvian presidential election?",
+            "Will Fujimori win the Peru 2026 election? - Fujimori",
+        ));
+    }
+
+    #[test]
+    fn second_screen_rejects_election_round_mismatch() {
+        assert!(second_screen_try_match(
+            "Will Keiko Fujimori win the 2026 Peruvian presidential election?",
+            "Will Keiko Fujimori win the first round of the 2026 Peruvian presidential election? - Keiko Fujimori",
+            0.995,
+            "politics_us",
+        ).is_none(), "first-round vs general election must be rejected");
+    }
+
+    #[test]
+    fn second_screen_rejects_hole_in_one_threshold_mismatch() {
+        // 完整二筛：PM hole-in-one vs Kalshi 3+ holes-in-one → 应拒绝
+        assert!(second_screen_try_match(
+            "The Masters 2026: Hole in One?",
+            "Will there be 3+ holes-in-one at the 2026 Masters Tournament? - 3+ holes-in-one",
+            1.0,
+            "sports_golf",
+        ).is_none(), "hole-in-one vs 3+ holes-in-one must be rejected");
+
+        assert!(second_screen_try_match(
+            "The Masters 2026: Hole in One?",
+            "Will there be 2+ holes-in-one at the 2026 Masters Tournament? - 2+ holes-in-one",
+            1.0,
+            "sports_golf",
+        ).is_none(), "hole-in-one vs 2+ holes-in-one must be rejected");
     }
 }

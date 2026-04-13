@@ -30,8 +30,8 @@ mod kalshi_fee_schedule;
 mod session_risk;
 
 use std::collections::HashSet;
+use std::io::Write;
 use std::sync::Mutex;
-use std::io::{self, BufRead, Write};
 use std::sync::Arc;
 
 use crate::category_mapper::CategoryMapper;
@@ -58,8 +58,8 @@ use crate::system_params::{
     PM_TAKER_FEE_BPS_WHEN_FETCH_FAILS, RESOLUTION_HORIZON_DAYS,
     RETRY_INITIAL_DELAY_MS,
     MAX_SETTLEMENT_DATE_SKEW_DAYS, SIMILARITY_THRESHOLD, STOP_LOSS_KALSHI_SELL_MIN_PRICE_CENTS,
-    arb_probe_caps, kalshi_orderbook_debug_enabled, require_live_orders_allowed,
-    set_live_arbitrage_orders_allowed,
+    arb_probe_caps, kalshi_orderbook_debug_enabled, LIVE_TRADING_ON,
+    require_live_orders_allowed, set_live_arbitrage_orders_allowed,
     POLYMARKET_SIGNATURE_TYPE_ENV, load_env_file_if_missing,
 };
 use crate::tracking_log::print_arbitrage_detection_books;
@@ -103,30 +103,6 @@ fn expand_dual_orientations(
     out
 }
 
-/// 启动时必须完整输入 `CONFIRM`（全大写），否则退出进程。
-fn prompt_confirm_live() -> Result<()> {
-    println!("\n⚠️  本进程为实盘交易：将使用真实资金在 Kalshi / Polymarket 下单，并写入 {}", DESK_EVENTS_JSONL);
-    println!("   若确认，请完整输入 CONFIRM（全大写）后回车；其他任何输入均视为放弃并退出程序。");
-
-    let stdin = io::stdin();
-    let mut stdout = io::stdout();
-    let eof = || anyhow::anyhow!("标准输入不可用（无法交互确认）");
-
-    print!("确认实盘: ");
-    stdout.flush().ok();
-    let mut confirm = String::new();
-    if stdin.lock().read_line(&mut confirm).context("读取 stdin 失败")? == 0 {
-        return Err(eof());
-    }
-    if confirm.trim() == "CONFIRM" {
-        println!("✅ 已确认进入实盘模式。\n");
-        trades_cache::init_on_live_session_start().context("创建/清空 logs/trades_cache.txt")?;
-        trades_cache::append_session_banner(Utc::now());
-        return Ok(());
-    }
-    println!("已取消：未确认实盘，程序退出。");
-    std::process::exit(0);
-}
 
 fn format_resolution_expiry(label: &str, dt: Option<DateTime<Utc>>) -> String {
     match dt {
@@ -173,6 +149,8 @@ struct TrackingArbDiag {
     ladder_ks_liq_all_filtered: usize,
     /// 已有双边阶梯但严格 detector 未通过
     rejected_strict: usize,
+    /// 任一侧 `resolution_date` 距 now 不足 [`IMMINENT_RESOLUTION_SKIP_MINS`] 分钟，跳过
+    rejected_imminent: usize,
     /// 两侧 `resolution_date` 齐备且结算时刻差严格大于 [`MAX_SETTLEMENT_DATE_SKEW_DAYS`]
     rejected_settlement_skew: usize,
     missing_best_ask: usize,
@@ -307,6 +285,7 @@ impl TrackingArbDiag {
         self.ladder_ks_liq_empty_side += o.ladder_ks_liq_empty_side;
         self.ladder_ks_liq_all_filtered += o.ladder_ks_liq_all_filtered;
         self.rejected_strict += o.rejected_strict;
+        self.rejected_imminent += o.rejected_imminent;
         self.rejected_settlement_skew += o.rejected_settlement_skew;
         self.missing_best_ask += o.missing_best_ask;
         self.sum_ask_ge_1 += o.sum_ask_ge_1;
@@ -327,7 +306,7 @@ impl TrackingArbDiag {
     /// 每追踪周期一行摘要，便于判断「真没机会」还是「订单簿拉取异常」。
     fn print_compact(&self) {
         println!(
-            "   📎 追踪判定摘要: 尝试 {} | 通过 {} | 无PM token {} | PM簿缺 {} KS簿缺 {} | 阶梯失败 {} | 严格拒 {} (其中和≥1: {}) | 结算日差>{}天: {}",
+            "   📎 追踪判定摘要: 尝试 {} | 通过 {} | 无PM token {} | PM簿缺 {} KS簿缺 {} | 阶梯失败 {} | 严格拒 {} (其中和≥1: {}) | 即将结算跳过 {} | 结算日差>{}天: {}",
             self.attempts,
             self.accepted,
             self.no_pm_clob_token,
@@ -336,6 +315,7 @@ impl TrackingArbDiag {
             self.ladders_failed,
             self.rejected_strict,
             self.sum_ask_ge_1,
+            self.rejected_imminent,
             MAX_SETTLEMENT_DATE_SKEW_DAYS,
             self.rejected_settlement_skew,
         );
@@ -387,8 +367,11 @@ async fn main() -> Result<()> {
     // 优先从 env/credentials.env 加载缺失的凭证（系统环境变量已设置则不覆盖）
     load_env_file_if_missing();
     println!("🚀 跨平台套利监控");
-    prompt_confirm_live()?;
-    set_live_arbitrage_orders_allowed(true);
+    if LIVE_TRADING_ON {
+        trades_cache::init_on_live_session_start().context("创建/清空 logs/trades_cache.txt")?;
+        trades_cache::append_session_banner(Utc::now());
+    }
+    set_live_arbitrage_orders_allowed(LIVE_TRADING_ON);
     println!("📌 实盘交易：成交 JSONL: {DESK_EVENTS_JSONL}；终端摘录: logs/trades_cache.txt");
     println!(
         "🔒 资金安全：无合格套利时主循环**仅**请求行情/订单簿/费率等只读接口；Kalshi IOC / PM FOK / 卖平敞口仅在 `validate_arbitrage_pair_post_success` 内且通过 `require_live_orders_allowed`，不因「空转」自动下单或划帐。"
@@ -396,6 +379,11 @@ async fn main() -> Result<()> {
     println!(
         "🔒 Polymarket：CLOB 鉴权为链下；仅在**程序启动、进入主循环前**经 Relayer 尝试赎回可结算头寸并刷新 Collateral（需 API key）；非此类链上操作仍可能于他处发生。"
     );
+    if LIVE_TRADING_ON {
+        println!("💹 交易模式：实盘（LIVE_TRADING_ON=true）");
+    } else {
+        println!("👁️  交易模式：仅监控（LIVE_TRADING_ON=false），检测到机会不下单");
+    }
     println!("📊 平台: Polymarket ↔ Kalshi");
     if kalshi_orderbook_debug_enabled() {
         println!(
@@ -729,6 +717,9 @@ async fn validate_arbitrage_core(
 
     // 任一侧距结算不足 IMMINENT_RESOLUTION_SKIP_MINS 分钟：价格已反映结算共识，跳过。
     if pair_resolves_imminently(pm_market, kalshi_market, Utc::now()) {
+        if let Some(d) = arb_diag.as_mut() {
+            d.rejected_imminent += 1;
+        }
         return Ok(None);
     }
 
@@ -911,10 +902,18 @@ async fn preflight_live_readonly_trading_apis(
         .send()
         .await
         .context("实盘预检：GET https://polymarket.com/api/geoblock 失败")?;
-    if !resp.status().is_success() {
+    let status = resp.status();
+    // 官方文档仍写此 URL，但站点若改版可能整路径 404（与出口 IP/日本或印尼无关）；此时无法远程确认地理限制。
+    if status.as_u16() == 404 {
+        eprintln!(
+            "⚠️  实盘预检：Polymarket geoblock 返回 HTTP 404（官网 /api/geoblock 可能未部署或已变更）。跳过地理校验；请自行确认所在地允许使用 Polymarket。"
+        );
+        return Ok(());
+    }
+    if !status.is_success() {
         anyhow::bail!(
             "实盘预检：Polymarket geoblock HTTP {}（须可访问以确认地理限制）",
-            resp.status().as_u16()
+            status.as_u16()
         );
     }
     let v: serde_json::Value = resp
@@ -955,6 +954,17 @@ async fn validate_arbitrage_pair_post_success(
     session_risk: &SessionRiskHandle,
 ) -> Result<()> {
     require_live_orders_allowed().context("validate_arbitrage_pair_post_success")?;
+
+    // 监控模式：检测到机会但 LIVE_TRADING_ON=false，仅打印不下单
+    if !LIVE_TRADING_ON {
+        crate::trade_out!(
+            "\n  ── [监控模式] 发现套利机会但 LIVE_TRADING_ON=false，跳过下单 ──\n  \
+             PM: {} | Kalshi: {} | ROI {:.2}%",
+            pm_market.title, kalshi_market.title, opp.roi_100_percent
+        );
+        return Ok(());
+    }
+
     let Some(pm_token_id) = polymarket_clob_token_id_for_buy(pm_market, pm_side) else {
         anyhow::bail!("validate_arbitrage_pair_post_success: missing PM clob token");
     };
