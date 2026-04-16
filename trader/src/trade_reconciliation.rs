@@ -228,12 +228,12 @@ pub async fn print_live_pair_reconciliation(
         let matched = ks_buy_contracts.min(pm_take_sum);
         if matched > 1e-6 && pm_take_sum.is_finite() && ks_buy_cash.is_finite() {
             let payout = matched * 1.0;
-            let cash_out_est = -ks_buy_cash + pm_take_sum;
+            let cash_out_est = -ks_buy_cash + pm_buy_cost;
             let net_resolution_est = payout - cash_out_est;
             let denom = cash_out_est.abs().max(1e-9);
             let roi_pct = (net_resolution_est / denom) * 100.0;
             crate::trade_out!(
-                "     💰 **对冲摘要**（按接口分项估算，结算时 $1/份）：配对≈{:.4} 份 | 到期毛兑付≈${:.4} | 现金流出合≈${:.4}（Kalshi 买现金流幅值 + PM taking） | 预计至结算净利≈${:.4} | 估算 ROI≈{:.2}%",
+                "     💰 **对冲摘要**（按接口分项估算，结算时 $1/份）：配对≈{:.4} 份 | 到期毛兑付≈${:.4} | 现金流出合≈${:.4}（Kalshi 买现金流幅值 + PM USDC成本） | 预计至结算净利≈${:.4} | 估算 ROI≈{:.2}%",
                 matched, payout, cash_out_est, net_resolution_est, roi_pct
             );
             crate::trade_out!("        说明：微利已含 fills 内手续费口径；PM 费另按 trade bps 估 ${:.6}；结算与汇率为理论值。", pm_fee_sum);

@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use crate::market::Market;
-use crate::market_filter::{pair_settlement_dates_skew_exceeds, tracked_pair_exceeds_horizon};
+use crate::market_filter::{pair_already_expired, pair_settlement_dates_skew_exceeds, tracked_pair_exceeds_horizon};
 use crate::system_params::{FULL_FETCH_INTERVAL_WALL_SECS, MAX_SETTLEMENT_DATE_SKEW_DAYS};
 
 /// 单条 `arb_rounds_store` 记录：以 `oriented_track_id`（pm_market_id + kalshi_ticker + 两侧方向）为唯一键，
@@ -302,6 +302,14 @@ impl MonitorState {
         self.tracked_pairs.retain(|p| {
             !tracked_pair_exceeds_horizon(&p.pm_market, &p.kalshi_market, now)
         });
+    }
+
+    /// 剔除任一侧 `resolution_date` 已早于 `now` 的追踪对（已结算市场，在追踪周期间过期的情况）。
+    pub fn prune_tracked_expired(&mut self, now: DateTime<Utc>) -> usize {
+        let before = self.tracked_pairs.len();
+        self.tracked_pairs
+            .retain(|p| !pair_already_expired(&p.pm_market, &p.kalshi_market, now));
+        before - self.tracked_pairs.len()
     }
 
     /// 剔除 PM/Kalshi 到期时刻差严格大于 [`MAX_SETTLEMENT_DATE_SKEW_DAYS`] 的追踪对（与识别阶段同源规则）。

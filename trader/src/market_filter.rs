@@ -7,7 +7,10 @@ use chrono::{DateTime, Duration, Utc};
 use crate::market::Market;
 use crate::system_params::{IMMINENT_RESOLUTION_SKIP_MINS, RESOLUTION_HORIZON_DAYS};
 
-/// 若市场有 `resolution_date`（同上解析标准）且该时间 **严格晚于** `now + horizon_days`，则剔除。
+/// 若市场有 `resolution_date`（同上解析标准）且满足以下任一条件则剔除：
+/// - 严格早于 `now`（已过期/已结算）
+/// - 严格晚于 `now + horizon_days`（远期，超出窗口）
+/// 无 `resolution_date` 的市场保留。
 pub fn filter_markets_by_resolution_horizon(
     markets: Vec<Market>,
     now: DateTime<Utc>,
@@ -18,7 +21,7 @@ pub fn filter_markets_by_resolution_horizon(
         .into_iter()
         .filter(|m| match m.resolution_date {
             None => true,
-            Some(dt) => dt <= cutoff,
+            Some(dt) => dt >= now && dt <= cutoff,
         })
         .collect()
 }
@@ -42,13 +45,21 @@ pub fn tracked_pair_exceeds_horizon(
     pm_far || ks_far
 }
 
-/// 任一侧 `resolution_date` 在 `now + IMMINENT_RESOLUTION_SKIP_MINS` 之内则返回 `true`（即将结算，跳过）。
-/// 无 `resolution_date` 的市场不触发此过滤（视为不会很快结算）。
+/// 任一侧 `resolution_date` 在 `now` 之后且距 now 不足 [`IMMINENT_RESOLUTION_SKIP_MINS`] 分钟则返回 `true`（即将结算，跳过）。
+/// 已过期（`resolution_date <= now`）的市场不在此处拦截（由 `rejected_already_expired` 计数器单独处理）。
+/// 无 `resolution_date` 的市场不触发此过滤。
 pub fn pair_resolves_imminently(pm: &Market, ks: &Market, now: DateTime<Utc>) -> bool {
     let cutoff = now + Duration::minutes(IMMINENT_RESOLUTION_SKIP_MINS);
-    let pm_soon = pm.resolution_date.map(|dt| dt <= cutoff).unwrap_or(false);
-    let ks_soon = ks.resolution_date.map(|dt| dt <= cutoff).unwrap_or(false);
+    let pm_soon = pm.resolution_date.map(|dt| dt > now && dt <= cutoff).unwrap_or(false);
+    let ks_soon = ks.resolution_date.map(|dt| dt > now && dt <= cutoff).unwrap_or(false);
     pm_soon || ks_soon
+}
+
+/// 任一侧 `resolution_date` 严格早于 `now`（即已过期/已结算）则返回 `true`。
+pub fn pair_already_expired(pm: &Market, ks: &Market, now: DateTime<Utc>) -> bool {
+    let pm_exp = pm.resolution_date.map(|dt| dt < now).unwrap_or(false);
+    let ks_exp = ks.resolution_date.map(|dt| dt < now).unwrap_or(false);
+    pm_exp || ks_exp
 }
 
 /// 两侧均有到期时刻且 **严格宽于** `max_days`（整日等价：`abs(Δ秒) > max_days×86400`）时返回 `true`。`max_days ≤ 0` 视为不启用。

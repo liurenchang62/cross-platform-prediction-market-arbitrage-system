@@ -28,6 +28,7 @@ mod polymarket_trade;
 mod fee_model;
 mod kalshi_fee_schedule;
 mod session_risk;
+mod position_cleanup;
 
 use std::collections::HashSet;
 use std::io::Write;
@@ -495,7 +496,10 @@ async fn main() -> Result<()> {
     // full_match_interval 参数已废弃（改为挂钟调度），传 0 占位。
     let mut monitor_state = MonitorState::new(0);
     monitor_state.load_rounds_from_disk(ARB_ROUNDS_STORE_PATH);
-    
+
+    // 启动前仓位清理（处理上次会话遗留孤仓/已结算一侧/高置信止损）
+    position_cleanup::run_position_cleanup(&ks_http, &kalshi_cfg, &pm_trader).await;
+
     println!("📡 首次获取市场并构建索引...");
     
     // 首次获取全量市场
@@ -1963,7 +1967,12 @@ async fn run_cycle(
         .unwrap()
         .apply_snapshot_with_notifications(&cycle_snap);
 
-    monitor_state.prune_tracked_beyond_resolution_horizon(Utc::now());
+    let now_prune = Utc::now();
+    let n_expired = monitor_state.prune_tracked_expired(now_prune);
+    if n_expired > 0 {
+        println!("   🗑️  剔除已过期追踪对 {} 个（在追踪周期间到期）", n_expired);
+    }
+    monitor_state.prune_tracked_beyond_resolution_horizon(now_prune);
     monitor_state.prune_tracked_settlement_skew_too_wide();
 
     let (per_leg_cap, pair_cap) = arb_probe_caps();
@@ -1971,6 +1980,9 @@ async fn run_cycle(
     let is_full_match_cycle = monitor_state.should_full_match();
 
     let (new_matches, opportunities) = if is_full_match_cycle {
+        // 每次全量重建前执行仓位清理（孤仓/已结算/高置信止损）
+        position_cleanup::run_position_cleanup(ks_http, kalshi_cfg, pm_trader).await;
+
         let (m, v) = run_full_match_cycle(
             polymarket,
             kalshi,

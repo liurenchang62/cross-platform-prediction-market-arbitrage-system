@@ -362,6 +362,105 @@ pub async fn aggregate_kalshi_market_positions_mtm_usd_and_count(
     Ok((mtm_total, ks_markets_n, ks_tokens_n, priced_n))
 }
 
+/// 已开仓 Kalshi 市场单腿仓位（按 ticker 聚合，`position_fp` 符号已转为 `side`）。
+#[derive(Debug, Clone)]
+pub struct KalshiOpenPos {
+    pub ticker: String,
+    /// "YES" 或 "NO"
+    pub side: String,
+    pub contracts: f64,
+}
+
+/// 拉取全部 Kalshi 有净敞口仓位（分页 `GET /portfolio/positions`），返回每个 ticker 的仓位摘要。
+pub async fn fetch_kalshi_open_positions_list(
+    http: &Client,
+    cfg: &KalshiTradeConfig,
+) -> Result<Vec<KalshiOpenPos>> {
+    let mut out: Vec<KalshiOpenPos> = Vec::new();
+    let mut cursor: Option<String> = None;
+    for _ in 0..256 {
+        let url = format!("{}/portfolio/positions", cfg.base_url);
+        let ts = millis_timestamp();
+        let sig = sign_request(&cfg.private_key, &ts, "GET", KALSHI_SIGN_PATH_POSITIONS)?;
+        let mut req = http
+            .get(&url)
+            .query(&[("limit", "1000")])
+            .header("KALSHI-ACCESS-KEY", &cfg.api_key_id)
+            .header("KALSHI-ACCESS-TIMESTAMP", &ts)
+            .header("KALSHI-ACCESS-SIGNATURE", sig);
+        if let Some(c) = cursor.as_deref() {
+            if !c.is_empty() {
+                req = req.query(&[("cursor", c)]);
+            }
+        }
+        let resp = req.send().await.context("Kalshi GET /portfolio/positions (list)")?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            anyhow::bail!("Kalshi positions list HTTP {}: {}", status.as_u16(), text.trim());
+        }
+        let v: Value = serde_json::from_str(&text).context("positions list JSON")?;
+        if let Some(arr) = v["market_positions"].as_array() {
+            for pos in arr {
+                if !position_row_has_open_position(pos) {
+                    continue;
+                }
+                let Some(ticker) = pos.get("ticker").and_then(|x| x.as_str()) else {
+                    continue;
+                };
+                let Some((contracts, side)) = kalshi_position_fp_contracts_and_side(pos) else {
+                    continue;
+                };
+                out.push(KalshiOpenPos {
+                    ticker: ticker.to_string(),
+                    side: side.to_string(),
+                    contracts,
+                });
+            }
+        }
+        let next = v["cursor"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+        match next {
+            Some(c) if cursor.as_ref() != Some(&c) => cursor = Some(c),
+            _ => break,
+        }
+    }
+    Ok(out)
+}
+
+/// `GET /markets/{ticker}`（公开）：读取 `market.result` 字段。
+/// 返回 `Some("yes")` / `Some("no")` 表示已结算；`None` 表示尚未结算或字段缺失。
+pub async fn fetch_kalshi_market_settlement_result(
+    http: &Client,
+    cfg: &KalshiTradeConfig,
+    ticker: &str,
+) -> Result<Option<String>> {
+    if ticker.is_empty() {
+        return Ok(None);
+    }
+    let url = format!("{}/markets/{}", cfg.base_url, ticker);
+    let resp = http
+        .get(&url)
+        .send()
+        .await
+        .with_context(|| format!("Kalshi GET /markets/{}", ticker))?;
+    if !resp.status().is_success() {
+        anyhow::bail!(
+            "Kalshi GET /markets/{} HTTP {}",
+            ticker,
+            resp.status().as_u16()
+        );
+    }
+    let v: Value = resp.json().await.context("market result JSON")?;
+    let result = v["market"]["result"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_lowercase());
+    Ok(result)
+}
+
 fn millis_timestamp() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let ms = SystemTime::now()
