@@ -1,8 +1,7 @@
-//! 仓位清理模块：在程序启动（拉取市场前）以及每次全量重建前运行，处理三类场景：
+//! 仓位清理模块：在程序启动（拉取市场前）以及每次全量重建前运行，处理两类场景：
 //!
 //! - **A 孤仓**：Kalshi 有持仓但无 desk_events 配对记录，或 desk_events 对中一侧已清零另一侧仍有余额 → 直接平仓。
 //! - **B 一侧已结算**：Kalshi 或 Polymarket 一腿已结算时，关闭另一侧（锁定盈利或回收残值）。
-//! - **C 高置信止损**：双侧均开仓，但我方持有一侧当前 bid ≤ 0.10（市场 90%+ 置信反向）→ 平仓回收残值。
 //!
 //! 所有平仓操作均直接执行，无需人工确认。
 
@@ -19,8 +18,6 @@ use crate::kalshi_trade::{
 use crate::polymarket_trade::{clob_conditional_micro_to_shares, PolymarketClobTrader};
 use crate::system_params::{DESK_EVENTS_JSONL, STOP_LOSS_KALSHI_SELL_MIN_PRICE_CENTS};
 
-/// 我方持有侧 bid 低于此阈值时视为「高置信亏损侧」（0.90 置信 = 对立面 ≥ 0.90 → 我方 ≤ 0.10）。
-const C_LOSING_BID_THRESHOLD: f64 = 0.10;
 /// 最小有意义回收金额（美元），低于此值不发单。
 const MIN_RECOVERY_USD: f64 = 0.10;
 
@@ -393,72 +390,6 @@ pub async fn run_position_cleanup(
                 }
                 continue; // 已处理 B
             }
-        }
-        sleep(Duration::from_millis(200)).await;
-
-        // ── Scenario C: 双侧均开仓，高置信止损 ────────────────────────────
-        // 当我方持有侧 bid ≤ C_LOSING_BID_THRESHOLD（0.10），市场 90%+ 置信我方处于亏损侧。
-
-        // C-PM：检查我方 PM token bid
-        if let Some(pm_bid) = pm_best_bid(ks_http, &pair.pm_token_id).await {
-            if pm_bid <= C_LOSING_BID_THRESHOLD {
-                let expected = pm_bid * pm_shares;
-                if expected >= MIN_RECOVERY_USD {
-                    println!(
-                        "   🟠 [C-PM止损] token={}… {} bid={:.3} qty={:.2} 预期≈${:.3} → 平仓",
-                        &pair.pm_token_id[..pair.pm_token_id.len().min(16)],
-                        pair.pm_side,
-                        pm_bid,
-                        pm_shares,
-                        expected
-                    );
-                    close_pm_side(pm_trader, &pair.pm_token_id, pm_shares, "C-PM止损").await;
-                } else {
-                    println!(
-                        "   🟠 [C-PM止损] token={}… {} bid={:.3} qty={:.2} 预期≈${:.3} → 跳过（回收不足 ${}）",
-                        &pair.pm_token_id[..pair.pm_token_id.len().min(16)],
-                        pair.pm_side,
-                        pm_bid,
-                        pm_shares,
-                        expected,
-                        MIN_RECOVERY_USD
-                    );
-                }
-            }
-        }
-        sleep(Duration::from_millis(200)).await;
-
-        // C-KS：检查我方 KS 持仓 bid
-        match fetch_market_orderbook_json(ks_http, kalshi_cfg, &pair.ks_ticker).await {
-            Ok(Some(book)) => {
-                if let Some(ks_bid) = kalshi_best_bid_for_side(&book, &pos.side) {
-                    if ks_bid <= C_LOSING_BID_THRESHOLD {
-                        let expected = ks_bid * pos.contracts;
-                        if expected >= MIN_RECOVERY_USD {
-                            println!(
-                                "   🟠 [C-KS止损] {} {} bid={:.3} qty={:.2} 预期≈${:.3} → 平仓",
-                                pair.ks_ticker, pos.side, ks_bid, pos.contracts, expected
-                            );
-                            close_ks_side(
-                                ks_http,
-                                kalshi_cfg,
-                                &pair.ks_ticker,
-                                &pos.side,
-                                pos.contracts,
-                                "C-KS止损",
-                            )
-                            .await;
-                        } else {
-                            println!(
-                                "   🟠 [C-KS止损] {} {} bid={:.3} qty={:.2} 预期≈${:.3} → 跳过（回收不足 ${}）",
-                                pair.ks_ticker, pos.side, ks_bid, pos.contracts, expected, MIN_RECOVERY_USD
-                            );
-                        }
-                    }
-                }
-            }
-            Ok(None) => {}
-            Err(e) => eprintln!("   ⚠️ 拉 KS 订单簿 {} 失败: {}", pair.ks_ticker, e),
         }
         sleep(Duration::from_millis(200)).await;
     }
