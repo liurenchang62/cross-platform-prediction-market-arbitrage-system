@@ -650,6 +650,48 @@ pub async fn maybe_validate_with_llm(
     Ok(Some(result))
 }
 
+/// 批量并发验证：所有二筛通过的匹配并行送 LLM，兼顾精度与效率
+///
+/// 参数：
+/// - matches: Vec<(pm_title, kalshi_title, category, context_data)>
+/// - concurrency: 并发数（建议 10-20，DeepSeek 能承受）
+///
+/// 返回：每个输入对应的验证结果，顺序与输入一致
+pub async fn validate_matches_concurrent<T: Clone + Send + 'static>(
+    matches: Vec<(String, String, String, T)>,
+    concurrency: usize,
+) -> Result<Vec<(Option<LlmValidationResult>, T)>> {
+    use futures::stream::{self, StreamExt};
+
+    let Some(config) = LlmValidatorConfig::from_env()? else {
+        // LLM 未启用，全部返回 None
+        return Ok(matches
+            .into_iter()
+            .map(|(_, _, _, ctx)| (None, ctx))
+            .collect());
+    };
+
+    let validator = LlmValidator::new(config)?;
+    let validator = std::sync::Arc::new(validator);
+
+    let results = stream::iter(matches)
+        .map(|(pm_title, ks_title, category, ctx)| {
+            let v = validator.clone();
+            async move {
+                let result = v
+                    .validate_match(&pm_title, &ks_title, &category)
+                    .await
+                    .ok();
+                (result, ctx)
+            }
+        })
+        .buffer_unordered(concurrency)
+        .collect::<Vec<_>>()
+        .await;
+
+    Ok(results)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
