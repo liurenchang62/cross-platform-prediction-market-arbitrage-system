@@ -1,5 +1,9 @@
 //! LLM 二次验证模块：在二筛通过后，调用 DeepSeek API 进行最终确认
 //!
+//! ==================== 设计目标 ====================
+//! 确保进入跟踪系统的套利对是 100% 匹配的，杜绝误匹配导致的交易风险。
+//! 本模块放置在二筛之后、全量匹配之后，响应时间不影响实际交易速度。
+//!
 //! ==================== 快速开始 ====================
 //! 1. 购买 DeepSeek API：访问 https://platform.deepseek.com/
 //! 2. 创建 API Key，充值余额（建议 20元起）
@@ -8,17 +12,19 @@
 //!    DEEPSEEK_API_KEY=sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 //! 4. （可选）调整参数：
 //!    LLM_MODEL=deepseek-chat          # 或 deepseek-reasoner
-//!    LLM_TIMEOUT_MS=5000                # 超时时间
-//!    LLM_MAX_TOKENS=150                 # 最大响应长度
+//!    LLM_TIMEOUT_MS=10000             # 超时时间（默认10秒，详细验证需要）
+//!    LLM_MAX_TOKENS=400                 # 最大响应长度（默认400，详细输出）
 //!    LLM_TEMPERATURE=0.0                # 创造性（0=最保守）
 //!
 //! ==================== 成本参考 ====================
 //! - DeepSeek-V3 (deepseek-chat): 输入 1元/百万token, 输出 2元/百万token
-//! - 单次验证约 500-800 token，成本约 0.001-0.002 元（1-2厘钱）
+//! - 单次验证约 1000-1500 token（详细验证输出），成本约 0.002-0.004 元（2-4厘钱）
+//! - 这个成本远低于一次错误匹配可能造成的损失
 //!
-//! ==================== 启用逻辑 ====================
-//! - 二筛规则通过后，如果检测到 LLM_PROVIDER 设置，自动调用
-//! - LLM 判断不同合约时，会打印 🚫 LLM拒绝 并阻断匹配
+//! ==================== 验证逻辑 ====================
+//! - 检查项：事件同一性、标的同一性、命题类型一致性、关键参数完全匹配
+//! - 支持互斥市场：方向相反（YES/NO对立）是合法的套利模式
+//! - LLM 判断不匹配时，会打印 🚫 LLM拒绝 并阻断匹配
 //! - LLM API 故障时会打印 ⚠️ LLM验证失败 并保守放行（回退到规则判断）
 
 use anyhow::{Context, Result};
@@ -105,12 +111,12 @@ impl LlmValidatorConfig {
         let timeout_ms = env::var("LLM_TIMEOUT_MS")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(5000);
+            .unwrap_or(10000);  // 增加超时以适应详细验证
 
         let max_tokens = env::var("LLM_MAX_TOKENS")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(150);
+            .unwrap_or(400);  // 增加以适应详细的验证输出
 
         let temperature = env::var("LLM_TEMPERATURE")
             .ok()
@@ -178,32 +184,106 @@ impl LlmValidator {
         })
     }
 
-    /// 构建提示词
+    /// 构建提示词 - 严格版，确保100%匹配准确性
+    ///
+    /// 关键概念：
+    /// - 这是跨平台套利交易场景，两个平台可以有完全相同的合约，也可以有互斥合约
+    /// - 互斥合约 = 同一标的但方向相反（如一个押A赢YES，另一个押A输NO），这在套利中是合法的
+    /// - 我们需要的是【同一标的】，不一定需要【同一方向】
     fn build_prompt(&self, pm_title: &str, kalshi_title: &str, category: &str) -> String {
         format!(
-            "你是一名预测市场合约比对专家。请判断以下两个合约是否是同一标的的同一方向合约：
+            "你是一个预测市场套利系统的合约匹配审核专家。你的任务是判断 Polymarket 和 Kalshi 两个平台的合约是否指向【完全相同的标的（事件/比赛/选举/ proposition）】。
 
-【Polymarket合约】
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+【Polymarket 合约标题】
 {pm_title}
 
-【Kalshi合约】
+【Kalshi 合约标题】
 {kalshi_title}
 
-【类别】{category}
+【市场类别】{category}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-【判断标准】
-1. 是否是同一事件/标的（如都是同一场比赛、同一选举）
-2. 是否是同一方向（如都是看涨、都是看跌，或都是某队获胜）
-3. 是否涉及相同的关键参数（如分数线、日期、队伍）
+【核心任务】
+判断这两个合约是否描述的是【同一标的】。注意：方向（YES/NO）可以不同，这在套利中是正常的。重点是【标的是否完全一致】。
 
-【注意】
-- 如果一个是胜负盘，一个是总进球数盘，回答[否]
-- 如果一个是单场比赛，一个是锦标赛冠军，回答[否]
-- 如果日期/队伍明显不同，回答[否]
+【必须通过的全部检查项】
 
-请严格按以下格式回答：
-答案: <是/否>
-原因: <不超过15字的简要说明>",
+1. 【事件同一性】是否是同一个具体事件？
+   - 体育：同一场比赛（同两队、同日期、同赛事轮次）
+   - 选举：同一个选举/候选人/选区/轮次
+   - 金融：同一标的/同一到期日/同一行权价
+   - 娱乐：同一颁奖/同一节目/同一赛季
+   - 如果涉及不同赛季、不同日期、不同对阵 → [否]
+
+2. 【标的同一性】指向的具体对象是否完全一致？
+   - 球队/选手名称是否完全对应（注意简称vs全称、缩写vs完整名）
+   - 候选人姓名是否同一人
+   - 地区/选区是否一致
+   - 如果一方提到具体选手，另一方提到的是比赛本身 → [否]
+
+3. 【命题类型一致性】合约类型是否对应？
+   ✓ 允许的类型对应：
+     - 胜负盘(Winner) ↔ 胜负盘(Winner)：YES/NO可以相反
+     - 统计盘口(Points/Assists/Rebounds) ↔ 统计盘口：O/U X.5 ↔ X+ / X-
+     - 冠军盘(Champion/Win the tournament) ↔ 冠军盘
+     - 晋级盘(Advance/Make playoffs) ↔ 晋级盘
+     - 特定事件发生盘(Will X happen?) ↔ (Will X happen?)
+   
+   ✗ 严禁匹配的类型错配：
+     - 胜负盘 ↔ 统计盘口（如 Winner vs Points O/U）→ [否]
+     - 单场比赛 ↔ 锦标赛冠军 → [否]
+     - 比赛结束盘(Completed match) ↔ 胜负盘(Winner) → [否]
+     - 总进球数(Goals scored) ↔ 胜负盘 → [否]
+     - 第一轮选举 ↔ 大选/决选 → [否]
+
+4. 【关键参数完全匹配】所有数字和阈值必须一致：
+   - 分数线必须完全对应（O/U 2.5 ↔ 2+ / 3- 是互斥，不是同一标的，回答[否]）
+   - 统计阈值必须匹配（如 Assists 2+ vs Assists 3+ 是不同标的 → [否]）
+   - 日期必须一致（日期不一致 → [否]）
+   - 轮次必须一致（Round 1 vs Round 2 → [否]）
+
+5. 【方向理解】（重要）
+   - 两个合约可以方向相反（一个YES一个NO），这是套利的基础
+   - 只要标的是同一事件、同一阈值、同一类型，方向相反是正常的
+   - 例如：PM Lakers-vs-Celtics-Winner-Lakers YES vs KS Lakers-vs-Celtics-Winner NO 是合法的套利对 → [是]
+
+【常见错误陷阱 - 必须避免】
+- ❌ 只看标题相似度，忽略具体参数
+- ❌ 忽略轮次/阶段差异（初选vs大选、第一轮vs第二轮）
+- ❌ 将统计盘口与胜负盘混为一谈
+- ❌ 忽略分数线差异（2.5 vs 3.5 是不同市场）
+- ❌ 忽略队伍名称对应关系（简称vs全称）
+
+【决策流程】
+1. 先判断是否是同一事件/比赛/标的
+2. 如果是，判断命题类型是否一致
+3. 如果是，检查所有关键参数（分数线、日期、轮次）是否完全一致
+4. 如果全部匹配，回答[是]（即使方向相反也是正常的）
+5. 任一项不匹配，回答[否]
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+【输出格式 - 严格遵循】
+
+答案: [是] 或 [否]
+置信度: [高/中/低]
+匹配理由: [一句话说明为什么匹配或不匹配]
+关键验证点: [列出验证通过的关键点，如：1.同一场比赛✓ 2.都是胜负盘✓ 3.队伍名称一致✓]
+
+示例输出1（匹配）：
+答案: [是]
+置信度: [高]
+匹配理由: [同一场NBA比赛LAL vs BOS，都是胜负盘，队伍名称完全对应]
+关键验证点: [1.事件：Lakers vs Celtics同一场✓ 2.类型：都是Winner盘✓ 3.标的：Lakers/Celtics对应✓ 4.日期一致✓]
+
+示例输出2（不匹配）：
+答案: [否]
+置信度: [高]
+匹配理由: [一个是总进球数盘口，一个是胜负盘，标的不同]
+关键验证点: [1.事件：同一场比赛✓ 2.类型：Goals O/U vs Winner ✗ 类型不匹配]
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+现在请分析上面的两个合约标题，给出你的判断：",
             pm_title = pm_title,
             kalshi_title = kalshi_title,
             category = category
@@ -268,26 +348,56 @@ impl LlmValidator {
         Ok(content.to_string())
     }
 
-    /// 解析响应
+    /// 解析响应 - 支持新的详细格式
     fn parse_response(&self, response: &str) -> (bool, String) {
         let response_lower = response.to_lowercase();
 
-        // 检查是否包含 "是" 或 "否"
-        let is_same = if response_lower.contains("答案: 是") || response_lower.contains("答案：是") {
+        // 提取答案 [是] 或 [否]
+        let is_same = if response_lower.contains("答案: [是]") ||
+                         response_lower.contains("答案：[是]") ||
+                         response_lower.contains("答案:是") ||
+                         response_lower.contains("答案：是") {
             true
-        } else if response_lower.contains("答案: 否") || response_lower.contains("答案：否") {
+        } else if response_lower.contains("答案: [否]") ||
+                  response_lower.contains("答案：[否]") ||
+                  response_lower.contains("答案:否") ||
+                  response_lower.contains("答案：否") {
             false
         } else {
-            // 兜底：简单关键词判断
-            response_lower.contains("是") && !response_lower.contains("否")
+            // 兜底：按简单关键词判断
+            let has_yes = response_lower.contains("[是]") ||
+                         response_lower.contains("是") && !response_lower.contains("否");
+            let has_no = response_lower.contains("[否]") ||
+                        response_lower.contains("否");
+            has_yes && !has_no
         };
 
-        // 提取原因
+        // 提取匹配理由（更详细的说明）
         let reasoning = response
             .lines()
-            .find(|l| l.contains("原因:"))
-            .map(|l| l.split("原因:").nth(1).unwrap_or(l).trim().to_string())
-            .unwrap_or_else(|| "-".to_string());
+            .find(|l| l.to_lowercase().contains("匹配理由:"))
+            .map(|l| {
+                let lower = l.to_lowercase();
+                if let Some(idx) = lower.find("匹配理由:") {
+                    l[idx + "匹配理由:".len()..].trim()
+                        .trim_start_matches('[')
+                        .trim_end_matches(']')
+                        .to_string()
+                } else {
+                    l.to_string()
+                }
+            })
+            .or_else(|| {
+                // 备选：尝试提取关键验证点
+                response
+                    .lines()
+                    .find(|l| l.to_lowercase().contains("关键验证点:"))
+                    .map(|l| l.trim().to_string())
+            })
+            .unwrap_or_else(|| {
+                // 最终备选：简单判断
+                if is_same { "LLM判断为匹配".to_string() } else { "LLM判断为不匹配".to_string() }
+            });
 
         (is_same, reasoning)
     }
