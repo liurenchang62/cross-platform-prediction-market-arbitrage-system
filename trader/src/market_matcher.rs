@@ -344,36 +344,64 @@ impl MarketMatcher {
         }
 
         // ===== LLM 二次验证（如果启用）=====
-        // 无论是否实盘模式，都对二筛通过的匹配进行 LLM 验证
+        // 【高并发优化】默认 32 并发，200 对约 12-20 秒完成（假设单请求 2-3 秒）
         let deduped = if crate::llm_validator::llm_validation_enabled() {
-            println!("\n🤖 LLM 二次验证启动（{} 对候选）...", deduped.len());
+            let llm_concurrency: usize = std::env::var("LLM_CONCURRENCY")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(32); // 默认 32 并发，兼顾速度与稳定性
+
+            let llm_total = deduped.len();
+            println!("\n🤖 LLM 二次验证启动（{} 对候选，并发 {}）...", llm_total, llm_concurrency);
+            let llm_start = std::time::Instant::now();
+
+            // 准备并发输入数据
+            let inputs: Vec<(String, String, String, (Market, Market, f64, String, String, bool, String))> = deduped
+                .into_iter()
+                .map(|(pm, ks, sim, p_side, k_side, inv, cat)| {
+                    (pm.title.clone(), ks.title.clone(), cat.clone(), (pm, ks, sim, p_side, k_side, inv, cat))
+                })
+                .collect();
+
+            // 执行高并发批量验证
+            let results = crate::llm_validator::validate_matches_concurrent(inputs, llm_concurrency)
+                .await
+                .unwrap_or_else(|e| {
+                    eprintln!("⚠️ LLM 并发验证失败，回退到规则判断: {}", e);
+                    vec![]
+                });
+
+            // 分离通过/拒绝
             let mut llm_passed = Vec::new();
             let mut llm_rejected = 0usize;
+            let mut llm_errors = 0usize;
 
-            for (pm, ks, sim, p_side, k_side, inv, cat) in deduped {
-                match crate::validation::second_screen_with_llm_check(
-                    &pm.title,
-                    &ks.title,
-                    sim,
-                    &cat,
-                )
-                .await
-                {
-                    Some(_) => {
+            for (result, (pm, ks, sim, p_side, k_side, inv, cat)) in results {
+                match result {
+                    Some(validation) if validation.is_same_contract => {
                         llm_passed.push((pm, ks, sim, p_side, k_side, inv, cat));
                     }
-                    None => {
+                    Some(validation) => {
+                        println!("   ✗ LLM拒绝 [{}] {}ms | {}", 
+                            validation.provider.display_name(),
+                            validation.latency_ms,
+                            validation.reasoning.chars().take(60).collect::<String>()
+                        );
                         llm_rejected += 1;
+                    }
+                    None => {
+                        // LLM 出错，保守放行（不误杀）
+                        llm_errors += 1;
+                        llm_passed.push((pm, ks, sim, p_side, k_side, inv, cat));
                     }
                 }
             }
 
-            let llm_elapsed = start_time.elapsed();
+            let llm_elapsed = llm_start.elapsed();
+            let avg_time = if llm_total > 0 { llm_elapsed.as_millis() as f64 / llm_total as f64 } else { 0.0 };
             println!(
-                "🤖 LLM 验证完成：通过 {} 对，拒绝 {} 对，耗时 {:?}",
-                llm_passed.len(),
-                llm_rejected,
-                llm_elapsed
+                "🤖 LLM 验证完成：通过 {} 对，拒绝 {} 对，错误 {} 对，并发 {}，总耗时 {:?}，平均每对 {:.1}ms",
+                llm_passed.len(), llm_rejected, llm_errors, llm_concurrency, llm_elapsed, avg_time
             );
             llm_passed
         } else {
