@@ -73,6 +73,14 @@ impl LlmProvider {
         }
     }
 
+    /// API Key 文件路径环境变量名
+    fn api_key_path_env(&self) -> &'static str {
+        match self {
+            Self::DeepSeek => "DEEPSEEK_API_KEY_PATH",
+            Self::Moonshot => "MOONSHOT_API_KEY_PATH",
+        }
+    }
+
     /// 显示名称
     pub fn display_name(&self) -> &'static str {
         match self {
@@ -93,16 +101,25 @@ pub struct LlmValidatorConfig {
 }
 
 impl LlmValidatorConfig {
+    /// 从环境变量或文件加载配置
+    ///
+    /// API Key 加载优先级：
+    /// 1. 如果设置了 `DEEPSEEK_API_KEY_PATH`（或对应 provider 的 _PATH 变量），从该文件读取
+    /// 2. 否则尝试直接读取 `DEEPSEEK_API_KEY` 环境变量
     pub fn from_env() -> Result<Option<Self>> {
         let Some(provider) = LlmProvider::from_env() else {
             return Ok(None);
         };
 
-        let api_key = env::var(provider.api_key_env())
-            .with_context(|| format!("{} 未设置", provider.api_key_env()))?;
+        // 尝试从文件或环境变量获取 API Key
+        let api_key = Self::load_api_key(&provider)?;
 
         if api_key.trim().is_empty() {
-            anyhow::bail!("{} 为空", provider.api_key_env());
+            anyhow::bail!(
+                "{} 和 {} 均未设置或为空",
+                provider.api_key_path_env(),
+                provider.api_key_env()
+            );
         }
 
         let model = env::var("LLM_MODEL")
@@ -131,6 +148,48 @@ impl LlmValidatorConfig {
             max_tokens,
             temperature,
         }))
+    }
+
+    /// 加载 API Key：优先从文件，其次环境变量
+    fn load_api_key(provider: &LlmProvider) -> Result<String> {
+        // 先检查是否有文件路径
+        if let Ok(key_path) = env::var(provider.api_key_path_env()) {
+            let trimmed = key_path.trim();
+            if !trimmed.is_empty() {
+                // 规范化路径（支持 Windows 路径）
+                let normalized = Self::normalize_file_path(trimmed);
+                return Self::read_key_from_file(&normalized, provider.api_key_path_env());
+            }
+        }
+
+        // 退回到直接环境变量
+        env::var(provider.api_key_env())
+            .with_context(|| format!("{} 未设置", provider.api_key_env()))
+    }
+
+    /// 从文件读取 API Key（取第一行非空非注释内容）
+    fn read_key_from_file(path: &str, env_name: &str) -> Result<String> {
+        let contents = std::fs::read_to_string(path)
+            .with_context(|| format!("{} 指向的文件无法读取: {}", env_name, path))?;
+
+        // 提取第一行有效内容（跳过空行和 # 注释行）
+        let key = contents
+            .lines()
+            .map(|l| l.trim())
+            .find(|l| !l.is_empty() && !l.starts_with('#'))
+            .context(format!("{} 指向的文件没有有效内容: {}", env_name, path))?;
+
+        Ok(key.to_string())
+    }
+
+    /// 规范化文件路径（处理 Windows 反斜杠等）
+    fn normalize_file_path(path: &str) -> String {
+        // 去除首尾引号（如果有）
+        let trimmed = path.trim_matches('"').trim_matches('\'');
+        // 统一使用系统路径分隔符
+        std::path::PathBuf::from(trimmed)
+            .to_string_lossy()
+            .to_string()
     }
 }
 
