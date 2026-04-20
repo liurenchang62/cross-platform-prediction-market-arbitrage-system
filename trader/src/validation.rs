@@ -12,6 +12,14 @@ static ELECTORAL_STATE_DISTRICT_RE: Lazy<Regex> = Lazy::new(|| {
 static ELECTORAL_NTH_PLACE_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"(?i)\b\d+(?:st|nd|rd|th)\s+place\b").expect("ELECTORAL_NTH_PLACE_RE")
 });
+/// 流媒体榜单明确名次：匹配 `#2`、`# 2`、`#10` 等
+static STREAMING_RANK_NUM_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"#\s*(\d+)").expect("STREAMING_RANK_NUM_RE")
+});
+/// "top 10"、"top 5" 等范围表达（"top" 后跟 ≥2 的数字）
+static STREAMING_RANK_TOP_RANGE_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)\btop\s+[2-9]\d*\b").expect("STREAMING_RANK_TOP_RANGE_RE")
+});
 
 /// 安全词列表（单方有日期时放行）
 const SAFE_WORDS: [&str; 8] = [
@@ -908,6 +916,29 @@ impl EntertainmentChartValidator {
         l.contains("top 10") || l.contains("top10")
     }
 
+    fn looks_like_streaming_chart(title: &str) -> bool {
+        let l = title.to_lowercase();
+        l.contains("netflix") || l.contains("hulu") || l.contains("prime video")
+            || l.contains("disney+") || l.contains("disney plus")
+            || l.contains("hbo max") || l.contains("apple tv+") || l.contains("peacock")
+    }
+
+    /// 从标题中提取明确的单一名次档位。
+    /// `"#2 Netflix show"` → `Some(2)`；
+    /// `"Top US Netflix Show"` (无范围数字) → `Some(1)`；
+    /// `"Top 10 Netflix"` → `None`（范围，非单一名次）。
+    fn extract_chart_rank(title: &str) -> Option<u32> {
+        let l = title.to_lowercase();
+        if let Some(cap) = STREAMING_RANK_NUM_RE.captures(&l) {
+            return cap[1].parse::<u32>().ok();
+        }
+        // "top " 后无数字范围（如"top 10"）→ 第一名
+        if l.contains("top ") && !STREAMING_RANK_TOP_RANGE_RE.is_match(&l) {
+            return Some(1);
+        }
+        None
+    }
+
     /// Billboard/Hot100 与 Spotify 混配（用于二筛提示语）
     pub(crate) fn is_billboard_spotify_cross(pm_title: &str, kalshi_title: &str) -> bool {
         let pm_bb = Self::looks_like_billboard_chart(pm_title);
@@ -927,16 +958,30 @@ impl EntertainmentChartValidator {
             return false;
         }
 
-        if !pm_bb || !ks_bb {
-            return true;
+        if pm_bb && ks_bb {
+            let pm_one = Self::has_number_one_rank(pm_title);
+            let ks_one = Self::has_number_one_rank(kalshi_title);
+            let pm_t10 = Self::has_top_ten_rank(pm_title);
+            let ks_t10 = Self::has_top_ten_rank(kalshi_title);
+            if (pm_one && ks_t10) || (ks_one && pm_t10) {
+                return false;
+            }
         }
-        let pm_one = Self::has_number_one_rank(pm_title);
-        let ks_one = Self::has_number_one_rank(kalshi_title);
-        let pm_t10 = Self::has_top_ten_rank(pm_title);
-        let ks_t10 = Self::has_top_ten_rank(kalshi_title);
-        if (pm_one && ks_t10) || (ks_one && pm_t10) {
-            return false;
+
+        // 流媒体榜单（Netflix 等）名次档位必须一致：#1 与 #2 不能互配
+        let pm_streaming = Self::looks_like_streaming_chart(pm_title);
+        let ks_streaming = Self::looks_like_streaming_chart(kalshi_title);
+        if pm_streaming && ks_streaming {
+            if let (Some(pr), Some(kr)) = (
+                Self::extract_chart_rank(pm_title),
+                Self::extract_chart_rank(kalshi_title),
+            ) {
+                if pr != kr {
+                    return false;
+                }
+            }
         }
+
         true
     }
 }
@@ -2018,6 +2063,72 @@ pub(crate) fn second_screen_try_match_with_reason(
     })
 }
 
+/// ==================== LLM 二次验证（异步）====================
+///
+/// 在二筛规则通过后，可选择调用 DeepSeek/Kimi 大模型进行最终确认。
+/// 适用于对规则判断不够自信的场景，或对重要交易增加人工-like 审核。
+///
+/// 使用方式：
+/// 1. 设置环境变量：LLM_PROVIDER=deepseek, DEEPSEEK_API_KEY=sk-xxx
+/// 2. 调用此函数对二筛通过的候选进行最终确认
+/// 3. LLM 判断为"不同合约"时返回 None，中断匹配
+///
+/// 注意：LLM 调用会增加延迟（通常 500ms-2s），建议在并行处理中异步执行。
+
+/// 异步二筛 + LLM 验证（供交易核心调用）
+pub async fn second_screen_with_llm_check(
+    pm_title: &str,
+    kalshi_title: &str,
+    similarity: f64,
+    category: &str,
+) -> Option<MatchInfo> {
+    // 先走常规二筛
+    let result = second_screen_try_match(pm_title, kalshi_title, similarity, category);
+    if result.is_none() {
+        return None; // 规则二筛已拒绝
+    }
+
+    // 如果启用了 LLM 验证，进行二次确认
+    if crate::llm_validator::llm_validation_enabled() {
+        match crate::llm_validator::maybe_validate_with_llm(
+            pm_title,
+            kalshi_title,
+            category,
+        )
+        .await
+        {
+            Ok(Some(validation)) => {
+                if validation.is_same_contract {
+                    println!(
+                        "   🤖 LLM确认通过 [{}] {}ms | {}",
+                        validation.provider.display_name(),
+                        validation.latency_ms,
+                        validation.reasoning
+                    );
+                    result
+                } else {
+                    println!(
+                        "   🚫 LLM拒绝 [{}]: {}",
+                        validation.provider.display_name(),
+                        validation.reasoning
+                    );
+                    None
+                }
+            }
+            Ok(None) => {
+                // LLM 未配置，直接返回规则结果
+                result
+            }
+            Err(e) => {
+                eprintln!("   ⚠️ LLM验证失败，回退到规则判断: {}", e);
+                result // LLM 调用失败时保守放行，回退到规则判断
+            }
+        }
+    } else {
+        result // LLM 未启用
+    }
+}
+
 /// ==================== 主验证管道 ====================
 pub struct ValidationPipeline {
     date_validator: DateValidator,
@@ -2527,6 +2638,30 @@ mod tests {
         assert!(EntertainmentChartValidator::allows_pair(
             "Will X be Billboard #1 for March 28?",
             "Will Y be Billboard #1 for March 28?"
+        ));
+    }
+
+    #[test]
+    fn test_netflix_rank_mismatch_rejected() {
+        // #2 Netflix vs Top (#1) Netflix → 不同名次，拒绝
+        assert!(!EntertainmentChartValidator::allows_pair(
+            "Will \"Big Mistakes: Season 1\" be the #2 US Netflix show this week?",
+            "Top US Netflix Show on Apr 20, 2026? - Big Mistakes: Season 1"
+        ));
+        // 同为 #1 → 放行
+        assert!(EntertainmentChartValidator::allows_pair(
+            "Will X be the #1 Netflix show this week?",
+            "Top US Netflix Show this week? - X"
+        ));
+        // 同为 #2 → 放行
+        assert!(EntertainmentChartValidator::allows_pair(
+            "Will X be the #2 Netflix show this week?",
+            "Will X be the #2 US Netflix show? - X"
+        ));
+        // Top 10 Netflix (范围) vs #1 → 无明确单一名次，不拒绝（由其他逻辑处理）
+        assert!(EntertainmentChartValidator::allows_pair(
+            "Will X be in the Top 10 Netflix shows?",
+            "Top US Netflix Show? - X"
         ));
     }
 

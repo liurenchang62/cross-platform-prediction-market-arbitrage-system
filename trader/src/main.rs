@@ -29,6 +29,7 @@ mod fee_model;
 mod kalshi_fee_schedule;
 mod session_risk;
 mod position_cleanup;
+mod llm_validator;
 
 use std::collections::HashSet;
 use std::io::Write;
@@ -1764,160 +1765,222 @@ async fn run_tracking_cycle(
         monitor_state.persist_round_counts_batch(&rounds_batch, ARB_ROUNDS_STORE_PATH);
         diag_total = diag_slot.take().unwrap_or_default();
     } else {
-        println!(
-            "      … 使用并发 {} 校验 {} 个活跃对（sweep 模式：确认无机会的不重扫，交易后立即继续扫剩余对）",
-            conc, n_active
-        );
+        // ── Scheme C 槽扫描 ─────────────────────────────────────────────────────
+        // 每次 price_track 调用只扫描一个槽（最多 conc 对）。
+        // 槽从 scan_rotation_queue 中弹出；队列清空时进入新追踪周期：
+        //   Scheme A：连续 3 个追踪周期 KS 订单簿均空 → 跳过 5 个追踪周期。
+        //   有成交 → 将该对压回队首，下次优先再扫。
 
-        let ks_fee_j = ks_fee.clone();
-        let cm_j = category_mapper.clone();
-        let pm_tc = pm_trader.clone();
-
-        // ── sweep 架构 ──────────────────────────────────────────────────────────────
-        // scanned：已返回结果（无论 Some/None）的 pair 索引集合。
-        // 每轮 sweep 迭代：对未扫描对发起新 buffer_unordered 检测。
-        //   • 发现机会 → 原子执行 → break 内循环（取消在途 future）→ 立即以剩余未扫描对开新轮
-        //   • 全部无机会 → break 外循环（本次 sweep 完成）
-        // 结果：已确认无机会的对在本次 sweep 内不重复检测；交易后剩余对立即继续扫，无等待。
-        let mut scanned: HashSet<usize> = HashSet::new();
-
-        'sweep: loop {
-            let remaining: Vec<(usize, TrackedArbitrage)> = monitor_state
-                .tracked_pairs
-                .iter()
-                .enumerate()
-                .filter(|(i, p)| p.active && !scanned.contains(i))
-                .map(|(i, p)| (i, p.clone()))
-                .collect();
-
-            if remaining.is_empty() {
-                break 'sweep;
-            }
-
-            let ks_fee_s = ks_fee_j.clone();
-            let cm_s = cm_j.clone();
-            let pm_ts = pm_tc.clone();
-
-            let mut det_stream = stream::iter(remaining.into_iter())
-                .map(|(idx, pair)| {
-                    let pm = polymarket.clone();
-                    let ks = kalshi.clone();
-                    let det = arb_detector.clone();
-                    let kf = ks_fee_s.clone();
-                    let cm = cm_s.clone();
-                    let pm_tr = pm_ts.clone();
-                    async move {
-                        let mut dslot = Some(TrackingArbDiag::default());
-                        let core = validate_arbitrage_core(
-                            &pm,
-                            &ks,
-                            &det,
-                            &pair.pm_market,
-                            &pair.kalshi_market,
-                            &pair.pm_side,
-                            &pair.kalshi_side,
-                            pair.needs_inversion,
-                            trade_amount,
-                            pair_cap_usdt,
-                            kf.as_ref(),
-                            cm.as_ref(),
-                            &pm_tr,
-                            &mut dslot,
-                            true,
-                        )
-                        .await;
-                        let frag = dslot.unwrap_or_default();
-                        (idx, pair, core, frag)
-                    }
-                })
-                .buffer_unordered(conc);
-
-            let mut traded = false;
-            let mut traded_pair_id: Option<String> = None;
-            let mut traded_rounds: u32 = 0;
-
-            while let Some((idx, pair, core_res, frag)) = det_stream.next().await {
-                diag_total.merge_from(&frag);
-                scanned.insert(idx); // 已得到结果，本次 sweep 不再重扫
-                let tr = &mut monitor_state.tracked_pairs[idx];
-                tr.pm_market = pair.pm_market;
-                match core_res {
-                    Ok(Some((opp, pm_exp, ks_exp))) => {
-                        let paused = session_risk
-                            .lock()
-                            .map(|g| g.trading_paused())
-                            .unwrap_or(false);
-                        if paused {
-                            println!("   🔒 会话风控：现金预警未解除，跳过本对实盘下单。");
-                            print_arbitrage_detection_books(
-                                &opp,
-                                &tr.pm_market.title,
-                                &tr.kalshi_market.title,
-                                tr.similarity,
-                                tr.needs_inversion,
-                                &tr.pm_side,
-                                &tr.kalshi_side,
-                                pm_exp,
-                                ks_exp,
-                            );
-                        } else {
-                            validate_arbitrage_pair_post_success(
-                                polymarket,
-                                &tr.pm_market,
-                                &tr.kalshi_market,
-                                tr.similarity,
-                                &tr.pm_side,
-                                &tr.kalshi_side,
-                                tr.needs_inversion,
-                                trade_amount,
-                                desk_ctx,
-                                "price_track",
-                                &tr.pair_id,
-                                live_log,
-                                ks_http,
-                                kalshi_cfg,
-                                pm_trader,
-                                ks_fee.as_ref(),
-                                per_leg_cap_usd,
-                                &opp,
-                                pm_exp,
-                                ks_exp,
-                                session_risk,
-                            )
-                            .await?;
-                            tr.arb_rounds_executed += 1;
-                            traded_pair_id = Some(tr.pair_id.clone());
-                            traded_rounds = tr.arb_rounds_executed;
-                            traded = true;
-                        }
-                        opportunity_count += 1;
-                        tr.last_check = Utc::now();
-                        if opp.net_profit_100 > tr.best_profit {
-                            tr.best_profit = opp.net_profit_100;
-                        }
-                        // 发现并处理机会后 break 内循环：
-                        //   • det_stream drop → 取消所有在途 future（价格数据作废）
-                        //   • 外循环立即用剩余未扫描对（!scanned）重启新一轮检测
-                        break;
-                    }
-                    Ok(None) => {}
-                    Err(e) => return Err(e),
-                }
-            }
-            drop(det_stream); // 显式取消所有挂起 future
-
-            if let Some(pid) = traded_pair_id {
-                monitor_state.persist_round_counts_batch(&[(pid, traded_rounds)], ARB_ROUNDS_STORE_PATH);
-            }
-
-            if !traded {
-                // 本次 sweep 迭代中所有对均已扫完且无机会 → sweep 结束
-                break 'sweep;
-            }
-            // traded=true：继续 sweep 外循环，立即对剩余未扫对重新检测
+        // ── 队列空 → 追踪周期结束，Scheme A 状态更新后重建 ──────────────────
+        if monitor_state.scan_rotation_queue.is_empty() {
+            monitor_state.advance_tracking_cycle();
         }
 
-        println!("      … 并发追踪校验结束，总用时 {:?}", tick.elapsed());
+        // 弹出本槽要扫描的对索引（最多 conc 个）
+        let mut slot_indices: Vec<usize> = Vec::with_capacity(conc);
+        while slot_indices.len() < conc {
+            match monitor_state.scan_rotation_queue.pop_front() {
+                Some(idx) => {
+                    // 防御性检查：索引越界或对已不活跃则丢弃
+                    if idx < monitor_state.tracked_pairs.len()
+                        && monitor_state.tracked_pairs[idx].active
+                    {
+                        slot_indices.push(idx);
+                    }
+                }
+                None => break,
+            }
+        }
+
+        if slot_indices.is_empty() {
+            println!("      … 本槽无可扫对（队列空且无活跃对），跳过本次追踪。");
+        } else {
+            let queue_remaining = monitor_state.scan_rotation_queue.len();
+            println!(
+                "      … 槽扫描：本槽 {} 对，队列剩余 {} 对（追踪周期 #{}）",
+                slot_indices.len(),
+                queue_remaining,
+                monitor_state.tracking_cycle_serial,
+            );
+
+            // ── KS 预热：槽内唯一 ticker 先串行拉取一次，写入缓存 ───────────
+            // 同一 KS ticker 双向展开后仅预热一次，sweep 时两个方向均命中缓存。
+            {
+                let unique_tickers: Vec<String> = slot_indices
+                    .iter()
+                    .map(|&i| monitor_state.tracked_pairs[i].kalshi_market.market_id.clone())
+                    .collect::<std::collections::HashSet<_>>()
+                    .into_iter()
+                    .collect();
+                let n_unique = unique_tickers.len();
+                let n_slot = slot_indices.len();
+                if n_unique < n_slot {
+                    // 槽内有重复 ticker（双向展开），预热去重后的唯一 ticker
+                    let ks_prewarm = kalshi.clone();
+                    stream::iter(unique_tickers)
+                        .map(|t| {
+                            let ks = ks_prewarm.clone();
+                            async move { ks.fetch_order_book_raw(&t).await; }
+                        })
+                        .buffer_unordered(conc)
+                        .for_each(|_| async {})
+                        .await;
+                }
+            }
+
+            let ks_fee_j = ks_fee.clone();
+            let cm_j = category_mapper.clone();
+            let pm_tc = pm_trader.clone();
+
+            // ── sweep within slot ───────────────────────────────────────────
+            // 槽内发现机会 → 执行 → 取消在途 future → 重扫槽内剩余对
+            let mut scanned_in_slot: HashSet<usize> = HashSet::new();
+
+            'sweep: loop {
+                let remaining: Vec<(usize, TrackedArbitrage)> = slot_indices
+                    .iter()
+                    .filter(|i| !scanned_in_slot.contains(*i))
+                    .map(|&i| (i, monitor_state.tracked_pairs[i].clone()))
+                    .collect();
+
+                if remaining.is_empty() {
+                    break 'sweep;
+                }
+
+                let ks_fee_s = ks_fee_j.clone();
+                let cm_s = cm_j.clone();
+                let pm_ts = pm_tc.clone();
+
+                let mut det_stream = stream::iter(remaining.into_iter())
+                    .map(|(idx, pair)| {
+                        let pm = polymarket.clone();
+                        let ks = kalshi.clone();
+                        let det = arb_detector.clone();
+                        let kf = ks_fee_s.clone();
+                        let cm = cm_s.clone();
+                        let pm_tr = pm_ts.clone();
+                        async move {
+                            let mut dslot = Some(TrackingArbDiag::default());
+                            let core = validate_arbitrage_core(
+                                &pm,
+                                &ks,
+                                &det,
+                                &pair.pm_market,
+                                &pair.kalshi_market,
+                                &pair.pm_side,
+                                &pair.kalshi_side,
+                                pair.needs_inversion,
+                                trade_amount,
+                                pair_cap_usdt,
+                                kf.as_ref(),
+                                cm.as_ref(),
+                                &pm_tr,
+                                &mut dslot,
+                                true,
+                            )
+                            .await;
+                            let frag = dslot.unwrap_or_default();
+                            (idx, pair, core, frag)
+                        }
+                    })
+                    .buffer_unordered(conc);
+
+                let mut traded = false;
+                let mut traded_pair_id: Option<String> = None;
+                let mut traded_rounds: u32 = 0;
+                let mut traded_idx: Option<usize> = None;
+
+                while let Some((idx, pair, core_res, frag)) = det_stream.next().await {
+                    diag_total.merge_from(&frag);
+                    scanned_in_slot.insert(idx);
+                    let tr = &mut monitor_state.tracked_pairs[idx];
+                    tr.pm_market = pair.pm_market;
+                    // KS ask 侧无档位 → 标记本周期空
+                    if frag.ladder_ks_liq_empty_side > 0 {
+                        tr.ks_empty_this_cycle = true;
+                    }
+                    match core_res {
+                        Ok(Some((opp, pm_exp, ks_exp))) => {
+                            let paused = session_risk
+                                .lock()
+                                .map(|g| g.trading_paused())
+                                .unwrap_or(false);
+                            if paused {
+                                println!("   🔒 会话风控：现金预警未解除，跳过本对实盘下单。");
+                                print_arbitrage_detection_books(
+                                    &opp,
+                                    &tr.pm_market.title,
+                                    &tr.kalshi_market.title,
+                                    tr.similarity,
+                                    tr.needs_inversion,
+                                    &tr.pm_side,
+                                    &tr.kalshi_side,
+                                    pm_exp,
+                                    ks_exp,
+                                );
+                            } else {
+                                validate_arbitrage_pair_post_success(
+                                    polymarket,
+                                    &tr.pm_market,
+                                    &tr.kalshi_market,
+                                    tr.similarity,
+                                    &tr.pm_side,
+                                    &tr.kalshi_side,
+                                    tr.needs_inversion,
+                                    trade_amount,
+                                    desk_ctx,
+                                    "price_track",
+                                    &tr.pair_id,
+                                    live_log,
+                                    ks_http,
+                                    kalshi_cfg,
+                                    pm_trader,
+                                    ks_fee.as_ref(),
+                                    per_leg_cap_usd,
+                                    &opp,
+                                    pm_exp,
+                                    ks_exp,
+                                    session_risk,
+                                )
+                                .await?;
+                                tr.arb_rounds_executed += 1;
+                                traded_pair_id = Some(tr.pair_id.clone());
+                                traded_rounds = tr.arb_rounds_executed;
+                                traded_idx = Some(idx);
+                                traded = true;
+                            }
+                            opportunity_count += 1;
+                            tr.last_check = Utc::now();
+                            if opp.net_profit_100 > tr.best_profit {
+                                tr.best_profit = opp.net_profit_100;
+                            }
+                            // 取消在途 future，继续扫槽内剩余对
+                            break;
+                        }
+                        Ok(None) => {}
+                        Err(e) => return Err(e),
+                    }
+                }
+                drop(det_stream);
+
+                if let Some(pid) = traded_pair_id {
+                    monitor_state.persist_round_counts_batch(
+                        &[(pid, traded_rounds)],
+                        ARB_ROUNDS_STORE_PATH,
+                    );
+                    // 有成交 → 压回队首，下次 price_track 优先再扫该对
+                    if let Some(i) = traded_idx {
+                        monitor_state.scan_rotation_queue.push_front(i);
+                    }
+                }
+
+                if !traded {
+                    break 'sweep;
+                }
+            }
+
+            println!("      … 槽扫描结束，总用时 {:?}", tick.elapsed());
+        }
     }
 
     diag_total.print_compact();
