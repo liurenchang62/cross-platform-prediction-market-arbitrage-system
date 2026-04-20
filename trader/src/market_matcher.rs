@@ -343,9 +343,12 @@ impl MarketMatcher {
             }
         }
 
+        // 二筛 + market_id 去重后的对数；此后若启用 LLM，下游只使用 LLM 通过（及 API 失败回退）的列表，不再混用纯二筛结果
+        let pairs_after_dedup_before_llm = deduped.len();
+
         // ===== LLM 二次验证（如果启用）=====
         // 【高并发优化】默认 32 并发，200 对约 12-20 秒完成（假设单请求 2-3 秒）
-        let deduped = if crate::llm_validator::llm_validation_enabled() {
+        let (deduped, llm_rejected_total, llm_error_total) = if crate::llm_validator::llm_validation_enabled() {
             let llm_concurrency: usize = std::env::var("LLM_CONCURRENCY")
                 .ok()
                 .and_then(|s| s.parse().ok())
@@ -403,19 +406,32 @@ impl MarketMatcher {
                 "🤖 LLM 验证完成：通过 {} 对，拒绝 {} 对，错误 {} 对，并发 {}，总耗时 {:?}，平均每对 {:.1}ms",
                 llm_passed.len(), llm_rejected, llm_errors, llm_concurrency, llm_elapsed, avg_time
             );
-            llm_passed
+            (llm_passed, llm_rejected, llm_errors)
         } else {
-            deduped
+            (deduped, 0usize, 0usize)
         };
 
         let final_count = deduped.len();
         let merge_deduped = initial_count.saturating_sub(final_count);
 
         let elapsed = start_time.elapsed();
-        println!(
-            "\n📊 匹配：{:?} · 二筛后列表 {} 条 · 按 market_id 去重后 {} · 列表合并压掉 {}",
-            elapsed, initial_count, final_count, merge_deduped
-        );
+        if crate::llm_validator::llm_validation_enabled() {
+            println!(
+                "\n📊 匹配：{:?} · 初筛二筛原始 {} 条 · 二筛+去重后 {} 对 · 【LLM 后保留 {} 对】（LLM 拒绝 {} · API 异常按规则回退 {}）· 相对初筛压掉 {}",
+                elapsed,
+                initial_count,
+                pairs_after_dedup_before_llm,
+                final_count,
+                llm_rejected_total,
+                llm_error_total,
+                merge_deduped
+            );
+        } else {
+            println!(
+                "\n📊 匹配：{:?} · 二筛后列表 {} 条 · 按 market_id 去重后 {} · 列表合并压掉 {}",
+                elapsed, initial_count, final_count, merge_deduped
+            );
+        }
 
         self.validation_pipeline.print_retained_samples();
 
