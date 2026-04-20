@@ -1,4 +1,4 @@
-//! LLM 二次验证模块：在二筛通过后，调用 DeepSeek API 进行最终确认
+﻿//! LLM 二次验证模块：在二筛通过后，调用 DeepSeek API 进行最终确认
 //!
 //! ==================== 设计目标 ====================
 //! 确保进入跟踪系统的套利对是 100% 匹配的，杜绝误匹配导致的交易风险。
@@ -290,7 +290,7 @@ impl LlmValidator {
      - 特定事件发生盘(Will X happen?) ↔ (Will X happen?)
    
    ✗ 严禁匹配的类型错配：
-     - 胜负盘 ↔ 统计盘口（如 Winner vs Points O/U）→ [否]
+     - 胜负盘 ↔ 统计盘口（如 Winner  vs Points  O/U）→ [否]
      - 单场比赛 ↔ 锦标赛冠军 → [否]
      - 比赛结束盘(Completed match) ↔ 胜负盘(Winner) → [否]
      - 总进球数(Goals scored) ↔ 胜负盘 → [否]
@@ -311,7 +311,7 @@ impl LlmValidator {
 5. 【方向理解】（重要）
    - 两个合约可以方向相反（一个YES一个NO），这是套利的基础
    - 只要标的是同一事件、同一阈值、同一类型，方向相反是正常的
-   - 例如：PM Lakers-vs-Celtics-Winner-Lakers YES vs KS Lakers-vs-Celtics-Winner NO 是合法的套利对 → [是]
+   - 例如：PM Lakers-vs-Celtics-Winner-Lakers YES  vs KS Lakers-vs-Celtics-Winner NO 是合法的套利对 → [是]
 
 【常见错误陷阱 - 必须避免】
 - ❌ 只看标题相似度，忽略具体参数
