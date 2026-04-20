@@ -77,12 +77,13 @@ use crate::arbitrage_detector::{
 };
 
 /// 同一 PM–Kalshi 匹配在验证器给出的腿向上，再增加「两侧同时取反」的另一腿（如 PM YES+KS NO 与 PM NO+KS YES），去重后用于追踪与验证。
+/// 注意：输入现在包含 category 字段（第7个元素），但输出不需要传递 category。
 fn expand_dual_orientations(
-    matches: Vec<(Market, Market, f64, String, String, bool)>,
+    matches: Vec<(Market, Market, f64, String, String, bool, String)>,
 ) -> Vec<(Market, Market, f64, String, String, bool)> {
     let mut out = Vec::new();
     let mut seen: BTreeSet<(String, String, String, String)> = BTreeSet::new();
-    for (pm, ks, sim, pms, kss, inv) in matches {
+    for (pm, ks, sim, pms, kss, inv, _cat) in matches {
         let mut try_push = |ps: String, ks_: String| {
             let key = (
                 pm.market_id.clone(),

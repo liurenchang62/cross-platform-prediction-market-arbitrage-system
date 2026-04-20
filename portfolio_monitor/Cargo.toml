@@ -32,6 +32,14 @@ path = "src/bin/pm_redeem_diagnose.rs"
 name = "arb-reconcile"
 path = "src/bin/arb_reconcile.rs"
 
+[[bin]]
+name = "portfolio-position-markets"
+path = "src/bin/position_markets.rs"
+
+[[bin]]
+name = "close-position"
+path = "src/bin/close_position.rs"
+
 [dependencies]
 anyhow = "1.0"
 tokio = { version = "1", features = ["full"] }

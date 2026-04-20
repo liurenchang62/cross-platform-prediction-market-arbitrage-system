@@ -299,7 +299,7 @@ impl MarketMatcher {
         &mut self,
         _pm_markets: &[Market],
         _kalshi_markets: &[Market],
-    ) -> Vec<(Market, Market, f64, String, String, bool)> {
+    ) -> Vec<(Market, Market, f64, String, String, bool, String)> {
         if !self.fitted {
             println!("⚠️ 索引未构建");
             return Vec::new();
@@ -334,7 +334,7 @@ impl MarketMatcher {
         let initial_count = all_raw.len();
         all_raw.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
 
-        let mut deduped: Vec<(Market, Market, f64, String, String, bool)> = Vec::new();
+        let mut deduped: Vec<(Market, Market, f64, String, String, bool, String)> = Vec::new();
         let mut seen_m = HashSet::new();
         for t in all_raw {
             let key = (t.0.market_id.clone(), t.1.market_id.clone());
@@ -342,6 +342,43 @@ impl MarketMatcher {
                 deduped.push(t);
             }
         }
+
+        // ===== LLM 二次验证（如果启用）=====
+        // 无论是否实盘模式，都对二筛通过的匹配进行 LLM 验证
+        let deduped = if crate::llm_validator::llm_validation_enabled() {
+            println!("\n🤖 LLM 二次验证启动（{} 对候选）...", deduped.len());
+            let mut llm_passed = Vec::new();
+            let mut llm_rejected = 0usize;
+
+            for (pm, ks, sim, p_side, k_side, inv, cat) in deduped {
+                match crate::validation::second_screen_with_llm_check(
+                    &pm.title,
+                    &ks.title,
+                    sim,
+                    &cat,
+                )
+                .await
+                {
+                    Some(_) => {
+                        llm_passed.push((pm, ks, sim, p_side, k_side, inv, cat));
+                    }
+                    None => {
+                        llm_rejected += 1;
+                    }
+                }
+            }
+
+            let llm_elapsed = start_time.elapsed();
+            println!(
+                "🤖 LLM 验证完成：通过 {} 对，拒绝 {} 对，耗时 {:?}",
+                llm_passed.len(),
+                llm_rejected,
+                llm_elapsed
+            );
+            llm_passed
+        } else {
+            deduped
+        };
 
         let final_count = deduped.len();
         let merge_deduped = initial_count.saturating_sub(final_count);
@@ -472,12 +509,12 @@ impl MarketMatcher {
         polymarket_cache: &HashMap<String, Arc<Market>>,
         kalshi_cache: &HashMap<String, Arc<Market>>,
     ) -> (
-        Vec<(Market, Market, f64, String, String, bool)>,
+        Vec<(Market, Market, f64, String, String, bool, String)>,
         ValidationPipeline,
     ) {
         let start_time = std::time::Instant::now();
         let mut validation_pipeline = ValidationPipeline::new();
-        let mut all_arc: Vec<(Arc<Market>, Arc<Market>, f64, String, String, bool)> = Vec::new();
+        let mut all_arc: Vec<(Arc<Market>, Arc<Market>, f64, String, String, bool, String)> = Vec::new();
 
         let mut categories_used = 0usize;
         let chunk = MATCH_MATMUL_CHUNK_ROWS.max(1);
@@ -642,6 +679,7 @@ impl MarketMatcher {
                             match_info.pm_side.clone(),
                             match_info.kalshi_side.clone(),
                             match_info.needs_inversion,
+                            match_info.category.clone(), // 加入 category 用于 LLM 验证
                         ));
                     } else {
                         // 二筛通过但 confidence 不够
@@ -656,9 +694,9 @@ impl MarketMatcher {
             }
         }
 
-        let all_matches: Vec<(Market, Market, f64, String, String, bool)> = all_arc
+        let all_matches: Vec<(Market, Market, f64, String, String, bool, String)> = all_arc
             .into_iter()
-            .map(|(qa, ta, s, ps, ks, ni)| ((*qa).clone(), (*ta).clone(), s, ps, ks, ni))
+            .map(|(qa, ta, s, ps, ks, ni, cat)| ((*qa).clone(), (*ta).clone(), s, ps, ks, ni, cat))
             .collect();
 
         println!(

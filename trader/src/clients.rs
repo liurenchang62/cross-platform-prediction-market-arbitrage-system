@@ -4,7 +4,10 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 use reqwest::Client;
 use serde_json::Value;
-use std::time::Duration;
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::sync::Mutex;
 use tokio::time::sleep;
 
 /// Gamma `events[].markets[]` 或 `GET /markets` 单条：`endDate`（RFC3339）写入 `resolution_date`；与 Kalshi 展示对齐时见 `parse_kalshi_market_resolution_date`。
@@ -410,12 +413,19 @@ impl Default for PolymarketClient {
 
 const KALSHI_DEFAULT_BASE: &str = "https://api.elections.kalshi.com/trade-api/v2";
 
+/// 订单簿缓存条目 TTL（秒）。同一周期内同一 ticker 的双向配置共享同一次 HTTP 请求结果。
+const KS_OB_CACHE_TTL_SECS: u64 = 10;
+
+type ObCache = Arc<Mutex<HashMap<String, (Instant, KalshiOrderbookFetchReport)>>>;
+
 #[derive(Clone)]
 pub struct KalshiClient {
     http_client: Client,
     base_url: String,
     /// 订单簿令牌桶：容量 = KALSHI_OB_RATE_LIMIT_PER_SEC，每个令牌被取走后 1 秒归还。
-    ob_rate_limiter: std::sync::Arc<tokio::sync::Semaphore>,
+    ob_rate_limiter: Arc<tokio::sync::Semaphore>,
+    /// 短 TTL 订单簿缓存：周期内同 ticker 只发一次 HTTP 请求，缓解双向展开造成的重复限速。
+    ob_cache: ObCache,
 }
 
 impl KalshiClient {
@@ -433,9 +443,8 @@ impl KalshiClient {
         Self {
             http_client,
             base_url: base,
-            ob_rate_limiter: std::sync::Arc::new(tokio::sync::Semaphore::new(
-                KALSHI_OB_RATE_LIMIT_PER_SEC,
-            )),
+            ob_rate_limiter: Arc::new(tokio::sync::Semaphore::new(KALSHI_OB_RATE_LIMIT_PER_SEC)),
+            ob_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -698,6 +707,16 @@ impl KalshiClient {
             }
         }
 
+        // 缓存命中：TTL 内同 ticker 直接返回，跳过限速器，大幅减少双向展开造成的重复请求。
+        {
+            let cache = self.ob_cache.lock().await;
+            if let Some((ts, report)) = cache.get(ticker) {
+                if ts.elapsed() < Duration::from_secs(KS_OB_CACHE_TTL_SECS) {
+                    return report.clone();
+                }
+            }
+        }
+
         // 令牌桶限速：acquire_owned 取走一个令牌，1 秒后异步归还，确保 ≤ KALSHI_OB_RATE_LIMIT_PER_SEC req/s。
         let permit = self.ob_rate_limiter.clone().acquire_owned().await
             .expect("Kalshi ob rate limiter closed");
@@ -742,7 +761,7 @@ impl KalshiClient {
             };
         }
 
-        match serde_json::from_str::<serde_json::Value>(&body_text) {
+        let report = match serde_json::from_str::<serde_json::Value>(&body_text) {
             Ok(v) => KalshiOrderbookFetchReport {
                 json: Some(v),
                 outcome: KalshiOrderbookFetchOutcome::Ok,
@@ -751,7 +770,13 @@ impl KalshiClient {
                 json: None,
                 outcome: KalshiOrderbookFetchOutcome::JsonError(snip(&e.to_string(), 120)),
             },
+        };
+        // 仅缓存成功结果（Ok），错误不缓存以便下次重试。
+        if matches!(report.outcome, KalshiOrderbookFetchOutcome::Ok) {
+            let mut cache = self.ob_cache.lock().await;
+            cache.insert(ticker.to_string(), (Instant::now(), report.clone()));
         }
+        report
     }
 
     pub async fn get_order_book(&self, ticker: &str) -> Result<Option<serde_json::Value>> {

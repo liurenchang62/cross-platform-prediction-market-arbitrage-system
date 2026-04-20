@@ -256,7 +256,7 @@ fn extract_hex_private_key_line(text: &str) -> Result<String> {
 
 // ==================== 实盘开关 ====================
 /// `true` = 正常下单实盘交易；`false` = 仅追踪监控，检测到机会时打印但**不下单**。
-pub const LIVE_TRADING_ON: bool = true;
+pub const LIVE_TRADING_ON: bool = false;
 
 // ==================== 调试（环境变量） ====================
 /// 为 `true` 时，追踪周期结束额外打印 Kalshi 订单簿拉取细分与阶梯失败抽样（不致刷屏，每类最多数条）。
@@ -282,8 +282,8 @@ pub const NAKED_POSITIONS_JSONL: &str = "logs/naked_positions.jsonl";
 pub const ARB_TRACK_CONCURRENCY: usize = 40;
 
 /// Kalshi 订单簿拉取速率上限（每秒最多发出的请求数）。
-/// Kalshi REST API 约为 10 req/s；保守设 8 防触发 429。
-pub const KALSHI_OB_RATE_LIMIT_PER_SEC: usize = 8;
+/// Kalshi REST API 约为 10 req/s；设 10 与文档上限对齐，双向去重后唯一请求数已减半。
+pub const KALSHI_OB_RATE_LIMIT_PER_SEC: usize = 10;
 
 /// 全量重匹配最小挂钟间隔（秒）。追踪周期 sleep 改为 2s 后，不能再用 tick 计数——改为直接测经过时间。
 pub const FULL_FETCH_INTERVAL_WALL_SECS: u64 = 90 * 60;

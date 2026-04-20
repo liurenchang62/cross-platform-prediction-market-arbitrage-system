@@ -93,6 +93,39 @@ fn token_id_to_u256(token_id: &str) -> Result<U256> {
     s.parse().context("token_id U256")
 }
 
+/// FAK 市价卖出 outcome token（平仓用）。
+pub async fn sell_token_fak(
+    client: &PmClient<Authenticated<Normal>>,
+    token_id: &str,
+    n: i64,
+) -> Result<polymarket_client_sdk::clob::types::response::PostOrderResponse> {
+    use polymarket_client_sdk::clob::types::{Amount, OrderType};
+    let token_u256: U256 = token_id_to_u256(token_id)?;
+    let size_dec = Decimal::from(n as u64);
+    let amount = Amount::shares(size_dec).map_err(|e| anyhow::anyhow!("Amount::shares: {}", e))?;
+    let hex = system_params::load_polymarket_private_key_hex().context("PM 私钥")?;
+    let signer = PrivateKeySigner::from_str(&hex)
+        .context("PrivateKeySigner")?
+        .with_chain_id(Some(POLYGON));
+    let order = client
+        .market_order()
+        .token_id(token_u256)
+        .amount(amount)
+        .side(Side::Sell)
+        .order_type(OrderType::FAK)
+        .build()
+        .await
+        .map_err(|e| anyhow::anyhow!("build market_order (sell): {}", e))?;
+    let signed = client
+        .sign(&signer, order)
+        .await
+        .map_err(|e| anyhow::anyhow!("sign: {}", e))?;
+    client
+        .post_order(signed)
+        .await
+        .map_err(|e| anyhow::anyhow!("post_order (sell): {}", e))
+}
+
 pub async fn collateral_balance(client: &PmClient<Authenticated<Normal>>) -> Result<Decimal> {
     let req = BalanceAllowanceRequest::builder()
         .asset_type(AssetType::Collateral)

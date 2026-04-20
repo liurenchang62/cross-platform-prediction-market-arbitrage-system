@@ -83,6 +83,70 @@ pub async fn signed_get(
     Ok(text)
 }
 
+/// 鉴权 `POST`（平仓 / 下单）。
+pub async fn signed_post(
+    http: &Client,
+    auth: &KalshiAuth,
+    url: &str,
+    sign_path: &str,
+    body: &Value,
+) -> Result<String> {
+    let t = ts_ms();
+    let sig = sign(&auth.key, &t, "POST", sign_path)?;
+    let resp = http
+        .post(url)
+        .header("KALSHI-ACCESS-KEY", &auth.key_id)
+        .header("KALSHI-ACCESS-TIMESTAMP", &t)
+        .header("KALSHI-ACCESS-SIGNATURE", sig)
+        .json(body)
+        .send()
+        .await
+        .context("Kalshi POST")?;
+    let code = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    if !code.is_success() {
+        anyhow::bail!("Kalshi POST {} — {}", code, text.trim());
+    }
+    Ok(text)
+}
+
+/// IOC 限价卖单（平仓用）。`side` = "YES" 或 "NO"，`min_price_cents` 通常填 1。
+pub async fn sell_ioc(
+    http: &Client,
+    auth: &KalshiAuth,
+    ticker: &str,
+    side: &str,
+    count: i64,
+    min_price_cents: i64,
+) -> Result<Value> {
+    let side_lower = side.to_ascii_lowercase();
+    let price = min_price_cents.clamp(1, 99);
+    let client_id = format!(
+        "close_{}_{}_{}",
+        side_lower,
+        &ticker[..ticker.len().min(20)],
+        ts_ms()
+    );
+    let mut body = serde_json::json!({
+        "ticker": ticker,
+        "action": "sell",
+        "side": side_lower,
+        "count": count,
+        "type": "limit",
+        "time_in_force": "immediate_or_cancel",
+        "client_order_id": client_id,
+        "reduce_only": true,
+    });
+    if side_lower == "yes" {
+        body["yes_price"] = serde_json::json!(price);
+    } else {
+        body["no_price"] = serde_json::json!(price);
+    }
+    let url = format!("{}/portfolio/orders", auth.base);
+    let text = signed_post(http, auth, &url, "/trade-api/v2/portfolio/orders", &body).await?;
+    serde_json::from_str(&text).context("sell_ioc response json")
+}
+
 pub async fn balance_cents(http: &Client, auth: &KalshiAuth) -> Result<i64> {
     let sign_path = "/trade-api/v2/portfolio/balance";
     let url = format!("{}/portfolio/balance", auth.base);

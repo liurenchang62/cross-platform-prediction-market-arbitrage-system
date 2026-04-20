@@ -58,6 +58,9 @@ pub fn feishu_should_notify(status: &str) -> bool {
 }
 
 pub fn push_trade_summary_to_feishu(summary: &str) -> Result<()> {
+    if !crate::system_params::LIVE_TRADING_ON {
+        return Ok(());
+    }
     let summary = summary.trim().replace('\r', "");
     if summary.is_empty() {
         anyhow::bail!("飞书摘要为空");

@@ -1,6 +1,6 @@
 // src/tracking.rs
 use chrono::{DateTime, NaiveDate, Utc};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 use crate::market::Market;
@@ -88,6 +88,15 @@ pub struct TrackedArbitrage {
     pub active: bool,
     /// 本会话内该套利对已执行的套利轮次数（每次成功下 Kalshi 买单 +1）。
     pub arb_rounds_executed: u32,
+    // ── Scheme C/A 槽扫描字段 ──────────────────────────────────────────
+    /// 本追踪周期内是否遇到 KS 订单簿空（每周期末重置）。
+    pub ks_empty_this_cycle: bool,
+    /// 连续多少个追踪周期 KS 订单簿均为空（连续 3 次 → 触发 Scheme A 跳过）。
+    pub consecutive_ks_empty_cycles: u32,
+    /// 剩余需跳过的追踪周期数；> 0 时不纳入扫描队列。
+    pub skip_tracking_cycles_remaining: u32,
+    /// 本槽有成交 → 设为 true，下一个槽优先纳入（提前于普通轮转）。
+    pub priority_next_slot: bool,
 }
 
 impl TrackedArbitrage {
@@ -116,6 +125,10 @@ impl TrackedArbitrage {
             last_check: Utc::now(),
             active: true,
             arb_rounds_executed: 0,
+            ks_empty_this_cycle: false,
+            consecutive_ks_empty_cycles: 0,
+            skip_tracking_cycles_remaining: 0,
+            priority_next_slot: false,
         }
     }
 }
@@ -148,6 +161,11 @@ pub struct MonitorState {
     pub session_cycle_seq: usize,
     /// 跨会话套利轮次 + 两侧到期时间（RFC3339），由 `arb_rounds_store.json` 持久化。
     pub arb_rounds_store: HashMap<String, ArbRoundsStoreEntry>,
+    // ── Scheme C 槽轮换 ────────────────────────────────────────────────
+    /// 待扫描的 `tracked_pairs` 索引队列（每次 price_track 弹出一槽）。
+    pub scan_rotation_queue: VecDeque<usize>,
+    /// 已完成的追踪周期计数（队列清空、新周期开始时 +1）。
+    pub tracking_cycle_serial: u32,
 }
 
 impl MonitorState {
@@ -163,6 +181,8 @@ impl MonitorState {
             trading_session_utc_date: d,
             session_cycle_seq: 0,
             arb_rounds_store: HashMap::new(),
+            scan_rotation_queue: VecDeque::new(),
+            tracking_cycle_serial: 0,
         }
     }
 
@@ -257,6 +277,74 @@ impl MonitorState {
         self.session_cycle_seq = 1;
     }
 
+    /// 重建扫描轮换队列：优先对（`priority_next_slot`）排前，其余按索引顺序，跳过中所有对排除。
+    /// 应在追踪周期结束后或 `update_tracked_pairs` 完成后调用；调用后清除所有 `priority_next_slot` 标记。
+    pub fn reset_scan_queue(&mut self) {
+        let mut priority: Vec<usize> = Vec::new();
+        let mut regular: Vec<usize> = Vec::new();
+        for (i, p) in self.tracked_pairs.iter().enumerate() {
+            if !p.active || p.skip_tracking_cycles_remaining > 0 {
+                continue;
+            }
+            if p.priority_next_slot {
+                priority.push(i);
+            } else {
+                regular.push(i);
+            }
+        }
+        for i in &priority {
+            self.tracked_pairs[*i].priority_next_slot = false;
+        }
+        self.scan_rotation_queue = priority.into_iter().chain(regular).collect();
+    }
+
+    /// 一个追踪周期结束（队列清空）时调用：
+    /// 1. 更新各对的 `consecutive_ks_empty_cycles`（仅对本周期被扫到的对）；
+    /// 2. 连续 3 周期空 → 设跳过 5 周期；
+    /// 3. 正在跳过的对递减计数；
+    /// 4. 重置 `ks_empty_this_cycle`；
+    /// 5. 递增 `tracking_cycle_serial`；
+    /// 6. 重建队列。
+    pub fn advance_tracking_cycle(&mut self) {
+        let mut skip_applied = 0u32;
+        let mut skip_decremented = 0u32;
+
+        for p in self.tracked_pairs.iter_mut() {
+            if !p.active {
+                continue;
+            }
+            if p.skip_tracking_cycles_remaining > 0 {
+                // 对本周期被跳过的：递减剩余，不更新空计数
+                p.skip_tracking_cycles_remaining -= 1;
+                skip_decremented += 1;
+            } else {
+                // 对本周期被扫描的：更新连续空计数
+                if p.ks_empty_this_cycle {
+                    p.consecutive_ks_empty_cycles += 1;
+                } else {
+                    p.consecutive_ks_empty_cycles = 0;
+                }
+                // Scheme A：连续 3 周期空 → 跳过 5 周期
+                if p.consecutive_ks_empty_cycles >= 3 {
+                    p.skip_tracking_cycles_remaining = 5;
+                    p.consecutive_ks_empty_cycles = 0;
+                    skip_applied += 1;
+                }
+            }
+            p.ks_empty_this_cycle = false;
+        }
+
+        self.tracking_cycle_serial += 1;
+        let n_active = self.tracked_pairs.iter().filter(|p| p.active).count();
+        let n_skip = self.tracked_pairs.iter().filter(|p| p.active && p.skip_tracking_cycles_remaining > 0).count();
+        println!(
+            "   🔁 追踪周期 #{} 结束：活跃 {} 对，{} 对进入跳过（本周期新触发 {}，递减 {}）",
+            self.tracking_cycle_serial, n_active, n_skip, skip_applied, skip_decremented,
+        );
+
+        self.reset_scan_queue();
+    }
+
     pub fn desk_cycle_ctx(&self) -> DeskCycleCtx {
         DeskCycleCtx {
             trading_session_utc_date: self.trading_session_utc_date,
@@ -295,6 +383,9 @@ impl MonitorState {
 
         // 清理不活跃的
         self.tracked_pairs.retain(|p| p.active);
+
+        // 索引已变更（删增都有），重建扫描队列
+        self.reset_scan_queue();
     }
 
     /// 剔除任一侧「有解析日且晚于 horizon」的追踪对（与全量池筛选规则一致）。
