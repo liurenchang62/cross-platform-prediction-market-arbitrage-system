@@ -343,7 +343,7 @@ impl MarketMatcher {
             }
         }
 
-        // 二筛 + market_id 去重后的对数；此后若启用 LLM，下游只使用 LLM 通过（及 API 失败回退）的列表，不再混用纯二筛结果
+        // 二筛 + market_id 去重后的对数；启用 LLM 时仅保留「LLM 成功返回且 is_same_contract」的对；API/解析失败一律剔除
         let pairs_after_dedup_before_llm = deduped.len();
 
         // ===== LLM 二次验证（如果启用）=====
@@ -366,15 +366,17 @@ impl MarketMatcher {
                 })
                 .collect();
 
-            // 执行高并发批量验证
-            let results = crate::llm_validator::validate_matches_concurrent(inputs, llm_concurrency)
-                .await
-                .unwrap_or_else(|e| {
-                    eprintln!("⚠️ LLM 并发验证失败，回退到规则判断: {}", e);
-                    vec![]
-                });
+            // 执行高并发批量验证；整批 Err 则本批候选全部剔除（不混用二筛）
+            let (results, llm_fatal_batch) =
+                match crate::llm_validator::validate_matches_concurrent(inputs, llm_concurrency).await {
+                    Ok(r) => (r, false),
+                    Err(e) => {
+                        eprintln!("⚠️ LLM 并发验证失败，本批 {} 对全部剔除: {}", llm_total, e);
+                        (Vec::new(), true)
+                    }
+                };
 
-            // 分离通过/拒绝
+            // 分离通过/拒绝：仅 is_same_contract==true 进入下游；API/解析失败（None）→ 剔除
             let mut llm_passed = Vec::new();
             let mut llm_rejected = 0usize;
             let mut llm_errors = 0usize;
@@ -393,18 +395,35 @@ impl MarketMatcher {
                         llm_rejected += 1;
                     }
                     None => {
-                        // LLM 出错，保守放行（不误杀）
                         llm_errors += 1;
-                        llm_passed.push((pm, ks, sim, p_side, k_side, inv, cat));
+                        println!(
+                            "   ✗ LLM剔除（无有效结论）| PM:{}… / KS:{}…",
+                            pm.title.chars().take(40).collect::<String>(),
+                            ks.title.chars().take(40).collect::<String>()
+                        );
                     }
                 }
             }
 
+            if llm_fatal_batch {
+                llm_errors = llm_total;
+            }
+
             let llm_elapsed = llm_start.elapsed();
-            let avg_time = if llm_total > 0 { llm_elapsed.as_millis() as f64 / llm_total as f64 } else { 0.0 };
+            let avg_time = if llm_total > 0 {
+                llm_elapsed.as_millis() as f64 / llm_total as f64
+            } else {
+                0.0
+            };
             println!(
-                "🤖 LLM 验证完成：通过 {} 对，拒绝 {} 对，错误 {} 对，并发 {}，总耗时 {:?}，平均每对 {:.1}ms",
-                llm_passed.len(), llm_rejected, llm_errors, llm_concurrency, llm_elapsed, avg_time
+                "🤖 LLM 验证完成：通过 {} 对，拒绝 {} 对，无有效结论剔除 {} 对{}，并发 {}，总耗时 {:?}，平均每对 {:.1}ms",
+                llm_passed.len(),
+                llm_rejected,
+                llm_errors,
+                if llm_fatal_batch { "（含整批失败）" } else { "" },
+                llm_concurrency,
+                llm_elapsed,
+                avg_time
             );
             (llm_passed, llm_rejected, llm_errors)
         } else {
@@ -417,7 +436,7 @@ impl MarketMatcher {
         let elapsed = start_time.elapsed();
         if crate::llm_validator::llm_validation_enabled() {
             println!(
-                "\n📊 匹配：{:?} · 初筛二筛原始 {} 条 · 二筛+去重后 {} 对 · 【LLM 后保留 {} 对】（LLM 拒绝 {} · API 异常按规则回退 {}）· 相对初筛压掉 {}",
+                "\n📊 匹配：{:?} · 初筛二筛原始 {} 条 · 二筛+去重后 {} 对 · 【LLM 后保留 {} 对】（LLM 判否 {} · 无有效结论剔除 {}）· 相对初筛压掉 {}",
                 elapsed,
                 initial_count,
                 pairs_after_dedup_before_llm,
