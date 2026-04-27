@@ -256,7 +256,7 @@ fn extract_hex_private_key_line(text: &str) -> Result<String> {
 
 // ==================== 实盘开关 ====================
 /// `true` = 正常下单实盘交易；`false` = 仅追踪监控，检测到机会时打印但**不下单**。
-pub const LIVE_TRADING_ON: bool = false;
+pub const LIVE_TRADING_ON: bool = true;
 
 // ==================== 调试（环境变量） ====================
 /// 为 `true` 时，追踪周期结束额外打印 Kalshi 订单簿拉取细分与阶梯失败抽样（不致刷屏，每类最多数条）。

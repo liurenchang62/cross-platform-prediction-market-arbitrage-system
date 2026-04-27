@@ -975,7 +975,7 @@ async fn validate_arbitrage_pair_post_success(
         anyhow::bail!("validate_arbitrage_pair_post_success: missing PM clob token");
     };
 
-    crate::trade_out!(
+    crate::exec_out!(
         "\n  ── 实盘执行：识别 ✓ → 两腿并行（Kalshi IOC + PM FAK 限价单同时发出）──"
     );
 
@@ -991,65 +991,75 @@ async fn validate_arbitrage_pair_post_success(
         0.0
     };
 
-    crate::trade_out!("\n  📌 验证通过 (相似度: {:.3}){}", similarity, inv);
-    crate::trade_out!("     PM:      {}", pm_market.title);
-    crate::trade_out!("     Kalshi:  {}", kalshi_market.title);
-    crate::trade_out!("     📅 {}", format_resolution_expiry("PM", pm_expiry));
-    crate::trade_out!("     📅 {}", format_resolution_expiry("Kalshi", ks_expiry));
-    crate::trade_out!("     ─────────────────────────────────────────────────────────");
-    crate::trade_out!("     📗 PM 订单簿(买{}) Top5:", pm_side);
+    crate::exec_out!("\n  📌 验证通过 (相似度: {:.3}){}", similarity, inv);
+    crate::exec_out!("     PM:      {}", pm_market.title);
+    crate::exec_out!("     Kalshi:  {}", kalshi_market.title);
+    crate::exec_out!("     📅 {}", format_resolution_expiry("PM", pm_expiry));
+    crate::exec_out!("     📅 {}", format_resolution_expiry("Kalshi", ks_expiry));
+    crate::exec_out!("     ─────────────────────────────────────────────────────────");
+    crate::exec_out!("     📗 PM 订单簿(买{}) Top5:", pm_side);
     for (j, (p, s)) in opp.orderbook_pm_top5.iter().take(5).enumerate() {
-        crate::trade_out!("         #{}. 价 {:.4} 量 {:.1}", j + 1, p, s);
+        crate::exec_out!("         #{}. 价 {:.4} 量 {:.1}", j + 1, p, s);
     }
     if opp.orderbook_pm_top5.is_empty() {
-        crate::trade_out!("         (无订单簿)");
+        crate::exec_out!("         (无订单簿)");
     }
-    crate::trade_out!("     📗 Kalshi 订单簿(买{}) Top5:", kalshi_side);
+    crate::exec_out!("     📗 Kalshi 订单簿(买{}) Top5:", kalshi_side);
     for (j, (p, s)) in opp.orderbook_kalshi_top5.iter().take(5).enumerate() {
-        crate::trade_out!("         #{}. 价 {:.4} 量 {:.1}", j + 1, p, s);
+        crate::exec_out!("         #{}. 价 {:.4} 量 {:.1}", j + 1, p, s);
     }
     if opp.orderbook_kalshi_top5.is_empty() {
-        crate::trade_out!("         (无订单簿)");
+        crate::exec_out!("         (无订单簿)");
     }
-    crate::trade_out!("     ─────────────────────────────────────────────────────────");
-    crate::trade_out!(
+    crate::exec_out!("     ─────────────────────────────────────────────────────────");
+    crate::exec_out!(
         "     📊 策略: Polymarket 买 {}  +  Kalshi 买 {}",
         pm_side, kalshi_side
     );
-    crate::trade_out!("     ─────────────────────────────────────────────────────────");
-    crate::trade_out!("     📊 对冲份数 n: {:.4}", opp.contracts);
-    crate::trade_out!(
+    crate::exec_out!("     ─────────────────────────────────────────────────────────");
+    crate::exec_out!("     📊 对冲份数 n: {:.4}", opp.contracts);
+    crate::exec_out!(
         "     💵 最优 Ask:     PM {:.4}  |  Kalshi {:.4}",
         opp.pm_optimal, opp.kalshi_optimal
     );
-    crate::trade_out!(
+    crate::exec_out!(
         "     📉 滑点后均价:   PM {:.4} ({:+.2}%)  |  Kalshi {:.4} ({:+.2}%)",
         opp.pm_avg_slipped, pm_slip, opp.kalshi_avg_slipped, ks_slip
     );
-    crate::trade_out!("     ─────────────────────────────────────────────────────────");
-    crate::trade_out!(
+    crate::exec_out!("     ─────────────────────────────────────────────────────────");
+    crate::exec_out!(
         "     💰 投入 ${:.2}（每腿探针上限）利润拆解:",
         capital_usdt
     );
-    crate::trade_out!("        毛利润(兑付): ${:.2}", opp.contracts);
-    crate::trade_out!("        成本:          ${:.2}", opp.capital_used);
-    crate::trade_out!(
+    crate::exec_out!("        毛利润(兑付): ${:.2}", opp.contracts);
+    crate::exec_out!("        成本:          ${:.2}", opp.capital_used);
+    crate::exec_out!(
         "        交易手续费:    Polymarket ${:.2}  |  Kalshi ${:.2}",
         opp.fee_polymarket_usd, opp.fee_kalshi_usd
     );
-    crate::trade_out!("        链上执行成本（估）: ${:.4}", opp.gas_assumed_usd);
-    crate::trade_out!("        摩擦成本（friction cost）: ${:.4}", opp.surplus_buffer_usd);
-    crate::trade_out!("        = 净利润:      ${:.2}", opp.net_profit_100);
-    crate::trade_out!("        ROI:           {:.1}%", opp.roi_100_percent);
-    crate::trade_out!("     ─────────────────────────────────────────────────────────");
+    crate::exec_out!("        链上执行成本（估）: ${:.4}", opp.gas_assumed_usd);
+    crate::exec_out!("        摩擦成本（friction cost）: ${:.4}", opp.surplus_buffer_usd);
+    crate::exec_out!("        = 净利润:      ${:.2}", opp.net_profit_100);
+    crate::exec_out!("        ROI:           {:.1}%", opp.roi_100_percent);
+    crate::exec_out!("     ─────────────────────────────────────────────────────────");
 
     // —— 并行下单：Kalshi IOC + PM FAK 限价单同时发出 ——
     let n_target = opp.contracts as i64;
     let ks_client_oid = uuid::Uuid::new_v4().to_string();
 
-    crate::trade_out!(
-        "   ⚡ [并行下单] Kalshi IOC {} 份 @ {}¢  ‖  PM FAK {} 份 @ ${:.4}/token",
-        n_target, opp.ks_limit_cents, n_target, opp.pm_limit_price
+    // PM CLOB BUY 限价 FAK：USDC 预算 = size × price。当订单簿存在比 limit_price 更便宜的档位时，
+    // 相同 USDC 预算会买入超过 n_target 份 token，导致多腿需要以极低 bid 价卖回（损耗严重）。
+    // 修正：将 pm_order_n 设为 ceil(n × avg / limit)，使 USDC 预算 ≈ 实际预期成本。
+    let pm_order_n = if opp.pm_limit_price > 0.0 && opp.pm_avg_slipped > 0.0 {
+        let budget_n = (n_target as f64 * opp.pm_avg_slipped / opp.pm_limit_price).ceil() as i64;
+        budget_n.max(1).min(n_target)
+    } else {
+        n_target
+    };
+
+    crate::exec_out!(
+        "   ⚡ [并行下单] Kalshi IOC {} 份 @ {}¢  ‖  PM FAK {}→{} 份 @ ${:.4}/token",
+        n_target, opp.ks_limit_cents, pm_order_n, n_target, opp.pm_limit_price
     );
 
     let (ks_result, pm_result) = tokio::join!(
@@ -1058,16 +1068,16 @@ async fn validate_arbitrage_pair_post_success(
             kalshi_side, &opp, &ks_client_oid, per_leg_cap_usd,
         ),
         pm_trader.buy_outcome_token_limit_fak_n(
-            pm_token_id, n_target, opp.pm_limit_price,
+            pm_token_id, pm_order_n, opp.pm_limit_price,
         )
     );
 
     let (kalshi_fill, ks_err_s) = match ks_result {
-        Ok(r) => { crate::trade_out!("   📗 [Kalshi] order_id={} fill={}/{}", r.order_id, r.fill_count, n_target); (Some(r), String::new()) }
+        Ok(r) => { crate::exec_out!("   📗 [Kalshi] order_id={} fill={}/{}", r.order_id, r.fill_count, n_target); (Some(r), String::new()) }
         Err(e) => { eprintln!("   ⚠️ [Kalshi] 下单失败: {}", e); (None, format!("{}", e)) }
     };
     let (pm_fill_opt, pm_err_s) = match pm_result {
-        Ok(r) => { crate::trade_out!("   📗 [PM] order_id={} making={} taking={}", r.order_id, r.making_amount, r.taking_amount); (Some(r), String::new()) }
+        Ok(r) => { crate::exec_out!("   📗 [PM] order_id={} making={} taking={}", r.order_id, r.making_amount, r.taking_amount); (Some(r), String::new()) }
         Err(e) => { eprintln!("   ⚠️ [PM] 下单失败: {}", e); (None, format!("{}", e)) }
     };
 
@@ -1078,7 +1088,7 @@ async fn validate_arbitrage_pair_post_success(
     let k2: i64 = pm_tokens.round() as i64;
     let ks_order_id = kalshi_fill.as_ref().map(|r| r.order_id.clone()).unwrap_or_default();
 
-    crate::trade_out!("   📊 成交汇总: Kalshi={}/{} PM≈{}/{} (tokens≈{:.4} cost≈${:.4})", k1, n_target, k2, n_target, pm_tokens, pm_cost_usdc);
+    crate::exec_out!("   📊 成交汇总: Kalshi={}/{} PM≈{}/{} (tokens≈{:.4} cost≈${:.4})", k1, n_target, k2, n_target, pm_tokens, pm_cost_usdc);
 
     // —— 事后对账 ——
     let mut ks_err = ks_err_s;
@@ -1101,14 +1111,14 @@ async fn validate_arbitrage_pair_post_success(
     if excess_ks > 0 {
         let ref_price = opp.kalshi_avg_slipped;
         if excess_ks as f64 * ref_price >= 1.0 {
-            crate::trade_out!("   📙 [对账] Kalshi 多 {} 份 (K={} PM={}) → IOC 卖平", excess_ks, k1, k2);
+            crate::exec_out!("   📙 [对账] Kalshi 多 {} 份 (K={} PM={}) → IOC 卖平", excess_ks, k1, k2);
             let recon_oid = uuid::Uuid::new_v4().to_string();
             match kalshi_place_sell_ioc(
                 ks_http, kalshi_cfg, &kalshi_market.market_id, kalshi_side,
                 excess_ks, STOP_LOSS_KALSHI_SELL_MIN_PRICE_CENTS, &recon_oid,
             ).await {
                 Ok(r) => {
-                    crate::trade_out!("   📙 [对账] Kalshi 卖平 order_id={} fill={}/{}", r.order_id, r.fill_count, excess_ks);
+                    crate::exec_out!("   📙 [对账] Kalshi 卖平 order_id={} fill={}/{}", r.order_id, r.fill_count, excess_ks);
                     ks_unwind_order_ids.push(r.order_id.clone());
                     if r.fill_count < excess_ks {
                         let naked = excess_ks - r.fill_count;
@@ -1127,7 +1137,7 @@ async fn validate_arbitrage_pair_post_success(
                 }
             }
         } else {
-            crate::trade_out!("   📙 [对账] Kalshi 多 {} 份，名义 ${:.4} < $1.00，记录裸仓", excess_ks, excess_ks as f64 * ref_price);
+            crate::exec_out!("   📙 [对账] Kalshi 多 {} 份，名义 ${:.4} < $1.00，记录裸仓", excess_ks, excess_ks as f64 * ref_price);
             append_naked_position_log(&kalshi_market.market_id, kalshi_side, excess_ks, &pm_market.market_id, "recon_ks_below_min");
             status = "NAKED_KS_SMALL";
         }
@@ -1136,13 +1146,13 @@ async fn validate_arbitrage_pair_post_success(
     if excess_pm > 0 {
         let ref_price = opp.pm_avg_slipped;
         if excess_pm as f64 * ref_price >= 1.0 {
-            crate::trade_out!("   📙 [对账] PM 多 {} 份 (K={} PM={}) → FAK 卖出", excess_pm, k1, k2);
+            crate::exec_out!("   📙 [对账] PM 多 {} 份 (K={} PM={}) → FAK 卖出", excess_pm, k1, k2);
             match pm_trader.sell_outcome_token_fak(pm_token_id, excess_pm).await {
                 Ok(r) => {
                     // SELL 语义：making_amount = 卖出 token 数，taking_amount = 收到 USDC
                     let sold: f64 = r.making_amount.to_string().parse().unwrap_or(0.0);
                     let usdc_in: f64 = r.taking_amount.to_string().parse().unwrap_or(0.0);
-                    crate::trade_out!("   📙 [对账] PM 卖出 order_id={} tokens_sold≈{:.3} usdc_in≈${:.4}", r.order_id, sold, usdc_in);
+                    crate::exec_out!("   📙 [对账] PM 卖出 order_id={} tokens_sold≈{:.3} usdc_in≈${:.4}", r.order_id, sold, usdc_in);
                     pm_post_responses.push(r);
                     let sold_int = sold.round() as i64;
                     if sold_int < excess_pm {
@@ -1160,7 +1170,7 @@ async fn validate_arbitrage_pair_post_success(
                 }
             }
         } else {
-            crate::trade_out!("   📙 [对账] PM 多 {} 份，名义 ${:.4} < $1.00，记录裸仓", excess_pm, excess_pm as f64 * ref_price);
+            crate::exec_out!("   📙 [对账] PM 多 {} 份，名义 ${:.4} < $1.00，记录裸仓", excess_pm, excess_pm as f64 * ref_price);
             status = "NAKED_PM_SMALL";
         }
     }

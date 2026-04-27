@@ -346,6 +346,32 @@ impl MarketMatcher {
         // 二筛 + market_id 去重后的对数；启用 LLM 时仅保留「LLM 成功返回且 is_same_contract」的对；API/解析失败一律剔除
         let pairs_after_dedup_before_llm = deduped.len();
 
+        // ===== 写入全量候选对日志（每次全量匹配覆盖写，供人工分析二筛/LLM 逻辑）=====
+        {
+            let log_path = "logs/match_candidates_latest.jsonl";
+            let mut lines = Vec::with_capacity(deduped.len());
+            for (pm, ks, sim, p_side, k_side, inv, cat) in &deduped {
+                let obj = serde_json::json!({
+                    "pm_id":    pm.market_id,
+                    "ks_id":    ks.market_id,
+                    "pm_title": pm.title,
+                    "ks_title": ks.title,
+                    "similarity": sim,
+                    "pm_side":  p_side,
+                    "ks_side":  k_side,
+                    "inversion": inv,
+                    "category": cat,
+                    "pm_resolution": pm.resolution_date.map(|d| d.to_string()),
+                    "ks_resolution": ks.resolution_date.map(|d| d.to_string()),
+                });
+                lines.push(obj.to_string());
+            }
+            match std::fs::write(log_path, lines.join("\n") + "\n") {
+                Ok(_) => println!("   📝 已写入全量候选对 {} 条 → {}", deduped.len(), log_path),
+                Err(e) => eprintln!("   ⚠️ 写入候选对日志失败: {}", e),
+            }
+        }
+
         // ===== LLM 二次验证（如果启用）=====
         // 【高并发优化】默认 32 并发，200 对约 12-20 秒完成（假设单请求 2-3 秒）
         let (deduped, llm_rejected_total, llm_error_total) = if crate::llm_validator::llm_validation_enabled() {
@@ -378,6 +404,7 @@ impl MarketMatcher {
 
             // 分离通过/拒绝：仅 is_same_contract==true 进入下游；API/解析失败（None）→ 剔除
             let mut llm_passed = Vec::new();
+            let mut llm_rejected_pairs: Vec<serde_json::Value> = Vec::new();
             let mut llm_rejected = 0usize;
             let mut llm_errors = 0usize;
 
@@ -387,11 +414,27 @@ impl MarketMatcher {
                         llm_passed.push((pm, ks, sim, p_side, k_side, inv, cat));
                     }
                     Some(validation) => {
-                        println!("   ✗ LLM拒绝 [{}] {}ms | {}", 
+                        println!("   ✗ LLM拒绝 [{}] {}ms | {}",
                             validation.provider.display_name(),
                             validation.latency_ms,
                             validation.reasoning.chars().take(60).collect::<String>()
                         );
+                        llm_rejected_pairs.push(serde_json::json!({
+                            "pm_id":    pm.market_id,
+                            "ks_id":    ks.market_id,
+                            "pm_title": pm.title,
+                            "ks_title": ks.title,
+                            "similarity": sim,
+                            "pm_side":  p_side,
+                            "ks_side":  k_side,
+                            "inversion": inv,
+                            "category": cat,
+                            "pm_resolution": pm.resolution_date.map(|d| d.to_string()),
+                            "ks_resolution": ks.resolution_date.map(|d| d.to_string()),
+                            "llm_reject_reason": validation.reasoning,
+                            "llm_provider": validation.provider.display_name(),
+                            "llm_latency_ms": validation.latency_ms,
+                        }));
                         llm_rejected += 1;
                     }
                     None => {
@@ -401,7 +444,33 @@ impl MarketMatcher {
                             pm.title.chars().take(40).collect::<String>(),
                             ks.title.chars().take(40).collect::<String>()
                         );
+                        llm_rejected_pairs.push(serde_json::json!({
+                            "pm_id":    pm.market_id,
+                            "ks_id":    ks.market_id,
+                            "pm_title": pm.title,
+                            "ks_title": ks.title,
+                            "similarity": sim,
+                            "pm_side":  p_side,
+                            "ks_side":  k_side,
+                            "inversion": inv,
+                            "category": cat,
+                            "pm_resolution": pm.resolution_date.map(|d| d.to_string()),
+                            "ks_resolution": ks.resolution_date.map(|d| d.to_string()),
+                            "llm_reject_reason": null,
+                            "llm_provider": null,
+                            "llm_latency_ms": null,
+                        }));
                     }
+                }
+            }
+
+            // 写入 LLM 拒绝对日志（每次覆盖）
+            {
+                let log_path = "logs/arb_pairs_llm_rejected.jsonl";
+                let lines: Vec<String> = llm_rejected_pairs.iter().map(|v| v.to_string()).collect();
+                match std::fs::write(log_path, lines.join("\n") + "\n") {
+                    Ok(_) => println!("   📝 LLM拒绝对 {} 条 → {}", llm_rejected_pairs.len(), log_path),
+                    Err(e) => eprintln!("   ⚠️ 写入LLM拒绝对日志失败: {}", e),
                 }
             }
 
@@ -432,6 +501,32 @@ impl MarketMatcher {
 
         let final_count = deduped.len();
         let merge_deduped = initial_count.saturating_sub(final_count);
+
+        // ===== 写入 LLM 后全量套利对日志（每次覆盖，供人工比对误杀）=====
+        {
+            let log_path = "logs/arb_pairs_latest.jsonl";
+            let mut lines = Vec::with_capacity(deduped.len());
+            for (pm, ks, sim, p_side, k_side, inv, cat) in &deduped {
+                let obj = serde_json::json!({
+                    "pm_id":    pm.market_id,
+                    "ks_id":    ks.market_id,
+                    "pm_title": pm.title,
+                    "ks_title": ks.title,
+                    "similarity": sim,
+                    "pm_side":  p_side,
+                    "ks_side":  k_side,
+                    "inversion": inv,
+                    "category": cat,
+                    "pm_resolution": pm.resolution_date.map(|d| d.to_string()),
+                    "ks_resolution": ks.resolution_date.map(|d| d.to_string()),
+                });
+                lines.push(obj.to_string());
+            }
+            match std::fs::write(log_path, lines.join("\n") + "\n") {
+                Ok(_) => println!("   📝 LLM后套利对 {} 条 → {}", deduped.len(), log_path),
+                Err(e) => eprintln!("   ⚠️ 写入套利对日志失败: {}", e),
+            }
+        }
 
         let elapsed = start_time.elapsed();
         if crate::llm_validator::llm_validation_enabled() {

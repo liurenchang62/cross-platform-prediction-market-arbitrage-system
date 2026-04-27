@@ -40,7 +40,13 @@ pub fn append_line(s: &str) {
     }
 }
 
+/// 只输出到控制台，不写入缓存（用于追踪/扫描等非成交日志）。
 pub fn trade_out_fmt(args: std::fmt::Arguments<'_>) {
+    println!("{}", args);
+}
+
+/// 同时输出到控制台和缓存（仅用于实际下单执行相关日志）。
+pub fn exec_out_fmt(args: std::fmt::Arguments<'_>) {
     let line = args.to_string();
     println!("{}", line);
     append_line(&line);
@@ -53,9 +59,18 @@ pub fn append_session_banner(now: DateTime<Utc>) {
     ));
 }
 
+/// 控制台输出（不写缓存），用于追踪/监控日志。
 #[macro_export]
 macro_rules! trade_out {
     ($($arg:tt)*) => {{
         $crate::trades_cache::trade_out_fmt(format_args!($($arg)*))
+    }};
+}
+
+/// 控制台 + 缓存双写，仅用于实际下单执行日志。
+#[macro_export]
+macro_rules! exec_out {
+    ($($arg:tt)*) => {{
+        $crate::trades_cache::exec_out_fmt(format_args!($($arg)*))
     }};
 }

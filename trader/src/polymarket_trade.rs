@@ -279,7 +279,7 @@ impl PolymarketClobTrader {
     /// 第二腿（并行）：限价 FAK 买单，精确控制份数与最高可接受价格。
     /// `limit_price` = 识别阶段 PM ask 阶梯的 worst-ask（`pm_limit_price`），保证在价格未恶化时能成交 `n` 份。
     /// FAK（Fill-and-Kill）= IOC：在 ≤ limit_price 的档位尽量成交，剩余立即取消。
-    /// making_amount = 实际成交 token 数，taking_amount = 实际 USDC 花费（含手续费）。
+    /// making_amount = 实际支付 USDC（含手续费），taking_amount = 实际收到的 token 数。
     pub async fn buy_outcome_token_limit_fak_n(
         &self,
         token_id: &str,

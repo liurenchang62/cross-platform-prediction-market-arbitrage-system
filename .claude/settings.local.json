@@ -67,7 +67,8 @@
       "Bash(curl -s \"https://gamma-api.polymarket.com/events?active=true&closed=false&limit=1&order=volume24hr&ascending=false\")",
       "Bash(find:*)",
       "Read(//d/cross_platform_arbitrage_system_livetrading/trader/src//**)",
-      "Read(//c/Users//**)"
+      "Read(//c/Users//**)",
+      "Bash(grep:*)"
     ]
   }
 }

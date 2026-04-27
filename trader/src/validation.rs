@@ -1828,6 +1828,53 @@ impl ElectoralPropositionValidator {
     }
 }
 
+/// 价格阈值验证器：用于「资产价格是否高于/低于 $X」类合约
+/// PM 格式："Will the price of Bitcoin be above $68,000 on May 1?"
+/// KS 格式："Bitcoin price on May 1, 2026? - $68,000 or above"
+///
+/// 根本原因：NumberComparator 的 ±0.5 规则会把「May 1」中的「1」与对侧「1」配对，
+/// 导致真正的价格阈值差异（$68,000 vs $65,000）被忽略。
+/// 本验证器专门拦截此类误配：两侧均含大额美元阈值（≥$1,000）时，必须精确吻合。
+pub struct PriceThresholdValidator;
+
+impl PriceThresholdValidator {
+    /// 提取标题中的大额美元阈值（≥$1,000）
+    /// 匹配 $65,000 / $68000 / $1,500 等格式，排除小额（如 $5、$100）
+    fn extract_large_dollar_thresholds(text: &str) -> Vec<f64> {
+        static RE: Lazy<Regex> = Lazy::new(|| {
+            Regex::new(r"\$([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]+)?)").expect("price_threshold_re")
+        });
+        RE.captures_iter(text)
+            .filter_map(|cap| {
+                let s = cap[1].replace(',', "");
+                let v: f64 = s.parse().ok()?;
+                if v >= 1000.0 { Some(v) } else { None }
+            })
+            .collect()
+    }
+
+    /// 若两侧均含大额美元阈值，则 PM 的每一个阈值都必须在 KS 中找到精确对应（<$1 误差）。
+    /// 金融价格合约不适用「±0.5 整数等价」规则（$67,500 ≠ $68,000，两者兑付条件不同）。
+    /// 返回 false 表示应拒绝。
+    pub fn allows_pair(pm_title: &str, kalshi_title: &str) -> bool {
+        let pm_prices = Self::extract_large_dollar_thresholds(pm_title);
+        let ks_prices = Self::extract_large_dollar_thresholds(kalshi_title);
+
+        // 两侧均无大额美元阈值 → 不适用本规则，放行
+        if pm_prices.is_empty() || ks_prices.is_empty() {
+            return true;
+        }
+
+        // PM 的每个价格阈值必须在 KS 中找到精确对应
+        for &p in &pm_prices {
+            if !ks_prices.iter().any(|&k| (p - k).abs() < 1.0) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
 /// 轮次限定词检测器：一侧含 "first round" / "round 1" 等限定词而另一侧没有时拒绝。
 /// 典型误配：PM "win the presidential election"（赢整个大选）vs
 ///           Kalshi "win the first round of the presidential election"（只赢第一轮）。
@@ -1892,6 +1939,14 @@ pub(crate) fn second_screen_try_match_with_reason(
 
     if !date_validator.validate(pm_title, kalshi_title) {
         reject!("DateValidator");
+    }
+
+    if !PriceThresholdValidator::allows_pair(pm_title, kalshi_title) {
+        reject!(format!(
+            "PriceThresholdMismatch(pm={:?} ks={:?})",
+            PriceThresholdValidator::extract_large_dollar_thresholds(pm_title),
+            PriceThresholdValidator::extract_large_dollar_thresholds(kalshi_title),
+        ));
     }
 
     if !WeatherValidator::regions_match(pm_title, kalshi_title) {

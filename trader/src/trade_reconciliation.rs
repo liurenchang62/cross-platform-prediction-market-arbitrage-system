@@ -177,8 +177,11 @@ pub async fn print_live_pair_reconciliation(
         for (i, post) in pm_posts.iter().enumerate() {
             let taking = decimal_to_f64(&post.taking_amount);
             let making = decimal_to_f64(&post.making_amount);
-            // 用 side 字段区分 BUY/SELL，无 side 字段时按 making < taking 启发判断（BUY 时 making≈USDC < taking≈token）
-            let is_buy = making < taking || taking > 1.0;
+            // PostOrderResponse 无 side 字段，通过 making < taking 判断方向：
+            // BUY：making=USDC（如$4.44）< taking=tokens（如12）→ true
+            // SELL：making=tokens（如4）> taking=USDC（如$0.80）→ false
+            // 预测市场 token 价格永远 < $1，故此等式对任意 n≥1 恒成立，无需 `|| taking > 1.0`（该条件反而误判SELL为BUY）
+            let is_buy = making < taking;
             if is_buy {
                 pm_buy_tokens += taking;
                 pm_buy_cost   += making;
