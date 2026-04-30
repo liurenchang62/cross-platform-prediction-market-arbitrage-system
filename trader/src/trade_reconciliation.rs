@@ -62,7 +62,7 @@ fn kalshi_fills_signed_cash_and_fees(fills: &[Value]) -> (f64, f64, f64, f64) {
     (cash, fees, buy_contracts, sell_contracts)
 }
 
-fn decimal_to_f64(d: &polymarket_client_sdk::types::Decimal) -> f64 {
+fn decimal_to_f64(d: &polymarket_client_sdk_v2::types::Decimal) -> f64 {
     d.to_string().parse::<f64>().unwrap_or(f64::NAN)
 }
 

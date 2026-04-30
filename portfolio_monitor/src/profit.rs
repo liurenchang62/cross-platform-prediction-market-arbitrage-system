@@ -5,10 +5,10 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use chrono::Utc;
-use polymarket_client_sdk::data::types::request::{ClosedPositionsRequest, PositionsRequest};
-use polymarket_client_sdk::data::types::{ClosedPositionSortBy, SortDirection};
-use polymarket_client_sdk::data::Client as DataClient;
-use polymarket_client_sdk::types::Decimal;
+use polymarket_client_sdk_v2::data::types::request::{ClosedPositionsRequest, PositionsRequest};
+use polymarket_client_sdk_v2::data::types::{ClosedPositionSortBy, SortDirection};
+use polymarket_client_sdk_v2::data::Client as DataClient;
+use polymarket_client_sdk_v2::types::Decimal;
 use reqwest::Client;
 use serde_json::Value;
 
@@ -27,8 +27,8 @@ fn dec(d: &Decimal) -> f64 {
 }
 
 async fn pm_open_positions(
-    user: polymarket_client_sdk::types::Address,
-) -> Result<Vec<polymarket_client_sdk::data::types::response::Position>> {
+    user: polymarket_client_sdk_v2::types::Address,
+) -> Result<Vec<polymarket_client_sdk_v2::data::types::response::Position>> {
     let client = DataClient::default();
     let mut all = Vec::new();
     let mut offset: i32 = 0;
@@ -63,8 +63,8 @@ async fn pm_open_positions(
 }
 
 async fn pm_closed_positions(
-    user: polymarket_client_sdk::types::Address,
-) -> Result<Vec<polymarket_client_sdk::data::types::response::ClosedPosition>> {
+    user: polymarket_client_sdk_v2::types::Address,
+) -> Result<Vec<polymarket_client_sdk_v2::data::types::response::ClosedPosition>> {
     let client = DataClient::default();
     let mut all = Vec::new();
     let mut offset: i32 = 0;

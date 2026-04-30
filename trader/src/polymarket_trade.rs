@@ -8,15 +8,15 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use alloy_signer_local::PrivateKeySigner;
 use rust_decimal::prelude::ToPrimitive;
-use polymarket_client_sdk::auth::Signer as _;
-use polymarket_client_sdk::auth::Normal;
-use polymarket_client_sdk::auth::state::Authenticated;
-use polymarket_client_sdk::clob::types::request::{BalanceAllowanceRequest, TradesRequest};
-pub use polymarket_client_sdk::clob::types::response::{PostOrderResponse, TradeResponse};
-use polymarket_client_sdk::clob::types::{Amount, AssetType, OrderType, Side, SignatureType};
-use polymarket_client_sdk::clob::{Client, Config};
-use polymarket_client_sdk::types::{Decimal, U256};
-use polymarket_client_sdk::POLYGON;
+use polymarket_client_sdk_v2::auth::Signer as _;
+use polymarket_client_sdk_v2::auth::Normal;
+use polymarket_client_sdk_v2::auth::state::Authenticated;
+use polymarket_client_sdk_v2::clob::types::request::{BalanceAllowanceRequest, TradesRequest};
+pub use polymarket_client_sdk_v2::clob::types::response::{PostOrderResponse, TradeResponse};
+use polymarket_client_sdk_v2::clob::types::{Amount, AssetType, OrderType, Side, SignatureType};
+use polymarket_client_sdk_v2::clob::{Client, Config};
+use polymarket_client_sdk_v2::types::{Decimal, U256};
+use polymarket_client_sdk_v2::POLYGON;
 use serde_json::Value;
 
 use crate::clients::PolymarketClient;
@@ -27,7 +27,7 @@ use crate::system_params::{
 
 pub const CLOB_HOST: &str = "https://clob.polymarket.com";
 
-/// CLOB `Collateral` 的 `balance`：与 py-clob 一致，为 USDC **micro 单位**（1 USDC = 1e6），换算为美元。
+/// CLOB `Collateral` 的 `balance`：Polymarket V2（2026-04-28）后抵押品为 **pUSD** micro 单位（1 pUSD = 1e6），换算为美元。
 pub fn clob_collateral_micro_usdc_to_usd(balance: &Decimal) -> f64 {
     let div = Decimal::from(1_000_000u64);
     (balance / div).to_f64().unwrap_or(0.0)

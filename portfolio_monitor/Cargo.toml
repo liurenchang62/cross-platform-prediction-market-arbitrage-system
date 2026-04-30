@@ -40,6 +40,10 @@ path = "src/bin/position_markets.rs"
 name = "close-position"
 path = "src/bin/close_position.rs"
 
+[[bin]]
+name = "pm-wrap-collateral"
+path = "src/bin/pm_wrap_collateral.rs"
+
 [dependencies]
 anyhow = "1.0"
 tokio = { version = "1", features = ["full"] }
@@ -53,7 +57,7 @@ base64 = "0.22"
 rsa = { version = "0.9", features = ["pem", "sha2"] }
 sha2 = "0.10"
 rand = "0.8"
-polymarket-client-sdk = { version = "0.4.4", features = ["clob", "data", "ctf"] }
+polymarket_client_sdk_v2 = { version = "0.5.1", features = ["clob", "data", "ctf"] }
 # 与 polymarket-client-sdk 的 CTF 示例一致：Provider + 本地签名发链上 redeem
 alloy = { version = "1.6.3", default-features = false, features = [
     "signer-local",

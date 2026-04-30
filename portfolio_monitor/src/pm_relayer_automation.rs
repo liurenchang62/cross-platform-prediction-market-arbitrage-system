@@ -12,14 +12,14 @@ use alloy::sol;
 use alloy::sol_types::SolCall;
 use alloy_signer_local::PrivateKeySigner;
 use anyhow::{Context, Result};
-use polymarket_client_sdk::clob::types::request::BalanceAllowanceRequest;
-use polymarket_client_sdk::clob::types::AssetType;
-use polymarket_client_sdk::data::Client as DataClient;
-use polymarket_client_sdk::data::types::request::PositionsRequest;
-use polymarket_client_sdk::data::types::response::Position;
-use polymarket_client_sdk::types::address;
-use polymarket_client_sdk::types::Decimal;
-use polymarket_client_sdk::{contract_config, derive_proxy_wallet, ContractConfig, POLYGON};
+use polymarket_client_sdk_v2::clob::types::request::BalanceAllowanceRequest;
+use polymarket_client_sdk_v2::clob::types::AssetType;
+use polymarket_client_sdk_v2::data::Client as DataClient;
+use polymarket_client_sdk_v2::data::types::request::PositionsRequest;
+use polymarket_client_sdk_v2::data::types::response::Position;
+use polymarket_client_sdk_v2::types::address;
+use polymarket_client_sdk_v2::types::Decimal;
+use polymarket_client_sdk_v2::{contract_config, derive_proxy_wallet, ContractConfig, POLYGON};
 use rust_decimal::prelude::ToPrimitive;
 use serde::Deserialize;
 use serde_json::json;
@@ -28,8 +28,13 @@ use crate::pm;
 
 const DEFAULT_RELAYER_URL: &str = "https://relayer-v2.polymarket.com";
 const DEFAULT_POLYGON_RPC: &str = "https://polygon-bor-rpc.publicnode.com";
-const USDC_POLYGON: polymarket_client_sdk::types::Address =
-    address!("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174");
+/// pUSD（Polymarket USD）—— Polymarket V2（2026-04-28）迁移后的抵押品，替换原 USDC.e。
+const PUSD_POLYGON: polymarket_client_sdk_v2::types::Address =
+    address!("0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB");
+/// USDC.e on Polygon（V2 迁移前的抵押品，仍用于 wrap 输入）。
+const USDCE_POLYGON: Address = address!("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174");
+/// Polymarket V2 CollateralOnramp：wrap(USDC.e → pUSD)。
+const ONRAMP_POLYGON: Address = address!("0x93070a847efEf7F70739046A929D47a521F5B8ee");
 const RELAY_HUB_POLYGON: Address = address!("0xD216153c06E857cD7f72665E0aF1d7D82172F494");
 const PROXY_FACTORY_POLYGON: Address = address!("0xaB45c5A4B0c941a2F231C04C3f49182e1A254052");
 const PROXY_CALL_CALL: u8 = 1;
@@ -81,6 +86,11 @@ sol! {
         function getCollectionId(bytes32 parentCollectionId, bytes32 conditionId, uint256 indexSet) external view returns (bytes32);
         function getPositionId(address collateralToken, bytes32 collectionId) external view returns (uint256);
         function balanceOf(address account, uint256 id) external view returns (uint256);
+    }
+
+    interface ICollateralOnramp {
+        /// wrap USDC.e → pUSD，1:1；_asset=USDC.e 地址，_to=pUSD 接收方，_amount=micro 单位（6位小数）。
+        function wrap(address _asset, address _to, uint256 _amount) external;
     }
 }
 
@@ -314,7 +324,7 @@ async fn standard_ctf_eligible_for_redeem(
     http: &reqwest::Client,
     rpc: &str,
     ctf: Address,
-    proxy: polymarket_client_sdk::types::Address,
+    proxy: polymarket_client_sdk_v2::types::Address,
     condition_id: B256,
 ) -> Result<(bool, String)> {
     let pd = ICTFRedeemPrecheck::payoutDenominatorCall { conditionId: condition_id };
@@ -344,7 +354,7 @@ async fn standard_ctf_eligible_for_redeem(
         w.copy_from_slice(&col_raw[col_raw.len() - 32..]);
         let collection_id = B256::from(w);
         let pid_call = ICTFRedeemPrecheck::getPositionIdCall {
-            collateralToken: USDC_POLYGON,
+            collateralToken: PUSD_POLYGON,
             collectionId: collection_id,
         };
         let pid_raw = match rpc_eth_call(http, rpc, ctf, pid_call.abi_encode()).await {
@@ -381,7 +391,7 @@ fn decimal_to_raw_micro(d: &Decimal) -> U256 {
     U256::ZERO
 }
 
-async fn fetch_all_positions(user: polymarket_client_sdk::types::Address) -> Result<Vec<Position>> {
+async fn fetch_all_positions(user: polymarket_client_sdk_v2::types::Address) -> Result<Vec<Position>> {
     let client = DataClient::default();
     let mut all = Vec::new();
     let mut offset: i32 = 0;
@@ -501,7 +511,7 @@ async fn relay_submit_proxy(
     rpc: &str,
     eoa: Address,
     signer: &PrivateKeySigner,
-    data_user: polymarket_client_sdk::types::Address,
+    data_user: polymarket_client_sdk_v2::types::Address,
     api_key: &str,
     key_address: &str,
     factory_data: Vec<u8>,
@@ -608,7 +618,7 @@ async fn submit_relayer_approval_batch(
     rpc: &str,
     eoa: Address,
     signer: &PrivateKeySigner,
-    data_user: polymarket_client_sdk::types::Address,
+    data_user: polymarket_client_sdk_v2::types::Address,
     api_key: &str,
     key_address: &str,
 ) -> Result<()> {
@@ -624,7 +634,7 @@ async fn submit_relayer_approval_batch(
         calls: proxy_calls,
     }
     .abi_encode();
-    println!("   💳 PM Relayer：提交 USDC/CTF 授权批次（{} 个 spender）…", spenders.len());
+    println!("   💳 PM Relayer：提交 pUSD/CTF 授权批次（{} 个 spender）…", spenders.len());
     let row = relay_submit_proxy(
         http,
         base,
@@ -657,7 +667,7 @@ async fn run_redeem_round(
     rpc: &str,
     eoa: Address,
     signer: &PrivateKeySigner,
-    data_user: polymarket_client_sdk::types::Address,
+    data_user: polymarket_client_sdk_v2::types::Address,
     api_key: &str,
     key_address: &str,
 ) -> Result<RedeemRoundReport> {
@@ -739,8 +749,8 @@ async fn run_redeem_round(
                 skipped += 1;
                 continue;
             }
-            let req = polymarket_client_sdk::ctf::types::RedeemPositionsRequest::for_binary_market(
-                USDC_POLYGON,
+            let req = polymarket_client_sdk_v2::ctf::types::RedeemPositionsRequest::for_binary_market(
+                PUSD_POLYGON,
                 condition_id,
             );
             ICTFRedeemEncode::redeemPositionsCall {
@@ -895,4 +905,84 @@ pub async fn desk_hydrate_pm_proxy(
     refresh_clob_collateral_desk().await?;
     report.clob_refresh_ok = true;
     Ok(report)
+}
+
+/// 将 Proxy 钱包中全部 USDC.e 通过 CollateralOnramp 换成 pUSD（Polymarket V2 抵押品迁移）。
+/// 仅支持 `POLYMARKET_SIGNATURE_TYPE=1`（Proxy 钱包），通过 Relayer 提交链上交易。
+/// 需要环境变量：`POLYMARKET_PRIVATE_KEY(_PATH)`、`RELAYER_API_KEY`、`RELAYER_API_KEY_ADDRESS`（或对应别名）。
+pub async fn wrap_usdce_to_pusd(polygon_rpc: &str, relayer_url: &str) -> Result<()> {
+    if signature_type_u8() != 1 {
+        anyhow::bail!("此工具仅支持 POLYMARKET_SIGNATURE_TYPE=1（Proxy 钱包）；EOA 用户请直接调用 CollateralOnramp 合约。");
+    }
+
+    let http = crate::http_client_env::build_http_client(Duration::from_secs(30))
+        .context("build http client")?;
+    let base = relayer_base(relayer_url);
+    let rpc = polygon_rpc.trim_end_matches('/');
+
+    let data_user = pm::polymarket_data_api_user_address()?;
+    let proxy: Address = data_user;
+    let hex = pm::read_polymarket_private_key_hex().context("PM 私钥")?;
+    let signer = PrivateKeySigner::from_str(&hex)
+        .context("PrivateKeySigner")?
+        .with_chain_id(Some(POLYGON));
+    let eoa = signer.address();
+
+    let ak = relayer_api_key()?;
+    let addr = relayer_api_key_address()?;
+
+    // 1. 查询 Proxy 钱包 USDC.e 余额
+    let bal_call = IERC20Balance::balanceOfCall { account: proxy };
+    let bal_raw = rpc_eth_call(&http, rpc, USDCE_POLYGON, bal_call.abi_encode())
+        .await
+        .context("查询 USDC.e 余额")?;
+    if bal_raw.len() < 32 {
+        anyhow::bail!("USDC.e balanceOf 返回数据不足");
+    }
+    let usdc_e_balance = decode_abi_u256_word(&bal_raw[bal_raw.len() - 32..])?;
+    if usdc_e_balance.is_zero() {
+        println!("   ℹ Proxy 钱包 USDC.e 余额为 0，无需 wrap。");
+        return Ok(());
+    }
+    let balance_human = usdc_e_balance.to_string().parse::<u128>().unwrap_or(0) as f64 / 1_000_000.0;
+    println!("   📋 Proxy 钱包 USDC.e 余额：{:.6} USDC.e（raw={}）", balance_human, usdc_e_balance);
+
+    // 2. 构造两步 Proxy 调用：先 approve Onramp 消费 USDC.e，再调 wrap()
+    let approve_call = IERC20ApproveEncode::approveCall {
+        spender: ONRAMP_POLYGON,
+        value: usdc_e_balance,
+    };
+    let wrap_call = ICollateralOnramp::wrapCall {
+        _asset: USDCE_POLYGON,
+        _to: proxy,
+        _amount: usdc_e_balance,
+    };
+
+    let proxy_calls = vec![
+        IProxyWalletFactory::ProxyCall {
+            typeCode: PROXY_CALL_CALL,
+            to: USDCE_POLYGON,
+            value: U256::ZERO,
+            data: approve_call.abi_encode().into(),
+        },
+        IProxyWalletFactory::ProxyCall {
+            typeCode: PROXY_CALL_CALL,
+            to: ONRAMP_POLYGON,
+            value: U256::ZERO,
+            data: wrap_call.abi_encode().into(),
+        },
+    ];
+    let factory_data = IProxyWalletFactory::proxyCall { calls: proxy_calls }.abi_encode();
+
+    println!("   🔄 提交 wrap 交易（approve USDC.e + wrap → pUSD）via Relayer…");
+    let row = relay_submit_proxy(
+        &http, &base, rpc, eoa, &signer, data_user, &ak, &addr, factory_data, "wrap usdce to pusd",
+    )
+    .await?;
+    println!(
+        "   ✅ wrap 已确认：{} ({})",
+        row.transaction_hash, row.state
+    );
+    println!("   💰 {:.6} USDC.e → pUSD 转换完成。请重启主程序。", balance_human);
+    Ok(())
 }

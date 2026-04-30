@@ -2,16 +2,16 @@ use std::str::FromStr as _;
 
 use anyhow::{Context, Result};
 use alloy_signer_local::PrivateKeySigner;
-use polymarket_client_sdk::auth::Signer as _;
-use polymarket_client_sdk::auth::Normal;
-use polymarket_client_sdk::auth::state::Authenticated;
-use polymarket_client_sdk::clob::types::request::{
+use polymarket_client_sdk_v2::auth::Signer as _;
+use polymarket_client_sdk_v2::auth::Normal;
+use polymarket_client_sdk_v2::auth::state::Authenticated;
+use polymarket_client_sdk_v2::clob::types::request::{
     BalanceAllowanceRequest, MidpointRequest, TradesRequest,
 };
-use polymarket_client_sdk::clob::types::{AssetType, Side, SignatureType};
-use polymarket_client_sdk::clob::{Client as PmClient, Config as PmConfig};
-use polymarket_client_sdk::types::{Address, Decimal, U256};
-use polymarket_client_sdk::{derive_proxy_wallet, derive_safe_wallet, POLYGON};
+use polymarket_client_sdk_v2::clob::types::{AssetType, Side, SignatureType};
+use polymarket_client_sdk_v2::clob::{Client as PmClient, Config as PmConfig};
+use polymarket_client_sdk_v2::types::{Address, Decimal, U256};
+use polymarket_client_sdk_v2::{derive_proxy_wallet, derive_safe_wallet, POLYGON};
 
 use crate::system_params;
 
@@ -98,8 +98,8 @@ pub async fn sell_token_fak(
     client: &PmClient<Authenticated<Normal>>,
     token_id: &str,
     n: i64,
-) -> Result<polymarket_client_sdk::clob::types::response::PostOrderResponse> {
-    use polymarket_client_sdk::clob::types::{Amount, OrderType};
+) -> Result<polymarket_client_sdk_v2::clob::types::response::PostOrderResponse> {
+    use polymarket_client_sdk_v2::clob::types::{Amount, OrderType};
     let token_u256: U256 = token_id_to_u256(token_id)?;
     let size_dec = Decimal::from(n as u64);
     let amount = Amount::shares(size_dec).map_err(|e| anyhow::anyhow!("Amount::shares: {}", e))?;
@@ -161,7 +161,7 @@ pub async fn conditional_shares(
 pub async fn all_trades_for_token(
     client: &PmClient<Authenticated<Normal>>,
     token_id: &str,
-) -> Result<Vec<polymarket_client_sdk::clob::types::response::TradeResponse>> {
+) -> Result<Vec<polymarket_client_sdk_v2::clob::types::response::TradeResponse>> {
     let u: U256 = token_id_to_u256(token_id)?;
     let mut out = Vec::new();
     let req = TradesRequest::builder().asset_id(u).build();
@@ -171,7 +171,7 @@ pub async fn all_trades_for_token(
 }
 
 pub fn trades_net_ledger(
-    trades: &[polymarket_client_sdk::clob::types::response::TradeResponse],
+    trades: &[polymarket_client_sdk_v2::clob::types::response::TradeResponse],
 ) -> (f64, f64, f64, Option<String>) {
     let mut net_cash_out = 0.0_f64;
     let mut fees = 0.0_f64;

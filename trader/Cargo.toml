@@ -56,7 +56,7 @@ rsa = { version = "0.9", features = ["pem", "sha2"] }
 sha2 = "0.10"
 rand = "0.8"
 base64 = "0.22"
-polymarket-client-sdk = { version = "0.4.4", features = ["clob"] }
+polymarket_client_sdk_v2 = { version = "0.5.1", features = ["clob"] }
 alloy-signer-local = "1.8"
 rust_decimal = "1.39"
 rust_decimal_macros = "1.39"

@@ -8,10 +8,10 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use chrono::DateTime;
-use polymarket_client_sdk::data::types::request::ClosedPositionsRequest;
-use polymarket_client_sdk::data::types::{ClosedPositionSortBy, SortDirection};
-use polymarket_client_sdk::data::Client as DataClient;
-use polymarket_client_sdk::types::Decimal;
+use polymarket_client_sdk_v2::data::types::request::ClosedPositionsRequest;
+use polymarket_client_sdk_v2::data::types::{ClosedPositionSortBy, SortDirection};
+use polymarket_client_sdk_v2::data::Client as DataClient;
+use polymarket_client_sdk_v2::types::Decimal;
 use reqwest::Client;
 use serde::Deserialize;
 
@@ -132,7 +132,7 @@ fn dec_f64(d: &Decimal) -> f64 {
     d.to_string().parse::<f64>().unwrap_or(0.0)
 }
 
-async fn fetch_pm_realized(token_id: &str, user: polymarket_client_sdk::types::Address) -> Result<Option<f64>> {
+async fn fetch_pm_realized(token_id: &str, user: polymarket_client_sdk_v2::types::Address) -> Result<Option<f64>> {
     let client = DataClient::default();
     let mut offset: i32 = 0;
     loop {

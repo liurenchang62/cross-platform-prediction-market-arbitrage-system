@@ -48,8 +48,8 @@ use kalshi_trade::{
     KalshiIocResult, KalshiTradeConfig,
 };
 use polymarket_trade::{PolymarketClobTrader, PostOrderResponse};
-use polymarket_client_sdk::clob::types::OrderStatusType;
-use polymarket_client_sdk::types::Decimal;
+use polymarket_client_sdk_v2::clob::types::OrderStatusType;
+use polymarket_client_sdk_v2::types::Decimal;
 use reqwest::Client as HttpClient;
 use market_matcher::{MarketMatcher, MarketMatcherConfig};
 use arbitrage_detector::{ArbitrageDetector, ArbitrageOpportunity};
@@ -596,7 +596,7 @@ async fn live_guard_pm_collateral_after_full_match(pm_trader: &PolymarketClobTra
     let bal = pm_trader.fetch_clob_collateral_balance_for_guard().await?;
     if bal == Decimal::ZERO {
         anyhow::bail!(
-            "实盘保护：Polymarket CLOB Collateral 余额为 0，程序已停止。请检查 {}（网页钱包常见为 1=Proxy）、入金与 USDC 授权；可设置 PM_CLOB_BALANCE_SYNC=1 后重试。",
+            "实盘保护：Polymarket CLOB Collateral(pUSD) 余额为 0，程序已停止。Polymarket V2（2026-04-28）已将抵押品从 USDC.e 迁移至 pUSD，请先在 Polymarket 网页将 USDC.e wrap 成 pUSD 后再启动；并检查 {}（网页钱包常见为 1=Proxy）与私钥一致；可设置 PM_CLOB_BALANCE_SYNC=1 后重试。",
             POLYMARKET_SIGNATURE_TYPE_ENV
         );
     }
@@ -893,13 +893,13 @@ async fn preflight_live_readonly_trading_apis(
         .context("实盘预检：Polymarket CLOB balance-allowance（Collateral）失败")?;
     if pm_collateral == Decimal::ZERO {
         anyhow::bail!(
-            "实盘预检：Polymarket CLOB Collateral 为 0（须 > 0）。请检查 {}（常见网页账户为 1=Proxy）与私钥一致；可设 PM_CLOB_BALANCE_SYNC=1 后重试。",
+            "实盘预检：Polymarket CLOB Collateral(pUSD) 为 0（须 > 0）。Polymarket V2（2026-04-28）已将抵押品从 USDC.e 迁移至 pUSD，请先在 Polymarket 网页将 USDC.e wrap 成 pUSD；并检查 {}（常见网页账户为 1=Proxy）与私钥一致；可设 PM_CLOB_BALANCE_SYNC=1 后重试。",
             POLYMARKET_SIGNATURE_TYPE_ENV
         );
     }
     let pm_u = polymarket_trade::clob_collateral_micro_usdc_to_usd(&pm_collateral);
     println!(
-        "      Polymarket CLOB Collateral ≈ ${:.2} USD（micro USDC ÷1e6，raw={}）",
+        "      Polymarket CLOB Collateral(pUSD) ≈ ${:.2} USD（micro pUSD ÷1e6，raw={}）",
         pm_u, pm_collateral
     );
 

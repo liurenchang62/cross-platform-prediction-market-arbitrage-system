@@ -6,10 +6,10 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use chrono::{DateTime, TimeZone, Utc};
 use csv::Writer;
-use polymarket_client_sdk::data::types::request::ActivityRequest;
-use polymarket_client_sdk::data::types::response::Activity;
-use polymarket_client_sdk::data::types::{ActivitySortBy, ActivityType, Side as PmDataSide, SortDirection};
-use polymarket_client_sdk::data::Client as DataClient;
+use polymarket_client_sdk_v2::data::types::request::ActivityRequest;
+use polymarket_client_sdk_v2::data::types::response::Activity;
+use polymarket_client_sdk_v2::data::types::{ActivitySortBy, ActivityType, Side as PmDataSide, SortDirection};
+use polymarket_client_sdk_v2::data::Client as DataClient;
 use reqwest::Client;
 use serde_json::Value;
 
@@ -292,7 +292,7 @@ async fn ks_merged_tickers(
     Ok((tickers, known_titles))
 }
 
-async fn fetch_pm_activity(user: polymarket_client_sdk::types::Address) -> Result<Vec<Activity>> {
+async fn fetch_pm_activity(user: polymarket_client_sdk_v2::types::Address) -> Result<Vec<Activity>> {
     let client = DataClient::default();
     let mut all = Vec::new();
     let mut offset: i32 = 0;

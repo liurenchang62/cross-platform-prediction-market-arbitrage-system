@@ -5,9 +5,9 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use chrono::Utc;
-use polymarket_client_sdk::data::types::request::PositionsRequest;
-use polymarket_client_sdk::data::Client as DataClient;
-use polymarket_client_sdk::types::Decimal;
+use polymarket_client_sdk_v2::data::types::request::PositionsRequest;
+use polymarket_client_sdk_v2::data::Client as DataClient;
+use polymarket_client_sdk_v2::types::Decimal;
 use reqwest::Client;
 use serde_json::Value;
 
@@ -27,8 +27,8 @@ fn dec_f64(d: &Decimal) -> f64 {
 }
 
 async fn pm_data_positions(
-    user: polymarket_client_sdk::types::Address,
-) -> Result<Vec<polymarket_client_sdk::data::types::response::Position>> {
+    user: polymarket_client_sdk_v2::types::Address,
+) -> Result<Vec<polymarket_client_sdk_v2::data::types::response::Position>> {
     let client = DataClient::default();
     let mut all = Vec::new();
     let mut offset: i32 = 0;

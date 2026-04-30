@@ -68,7 +68,11 @@
       "Bash(find:*)",
       "Read(//d/cross_platform_arbitrage_system_livetrading/trader/src//**)",
       "Read(//c/Users//**)",
-      "Bash(grep:*)"
+      "Bash(grep:*)",
+      "Bash(cargo search:*)",
+      "Bash(curl -s https://crates.io/api/v1/crates/polymarket-client-sdk/versions)",
+      "Bash(curl -s \"https://crates.io/api/v1/crates/polymarket_client_sdk_v2\")",
+      "Bash(curl -s \"https://crates.io/api/v1/crates/polymarket_client_sdk_v2/0.5.1\")"
     ]
   }
 }

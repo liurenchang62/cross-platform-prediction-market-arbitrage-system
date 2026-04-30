@@ -15,19 +15,20 @@ use alloy::sol;
 use alloy::sol_types::SolCall;
 use anyhow::{Context, Result};
 use clap::Parser;
-use polymarket_client_sdk::data::Client as DataClient;
-use polymarket_client_sdk::data::types::request::PositionsRequest;
-use polymarket_client_sdk::data::types::response::Position;
-use polymarket_client_sdk::types::address;
-use polymarket_client_sdk::types::Decimal;
-use polymarket_client_sdk::{contract_config, POLYGON};
+use polymarket_client_sdk_v2::data::Client as DataClient;
+use polymarket_client_sdk_v2::data::types::request::PositionsRequest;
+use polymarket_client_sdk_v2::data::types::response::Position;
+use polymarket_client_sdk_v2::types::address;
+use polymarket_client_sdk_v2::types::Decimal;
+use polymarket_client_sdk_v2::{contract_config, POLYGON};
 use serde_json::json;
 
 use portfolio_monitor::pm;
 
 const DEFAULT_RPC: &str = "https://polygon-bor-rpc.publicnode.com";
-const USDC_POLYGON: polymarket_client_sdk::types::Address =
-    address!("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174");
+/// pUSD（Polymarket USD）—— Polymarket V2（2026-04-28）迁移后抵押品。
+const PUSD_POLYGON: polymarket_client_sdk_v2::types::Address =
+    address!("0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB");
 
 sol! {
     interface IConditionalTokensView {
@@ -46,7 +47,7 @@ struct Args {
     rpc_url: String,
 }
 
-async fn fetch_all_positions(user: polymarket_client_sdk::types::Address) -> Result<Vec<Position>> {
+async fn fetch_all_positions(user: polymarket_client_sdk_v2::types::Address) -> Result<Vec<Position>> {
     let client = DataClient::default();
     let mut all = Vec::new();
     let mut offset: i32 = 0;
@@ -178,7 +179,7 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    let usdc_a: Address = USDC_POLYGON;
+    let usdc_a: Address = PUSD_POLYGON;
 
     for ((condition_id, neg_risk), ps) in groups {
         let redeemable_any = ps.iter().any(|x| x.redeemable);
