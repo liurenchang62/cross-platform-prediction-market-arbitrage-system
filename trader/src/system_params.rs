@@ -288,21 +288,54 @@ pub const KALSHI_OB_RATE_LIMIT_PER_SEC: usize = 10;
 /// 全量重匹配最小挂钟间隔（秒）。追踪周期 sleep 改为 2s 后，不能再用 tick 计数——改为直接测经过时间。
 pub const FULL_FETCH_INTERVAL_WALL_SECS: u64 = 90 * 60;
 
-// ==================== env 文件加载（备用凭证来源） ====================
-/// 默认凭证文件路径（相对于工作目录）。
-pub const ENV_CREDENTIALS_PATH: &str = "env/credentials.env";
+// ==================== env 文件加载（凭证来源） ====================
+/// 加载路径开关文件（无条件最先读取）。
+pub const ENV_PARAMS_PATH: &str = "env/env_params.env";
+/// 网络代理配置文件。
+pub const ENV_PROXY_PATH: &str = "env/proxy.env";
+/// 大模型 / 飞书配置文件。
+pub const ENV_LLM_PATH: &str = "env/llm.env";
+/// Kalshi 凭证文件。
+pub const ENV_KALSHI_PATH: &str = "env/kalshi.env";
+/// Polymarket 凭证文件。
+pub const ENV_POLYMARKET_PATH: &str = "env/polymarket.env";
 
-/// 从 `env/credentials.env` 加载凭证到环境变量。
+/// 从 `env/` 目录下的分类文件（或系统环境变量）加载凭证。
+///
+/// ## 加载路径选择（`LOAD_KEY_THROUGH_ENV`）
+///
+/// | 取值 | 行为 |
+/// |------|------|
+/// | 未设置 / `1` / `true` / `yes`（**默认**） | 从 `env/proxy.env`、`env/llm.env`、`env/kalshi.env`、`env/polymarket.env` 依次加载；再兜底加载旧版 `env/credentials.env` |
+/// | `0` / `false` / `no` | 跳过所有文件，完全依赖系统/用户态环境变量 |
 ///
 /// 规则：
 /// - `#` 开头或空行跳过
-/// - `KEY=VALUE` 格式解析（`=` 两侧不 trim，VALUE 可含 `=`）
-/// - 若 `KEY` 已在环境变量中存在（非空），**不覆盖**（系统/用户态注入优先）
+/// - `KEY=VALUE` 格式解析（VALUE 可含 `=`）
+/// - 若 `KEY` 已在环境变量中存在（非空），**不覆盖**（系统变量优先）
 /// - 文件不存在时静默跳过（不报错）
 ///
 /// 应在 `main()` 最开始、任何凭证读取之前调用。
 pub fn load_env_file_if_missing() {
-    load_env_file_from_path(ENV_CREDENTIALS_PATH);
+    // env_params.env 无条件最先读取，从中获取 LOAD_KEY_THROUGH_ENV 开关
+    load_env_file_from_path(ENV_PARAMS_PATH);
+    let load_from_files = std::env::var("LOAD_KEY_THROUGH_ENV")
+        .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no"))
+        .unwrap_or(true);
+
+    if !load_from_files {
+        return;
+    }
+
+    // 按分类顺序加载（后加载的不覆盖先加载已有的值）
+    for path in &[
+        ENV_PROXY_PATH,
+        ENV_LLM_PATH,
+        ENV_KALSHI_PATH,
+        ENV_POLYMARKET_PATH,
+    ] {
+        load_env_file_from_path(path);
+    }
 }
 
 /// 可测试的内部实现，接受任意路径。
