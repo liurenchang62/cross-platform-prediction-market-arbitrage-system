@@ -2,236 +2,225 @@
 
 **English** | [简体中文](README.zh-CN.md)
 
-> Live **boxed binary hedges** between **Kalshi** and **Polymarket**: each trade buys complementary YES/NO outcomes across venues so combined payoff targets about **`$1`** per paired contract at resolution. **The engine evaluates both symmetric orientations** (e.g. Kalshi YES + Polymarket NO and Kalshi NO + Polymarket YES) and executes whichever clears fees, ROI gates, and risk checks.
->
-> Research / educational use. Not investment advice.
+A production-grade monitoring and execution stack for cross-venue binary-contract hedges between **Kalshi** and **Polymarket**. The system continuously ingests full market catalogs from both venues, aligns economically equivalent contracts through similarity search, evaluates boxed hedges against complete order-book ladders, and—when risk gates clear—submits venue-native aggressive orders on both legs in parallel with structured post-trade reconciliation. Each trade targets a combined payoff of approximately **$1** per paired contract at resolution.
+
+> Research and educational use. Not investment advice.
 
 ---
 
-## Performance & speed
+## System Architecture
 
-| Angle | What the codebase does |
-|-------|-------------------------|
-| **Runtime model** | **Rust** + **Tokio** async I/O; hot paths avoid Python-style interpreter overhead and keep one OS process fanning out many concurrent HTTP calls. |
-| **Release build** | Workspace `Cargo.toml` enables **`opt-level = 3`**, **`lto = true`**, **`codegen-units = 1`** for maximum throughput in production binaries. |
-| **Parallel venue legs** | After validation, **Kalshi IOC buy** and **Polymarket BUY limit FAK** launch together via **`tokio::join!`**—elapsed time tracks the **slower** venue round-trip because both legs run in parallel. |
-| **Scan concurrency** | **`ARB_TRACK_CONCURRENCY`** (default **40**) bounds parallelism for **price tracking** and **full-cycle arbitrage validation**, keeping order-book polling responsive while capping outbound connections. |
-| **Matching throughput** | TF-IDF similarity uses **`MATCH_MATMUL_CHUNK_ROWS`** (**512**) chunked matrix multiplication for large market universes at sustainable throughput. |
+The pipeline operates as a closed loop across two independent central-limit order books:
+
+```
+Market ingest → Similarity matching → Dual-orientation expansion
+    → Ladder-based detection → Parallel execution → Reconciliation → Ledger
+```
+
+**Full-cycle refresh.** Both venue catalogs are pulled via paginated REST and kept current to tens of thousands of contracts. A periodic full fetch (default every 90 minutes, `FULL_FETCH_INTERVAL_WALL_SECS`) forces newly listed markets into the matching index, preventing coverage drift as tickers roll over.
+
+**Pair formation.** TF-IDF cosine similarity over market descriptions combines with curated keyword taxonomies (`config/categories.toml`) to propose candidate pairs. Similarity cuts against `SIMILARITY_THRESHOLD` (0.90); an optional DeepSeek-backed validation path (`validation.rs` / `llm_validator.rs`) handles ambiguous matches.
+
+**Dual-orientation expansion.** Each accepted pair expands into two complementary tracking handles—`Kalshi YES + Polymarket NO` and `Kalshi NO + Polymarket YES`—so that both economically equivalent hedge directions enter surveillance automatically (`expand_dual_orientations` in `main.rs`). This removes a recurring operational risk: manually maintained orientation tables that drift out of sync with the live book.
+
+**Ladder-based detection.** Every cycle rebuilds the visible ask ladder on both venues. The detector walks price levels in sequence, deriving worst-fill IOC limits for Kalshi and budget-aligned FAK notionals for Polymarket (`arbitrage_detector.rs`). Integer Kalshi contract counts are locked at this stage so that detection and execution share the same sizing model—eliminating a classic gap where models think in fractional contracts while venues settle in integers.
+
+**Parallel execution.** Validated opportunities cross a single `tokio::join!` barrier: Kalshi IOC and Polymarket FAK BUY instructions launch simultaneously (`validate_arbitrage_pair_post_success`). Wall-clock latency is bounded by the slower venue's round-trip, rather than the sum of two sequential REST chains. This directly reduces exposure windows during fill competition.
+
+**Reconciliation.** Independent matching engines rarely produce perfectly symmetric fills. When one leg overfills relative to the other, the system unwinds the excess through venue-native opposite-side orders (Kalshi IOC sell, Polymarket FAK sell) above a de minimis notional threshold. Residual imbalances that cannot be unwound are logged to `logs/naked_positions.jsonl` (`NAKED_POSITIONS_JSONL`). Every executed trade—including partial fills and unwind attempts—is appended to `logs/desk_events.jsonl` (`DESK_EVENTS_JSONL`) as structured, timestamped records.
 
 ---
 
-## Design highlights & innovations
+## Engineering Implementation
 
-1. **Symmetric complementary legs** — Detection compares **two** boxed structures: `Kalshi YES ask + Polymarket NO ask` vs `Kalshi NO ask + Polymarket YES ask`; whichever clears profit thresholds (after fee models and buffers) drives the live quote path—aligned with how binary contracts actually combine to `$1`.
-2. **Dual-orientation expansion** — Matcher output is expanded with **simultaneous YES/NO flips on both venues** so tracking and validation cover **both** economically equivalent hedge directions automatically.
-3. **Ladder-accurate economics** — Opportunities are refined from **full visible ask ladders** (Polymarket CLOB + Kalshi order books): sweep sizes through levels, derive **IOC limit prices** (worst fill) and **FAK limits**, and grade **integer Kalshi contract counts** consistently between detection and execution.
-4. **Venue-native fees** — **Kalshi** taker fees follow **series-specific schedules** from the Trade API; **Polymarket** prefers live **`fee-rate`** when available, with a conservative **bps fallback** on HTTP failure so pricing stays prudent while scanning continues.
-5. **Safety gates** — **`CONFIRM`** unlock, **`LIVE_TRADING_ON`**, and **`require_live_orders_allowed`** fence every path that can move balances; between validated executions the loop sticks to **read-only** calls (quotes, books, schedules).
-6. **Post-trade reconcile** — **`tokio::join!`** can still yield skewed fills; the runner **IOC-sells excess Kalshi** or **FAK-sells excess Polymarket** above de minimis notional, logs **`naked_positions`** when unwind fails, and records structured outcomes in **`desk_events.jsonl`**.
+### Runtime Model
+
+| Decision | Implementation |
+|----------|----------------|
+| Language & concurrency | Single Rust binary + Tokio async runtime. Polling loops, RSA signing, and reconciliation futures share one address space. No managed runtime or interpreter overhead on hot paths. |
+| Release profile | Workspace `Cargo.toml`: `opt-level = 3`, `lto = true`, `codegen-units = 1`. Trades incremental compile time for maximum steady-state throughput—the binary's job is to saturate HTTP pipelines, not rebuild frequently. |
+| Process model | One OS process fans out many concurrent HTTP calls. No multiprocess coordination overhead. |
+
+### Matching Throughput
+
+TF-IDF similarity search projects venue-wide market descriptions into a joint vector space. Rather than iterating pairwise, the matcher uses chunked matrix multiplication with **512-row blocks** (`MATCH_MATMUL_CHUNK_ROWS`), allowing ndarray-friendly dense kernels to absorb large venue snapshots without scripting-language loop overhead. This keeps full-catalog re-matching within practical wall-clock bounds even as market counts grow into the thousands.
+
+### Ladder-Accurate Economics
+
+| Aspect | Detail |
+|--------|--------|
+| Price source | Full visible ask ladder on both venues—not top-of-book snapshots |
+| IOC limit derivation | Worst resting sell price after walking the cumulative size required to fill the target notional |
+| FAK budget | Notional sized against realized VWAP across walked levels, not optimistic best-quote prints |
+| Contract integer alignment | Kalshi integer contract counts derived from the same ladder walk used for pricing; detection and execution operate on identical quantities |
+
+### Complementary-Leg Structure
+
+The detector evaluates two boxed bundles side by side:
+
+| Bundle | Composition |
+|--------|-------------|
+| Orientation A | Kalshi YES asks + Polymarket NO asks |
+| Orientation B | Kalshi NO asks + Polymarket YES asks |
+
+Whichever bundle clears post-fee profitability, ROI thresholds, and liquidity checks drives execution. Neither venue is hardcoded as the "YES side" or "NO side"—the economics of the book at that moment determine which orientation fires.
+
+### Venue-Native Fees
+
+| Venue | Fee source | Refresh / fallback behavior |
+|-------|-----------|-----------------------------|
+| Kalshi | Series-specific taker schedules from Trade API `/series/fee_changes`, filtered per tracked series ticker (`kalshi_fee_schedule.rs`) | Hydrated whenever the orchestrator builds the Kalshi `series_keys` set for a **full-match validation batch** or an **active tracking sweep**—aligned with validation cycles, not necessarily every isolated order-book GET |
+| Polymarket | Dynamic CLOB `fee-rate` (bps) via authenticated client | Conservative floor `PM_TAKER_FEE_BPS_WHEN_FETCH_FAILS` (250 bps) on HTTP failure |
+
+Fee models are refreshed alongside those validation passes so promotional windows and fee changes propagate into pricing without manual intervention. The Polymarket fallback is intentionally pessimistic—assuming zero fees silently would inflate apparent edge and risk live losses.
+
+### Concurrency Shaping
+
+| Parameter | Value | Purpose |
+|-----------|-------|---------|
+| `ARB_TRACK_CONCURRENCY` | 40 | Caps simultaneous book-driven validation tasks |
+| Effect | Tokio `buffer_unordered(conc)` around futures streams in `main.rs` | Prevents unbounded in-flight HTTP work during scan cycles while maintaining fresh liquidity across tracked pairs |
+
+Rather than spawning one unbounded task per market pair (which could number in the hundreds), the orchestrator multiplexes work behind this fixed concurrency window—converting potential connection storms into a controlled fan-out that respects local resources and venue rate-limit norms (`KALSHI_OB_RATE_LIMIT_PER_SEC` additionally shapes Kalshi book polling).
+
+### Safety Gates
+
+```
+LIVE_TRADING_ON (compile-time) → set_live_arbitrage_orders_allowed at startup
+    → require_live_orders_allowed() on execution paths → Orders / unwinds
+```
+
+`LIVE_TRADING_ON` is a compile-time flag in `system_params.rs`; `main` mirrors it into `live_arbitrage_orders_allowed` before the loop begins. Every path that can debit collateral issues `require_live_orders_allowed()` (`kalshi_trade.rs`, `polymarket_trade.rs`, reconciliation). Between executions the loop confines itself to read-only venue calls (quotes, ladders, fee endpoints). Setting `LIVE_TRADING_ON=false` keeps the process in surveillance-only mode (opportunities print, no live placement) without rebuilding secondary confirmation machinery.
+
+### Post-Trade Ledger & Round Limits
+
+| Record | Location | Purpose |
+|--------|----------------|---------|
+| Desk events | `logs/desk_events.jsonl` (`DESK_EVENTS_JSONL`), append-only JSONL | Full trade narrative: fills, partial fills, unwind attempts, timestamps |
+| Naked positions | `logs/naked_positions.jsonl` (`NAKED_POSITIONS_JSONL`), append-only JSONL | Residual imbalances that could not be unwound |
+| Round counter | `logs/arb_rounds_store.json` (`ARB_ROUNDS_STORE_PATH`), per-pair JSON | Cross-session persistence of successful execution rounds |
+
+The round counter enforces `MAX_PAIR_ARB_ROUNDS = 3` across process restarts—preventing silent pyramiding when the same statistical edge reappears across sessions.
 
 ---
 
-## Overview
+## Runtime Cadence
 
-Rust workspace crates:
+| Rhythm | Interval | Behavior |
+|--------|----------|----------|
+| Full re-match | 90 min (`FULL_FETCH_INTERVAL_WALL_SECS`) | Pull complete catalogs, rebuild similarity projections, re-expand orientations, enqueue tracking |
+| Microstructure polling | Tight loop (~2 s sleep between cycles in `main.rs`, plus network latency) | Rebuild ladders, re-validate active pairs behind `ARB_TRACK_CONCURRENCY` |
 
-| Crate | Role |
-|-------|------|
-| **`trader`** | Live loop: venue fetch, TF-IDF matching + optional LLM validation, ladder-based detector, **parallel IOC + FAK** execution, session risk, Feishu alerts |
-| **`portfolio-monitor`** | Read-only analytics + utilities: snapshots, P&amp;L, cash flows, turnover charts, redeem / wrap helpers |
+**Capital parameters** (fractions reference `session_reference_capital_usd`, seeded at startup from live balances—see `session_risk.rs` / `set_session_reference_capital_usd`):
 
-**End-to-end flow**
+| Parameter | Value | Constraint |
+|-----------|-------|------------|
+| Per-leg notional cap | 1.5% (`PER_LEG_CAP_FRAC_OF_CAPITAL`) | Single-venue probe sizing |
+| Pair combined cap | 3% (`PAIR_CAP_FRAC_OF_CAPITAL`) | Both legs combined ceiling |
+| Kalshi deployable ceiling | 70% (`KALSHI_BALANCE_DEPLOYABLE_FRAC`) | Leaves buffer for withdrawals and concurrent fills |
+| Net ROI gate | 10% (`LIVE_ARBIT_MIN_NET_PROFIT_FRAC_OF_PAIR_CAP`) | Net profit must exceed this fraction of deployed capital (`capital_used`) before acceptance |
 
-1. On a wall-clock cadence (**`FULL_FETCH_INTERVAL_WALL_SECS`** = **90 min**), refresh open markets from both venues (paginated caps in `system_params.rs`).
-2. **TF-IDF cosine** similarity + **`config/categories.toml`** keyword rules propose pairs; optional **DeepSeek** LLM pass for doubtful matches.
-3. Expand **dual orientations** per matched PM/Kalshi tuple so both complementary hedge directions are tracked.
-4. For each active pair, fetch books concurrently (bounded by **`ARB_TRACK_CONCURRENCY`**); build ladders; run strict detector with Kalshi + PM fee models, ROI gate (**`LIVE_ARBIT_MIN_NET_PROFIT_FRAC_OF_PAIR_CAP`**), caps, settlement skew / imminent-resolution skips.
-5. When live trading is enabled and checks pass, **`tokio::join!`** submits **Kalshi IOC** and **Polymarket FAK BUY** at ladder-derived limits; reconcile mismatched fills; append **`logs/desk_events.jsonl`** and optional Feishu notifications.
+**Calendar guards:**
 
----
-
-## Repository layout
-
-```
-cross_platform_arbitrage_system_livetrading/
-├── Cargo.toml                   # workspace: trader + portfolio_monitor (release LTO profile)
-├── config/
-│   └── categories.toml          # keyword categories for matching
-├── env/                         # credentials & configuration (git-ignored)
-│   ├── env_params.env           # loader switch (LOAD_KEY_THROUGH_ENV)
-│   ├── proxy.env                # HTTP/HTTPS proxy (Clash / V2Ray / ClashVerge)
-│   ├── llm.env                  # DeepSeek API key + model settings
-│   ├── kalshi.env               # Kalshi API key ID + RSA private key path
-│   └── polymarket.env           # Polymarket private key + Relayer credentials
-├── logs/                        # runtime outputs (auto-created)
-│   ├── desk_events.jsonl        # fill ledger (append-only)
-│   ├── arb_rounds_store.json    # per-pair round counter (cross-session)
-│   ├── naked_positions.jsonl    # emergency: unhedged positions
-│   └── trades_cache.txt         # Kalshi trade cache for reconciliation
-├── trader/
-│   └── src/
-│       ├── main.rs              # cycle loop, concurrency, parallel execution + reconcile
-│       ├── system_params.rs     # constants + env file loader
-│       ├── market_matcher.rs    # TF-IDF matching engine
-│       ├── arbitrage_detector.rs # symmetric strategies + ladders + slippage
-│       ├── validation.rs        # LLM + rule-based pair validation
-│       ├── session_risk.rs      # capital baseline + cash warnings
-│       ├── kalshi_trade.rs      # Kalshi IOC / IOC sell-unwind
-│       ├── polymarket_trade.rs  # Polymarket FAK BUY / FAK SELL helpers
-│       ├── feishu_push.rs       # Feishu webhook alerts
-│       ├── desk_events.rs       # fill ledger writer
-│       └── bin/
-│           ├── check_env.rs     # env / credential sanity check
-│           └── pm_redeem.rs     # standalone PM redeem + collateral refresh
-└── portfolio_monitor/
-    └── src/
-        ├── pm_relayer_automation.rs  # Relayer: redeem, approve, wrap, FOK
-        └── bin/
-            ├── snapshot.rs           # unified KS + PM portfolio snapshot
-            ├── cashflow.rs           # cash-flow CSV export
-            ├── profit.rs             # P&L summary
-            ├── turnover.rs           # trade turnover charts (PNG)
-            ├── arb_reconcile.rs      # 3-point return reconciliation
-            ├── position_markets.rs   # live order-book view for open positions
-            ├── close_position.rs     # directed close (dry-run by default)
-            ├── pm_redeem_diagnose.rs # on-chain payout diagnostics
-            └── pm_wrap_collateral.rs # USDC.e → pUSD via CollateralOnramp
-```
+| Guard | Threshold | Rationale |
+|-------|-----------|-----------|
+| Settlement date skew | Reject when `abs(ΔUTC seconds) > MAX_SETTLEMENT_DATE_SKEW_DAYS × 86400` (3 days) | Drops duration-mismatched pairs (either side missing dates skips the check) |
+| Imminent resolution skip | Skip when either leg resolves within `IMMINENT_RESOLUTION_SKIP_MINS` (10 minutes) | Excludes terminal microstructure noise from ladder logic |
 
 ---
 
-## Environment setup
-
-### 1 — Create the `env/` files
-
-The program auto-loads credentials from five files under `env/`. Copy the templates below and fill in your values.
-
-**`env/env_params.env`**
-```ini
-# true (default): load credentials from env/ files
-# false: skip files, rely entirely on system environment variables
-LOAD_KEY_THROUGH_ENV=true
-```
-
-**`env/proxy.env`**
-```ini
-# Clash / V2Ray / ClashVerge default port 7897
-# Comment out both lines if running on a server without a proxy
-HTTP_PROXY=http://127.0.0.1:7897
-HTTPS_PROXY=http://127.0.0.1:7897
-```
-
-**`env/llm.env`**
-```ini
-LLM_PROVIDER=deepseek
-DEEPSEEK_API_KEY=<your-deepseek-api-key>
-LLM_MODEL=deepseek-chat
-LLM_TIMEOUT_MS=10000
-LLM_MAX_TOKENS=400
-LLM_TEMPERATURE=0.0
-```
-
-**`env/kalshi.env`**
-```ini
-KALSHI_API_KEY_ID=<uuid-from-kalshi-settings>
-KALSHI_PRIVATE_KEY_PATH=C:\path\to\kalshi_rsa_private.txt
-# Optional: print order-book debug info each cycle
-# KALSHI_ORDERBOOK_DEBUG=1
-```
-
-**`env/polymarket.env`**
-```ini
-POLYMARKET_SIGNATURE_TYPE=1
-POLYMARKET_PRIVATE_KEY_PATH=C:\path\to\pm_private_key.txt
-POLYMARKET_API_KEY=<clob-api-key>
-POLYMARKET_ADDRESS=<proxy-wallet-address>
-RELAYER_API_KEY=<same-as-polymarket-api-key>
-RELAYER_API_KEY_ADDRESS=<same-as-polymarket-address>
-# POLYGON_RPC_URL=https://polygon-rpc.com   # optional, defaults to public RPC
-# POLYMARKET_RELAYER_URL=https://relayer-v2.polymarket.com  # optional
-```
-
-### 2 — Key file formats
-
-| Platform | Format | Notes |
-|----------|--------|-------|
-| Kalshi | RSA PEM private key, `.txt` or `.pem` | Generated from Kalshi Settings → API Keys |
-| Polymarket | EVM private key hex, one line, with or without `0x` | The proxy wallet private key |
-
-### 3 — Priority rules
-
-- System environment variables **always win** over `env/` file values (files never overwrite already-set vars).
-- Set `LOAD_KEY_THROUGH_ENV=false` to skip file loading entirely and rely on system env vars (CI / server mode).
-
----
-
-## Quick start
+## Quick Start
 
 ```bash
-# 1. Verify credentials and connectivity
+# Verify credentials and connectivity
 cargo run -p trader --bin check_env --release
 
-# 2. Wrap any USDC.e to pUSD before first run (Polymarket V2 requirement)
+# Migrate USDC.e to pUSD (Polymarket V2 collateral; run once if needed)
 cargo run -p portfolio-monitor --bin pm-wrap-collateral --release
 
-# 3. Run the live trading monitor
+# Launch live surveillance / execution (respects LIVE_TRADING_ON in system_params.rs)
 cargo run -p trader --release
 ```
 
-On startup, `trader` automatically runs one Relayer redeem + collateral refresh pass (requires `POLYMARKET_SIGNATURE_TYPE=1`). The main monitor loop starts immediately after.
+Startup runs an automated Relayer redeem plus collateral refresh via `portfolio_monitor::pm_relayer_automation::desk_hydrate_pm_proxy` when proxy signing is configured—typically `POLYMARKET_SIGNATURE_TYPE=1`. Secrets live under `env/` (git-ignored); **`std::env` values always win** over file-provided keys (`load_env_file_if_missing`).
 
 ---
 
-## Trading parameters
+## Repository Layout
 
-Key constants in `trader/src/system_params.rs`:
-
-| Parameter | Value | Meaning |
-|-----------|-------|---------|
-| `PER_LEG_CAP_FRAC_OF_CAPITAL` | 1.5 % | Max notional per leg (PM or KS) |
-| `PAIR_CAP_FRAC_OF_CAPITAL` | 3 % | Max notional per pair (both legs) |
-| `LIVE_ARBIT_MIN_NET_PROFIT_FRAC_OF_PAIR_CAP` | 10 % | Net ROI gate (net profit / capital used) |
-| `MAX_PAIR_ARB_ROUNDS` | 3 | Max successful rounds per pair (cross-session) |
-| `KALSHI_BALANCE_DEPLOYABLE_FRAC` | 70 % | Max fraction of Kalshi balance deployable |
-| `MAX_SETTLEMENT_DATE_SKEW_DAYS` | 3 days | Max allowed resolution date delta between legs |
-| `IMMINENT_RESOLUTION_SKIP_MINS` | 10 min | Skip pairs resolving within this window |
-| `FULL_FETCH_INTERVAL_WALL_SECS` | 90 min | Full re-match interval |
-| `ARB_TRACK_CONCURRENCY` | 40 | Parallel order-book checks / validation workers |
-
----
-
-## Polymarket V2 migration (April 28, 2026)
-
-Polymarket migrated CLOB collateral from **USDC.e → pUSD**.
-
-- SDK: **`polymarket_client_sdk_v2 = "0.5.1"`**
-- pUSD contract: `0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB` (Polygon)
-- CollateralOnramp: `0x93070a847efEf7F70739046A929D47a521F5B8ee` (Polygon)
-- If your proxy wallet still holds USDC.e, run `pm-wrap-collateral` to convert it automatically.
-
----
-
-## Feishu notifications
-
-`trader/src/feishu_push.rs` posts alerts for fills, session cash warnings, and Relayer events.
-
-Optional overrides in `env/llm.env`:
-```ini
-FEISHU_WEBHOOK=https://open.feishu.cn/open-apis/bot/v2/hook/<your-id>
-FEISHU_BOT_AUTHORIZATION=<your-token>
 ```
-If not set, the hardcoded default webhook is used.
+cross_platform_arbitrage_system_livetrading/
+├── Cargo.toml                   # Workspace: release LTO profile
+├── config/
+│   └── categories.toml          # Matching keyword taxonomy
+├── env/                         # Operator secrets (git-ignored)
+├── logs/                        # Runtime: desk_events, naked_positions, round counters
+├── trader/
+│   └── src/
+│       ├── main.rs              # Orchestration loop, buffer_unordered concurrency, join points
+│       ├── system_params.rs     # Constants, cadence, env bootstrap, LIVE_TRADING_ON gate
+│       ├── clients.rs           # Kalshi / Polymarket REST clients
+│       ├── market.rs            # Market model
+│       ├── market_filter.rs
+│       ├── market_matcher.rs    # TF-IDF + chunked matrix multiplication
+│       ├── arbitrage_detector.rs# Ladder economics, IOC/FAK derivation
+│       ├── validation.rs        # Deterministic + optional LLM validation
+│       ├── llm_validator.rs
+│       ├── tracking.rs          # Dual-orientation identifiers
+│       ├── tracking_log.rs
+│       ├── session_risk.rs      # Liquidity telemetry vs. baseline
+│       ├── kalshi_trade.rs      # IOC buy/sell + RSA-signed REST
+│       ├── kalshi_fee_schedule.rs
+│       ├── polymarket_trade.rs  # Authenticated CLOB wrappers (FAK paths)
+│       ├── fee_model.rs         # Shared fee / drag arithmetic
+│       ├── desk_events.rs       # Append-only JSONL ledger writer
+│       ├── trade_reconciliation.rs
+│       ├── position_cleanup.rs  # Residual position hygiene
+│       ├── trades_cache.rs
+│       ├── feishu_push.rs       # Optional operational alerts
+│       ├── text_vectorizer.rs
+│       ├── vector_index.rs
+│       ├── category_vectorizer.rs
+│       ├── category_mapper.rs
+│       └── bin/
+│           ├── check_env.rs     # Credential sanity check
+│           └── pm_redeem.rs     # Standalone redeem utility
+└── portfolio_monitor/
+    └── src/
+        ├── lib.rs
+        ├── gamma.rs
+        ├── kalshi.rs
+        ├── pm.rs
+        ├── mapping.rs
+        ├── http_client_env.rs   # Shared HTTP client builder (also used by trader)
+        ├── snapshot_report.rs
+        ├── cashflow.rs
+        ├── profit.rs
+        ├── turnover.rs
+        ├── arb_reconcile.rs
+        ├── pm_relayer_automation.rs
+        └── bin/
+            ├── portfolio-snapshot.rs
+            ├── portfolio-cashflow.rs
+            ├── portfolio-profit.rs
+            ├── portfolio-turnover.rs
+            ├── arb-reconcile.rs
+            ├── portfolio-position-markets.rs
+            ├── close-position.rs
+            ├── portfolio-pm-redeem-diagnose.rs
+            └── pm-wrap-collateral.rs
+```
 
 ---
 
 ## Requirements
 
-- **Rust** stable (edition 2021)
-- Network access to Kalshi REST API and Polymarket Gamma / CLOB / Data APIs
-- Recommended proxy region: Japan, Korea, or Indonesia (venues are sensitive to network stability)
+- Rust stable (edition 2021)
+- Reliable HTTPS access to Kalshi Trade API and Polymarket Gamma / CLOB
+- Recommended proxy region: Japan, Korea, or Indonesia
 
 ---
 
 ## Disclaimer
 
-Research / educational use only. Not investment advice. Live P&L differs from model snapshots; comply with each platform's terms of service and applicable law.
+Educational and research context only. Not investment advice. Live fills diverge from model estimates. Operators remain responsible for venue terms and jurisdictional compliance.
