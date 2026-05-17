@@ -72,7 +72,14 @@
       "Bash(cargo search:*)",
       "Bash(curl -s https://crates.io/api/v1/crates/polymarket-client-sdk/versions)",
       "Bash(curl -s \"https://crates.io/api/v1/crates/polymarket_client_sdk_v2\")",
-      "Bash(curl -s \"https://crates.io/api/v1/crates/polymarket_client_sdk_v2/0.5.1\")"
+      "Bash(curl -s \"https://crates.io/api/v1/crates/polymarket_client_sdk_v2/0.5.1\")",
+      "Bash(ls /d/cross_platform_arbitrage_system_livetrading/*.env)",
+      "Bash(wc -l /d/cross_platform_arbitrage_system_livetrading/trader/src/*.rs)",
+      "Bash(awk NR>=609 && NR<=640:*)",
+      "Bash(awk 'NR>=1 && NR<=30' /d/cross_platform_arbitrage_system_livetrading/trader/src/fee_model.rs)",
+      "Bash(awk 'NR>=660 && NR<=720' /d/cross_platform_arbitrage_system_livetrading/trader/src/llm_validator.rs)",
+      "Bash(awk 'NR>=158 && NR<=172' /d/cross_platform_arbitrage_system_livetrading/trader/src/session_risk.rs)",
+      "Bash(awk 'NR>=124 && NR<=160' /d/cross_platform_arbitrage_system_livetrading/trader/src/trade_reconciliation.rs)"
     ]
   }
 }
