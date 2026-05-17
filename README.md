@@ -2,7 +2,7 @@
 
 **English** | [简体中文](README.zh-CN.md)
 
-> Live **boxed binary hedges** between **Kalshi** and **Polymarket**: each trade buys complementary YES/NO outcomes across venues so combined payoff targets `$1` per paired contract at resolution—**the engine evaluates both symmetric orientations** (e.g. Kalshi YES + Polymarket NO *and* Kalshi NO + Polymarket YES) and executes whichever passes fees, ROI gates, and risk checks—**not** a fixed “Kalshi always NO / Polymarket always YES” mapping.
+> Live **boxed binary hedges** between **Kalshi** and **Polymarket**: each trade buys complementary YES/NO outcomes across venues so combined payoff targets about **`$1`** per paired contract at resolution. **The engine evaluates both symmetric orientations** (e.g. Kalshi YES + Polymarket NO and Kalshi NO + Polymarket YES) and executes whichever clears fees, ROI gates, and risk checks.
 >
 > Research / educational use. Not investment advice.
 
@@ -14,19 +14,19 @@
 |-------|-------------------------|
 | **Runtime model** | **Rust** + **Tokio** async I/O; hot paths avoid Python-style interpreter overhead and keep one OS process fanning out many concurrent HTTP calls. |
 | **Release build** | Workspace `Cargo.toml` enables **`opt-level = 3`**, **`lto = true`**, **`codegen-units = 1`** for maximum throughput in production binaries. |
-| **Parallel venue legs** | After validation, **Kalshi IOC buy** and **Polymarket BUY limit FAK** are fired together via **`tokio::join!`**—wall-clock latency is dominated by the slower venue response, not the sum of both sequential RTTs. |
-| **Scan concurrency** | **`ARB_TRACK_CONCURRENCY`** (default **40**) caps bounded parallelism for **price tracking** and **full-cycle arbitrage validation**, keeping order-book polling responsive without unbounded connection storms. |
-| **Matching throughput** | TF-IDF similarity uses chunked **`MATCH_MATMUL_CHUNK_ROWS`** (**512**) matrix work against large market universes without naive nested loops on every pair. |
+| **Parallel venue legs** | After validation, **Kalshi IOC buy** and **Polymarket BUY limit FAK** launch together via **`tokio::join!`**—elapsed time tracks the **slower** venue round-trip because both legs run in parallel. |
+| **Scan concurrency** | **`ARB_TRACK_CONCURRENCY`** (default **40**) bounds parallelism for **price tracking** and **full-cycle arbitrage validation**, keeping order-book polling responsive while capping outbound connections. |
+| **Matching throughput** | TF-IDF similarity uses **`MATCH_MATMUL_CHUNK_ROWS`** (**512**) chunked matrix multiplication for large market universes at sustainable throughput. |
 
 ---
 
 ## Design highlights & innovations
 
 1. **Symmetric complementary legs** — Detection compares **two** boxed structures: `Kalshi YES ask + Polymarket NO ask` vs `Kalshi NO ask + Polymarket YES ask`; whichever clears profit thresholds (after fee models and buffers) drives the live quote path—aligned with how binary contracts actually combine to `$1`.
-2. **Dual-orientation expansion** — Matcher output is expanded with **simultaneous YES/NO flips on both venues** so tracking and validation cover both economically equivalent hedge directions without manual relabeling.
+2. **Dual-orientation expansion** — Matcher output is expanded with **simultaneous YES/NO flips on both venues** so tracking and validation cover **both** economically equivalent hedge directions automatically.
 3. **Ladder-accurate economics** — Opportunities are refined from **full visible ask ladders** (Polymarket CLOB + Kalshi order books): sweep sizes through levels, derive **IOC limit prices** (worst fill) and **FAK limits**, and grade **integer Kalshi contract counts** consistently between detection and execution.
-4. **Venue-native fees** — **Kalshi** taker fees respect **series-specific schedules** from the Trade API; **Polymarket** uses live **`fee-rate`** when available with a conservative **bps fallback** if HTTP fails—avoiding both optimistic zeros and throwing away valid signals.
-5. **Safety gates** — **`CONFIRM`** unlock, **`LIVE_TRADING_ON`**, and **`require_live_orders_allowed`** fence every path that can move balances; idle loops stay **read-only** unless a validated opportunity enters execution.
+4. **Venue-native fees** — **Kalshi** taker fees follow **series-specific schedules** from the Trade API; **Polymarket** prefers live **`fee-rate`** when available, with a conservative **bps fallback** on HTTP failure so pricing stays prudent while scanning continues.
+5. **Safety gates** — **`CONFIRM`** unlock, **`LIVE_TRADING_ON`**, and **`require_live_orders_allowed`** fence every path that can move balances; between validated executions the loop sticks to **read-only** calls (quotes, books, schedules).
 6. **Post-trade reconcile** — **`tokio::join!`** can still yield skewed fills; the runner **IOC-sells excess Kalshi** or **FAK-sells excess Polymarket** above de minimis notional, logs **`naked_positions`** when unwind fails, and records structured outcomes in **`desk_events.jsonl`**.
 
 ---

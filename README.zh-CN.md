@@ -2,7 +2,7 @@
 
 [English](README.md) | **简体中文**
 
-> **Kalshi** 与 **Polymarket** 之间的实盘 **二元装箱对冲**：每一笔都是在两边买入 **互为补集的 YES/NO**，使配对合约在结算时合计兑付趋近 **每份约 1 美元**。**引擎对两种对称结构并行估值**——例如 **Kalshi YES + Polymarket NO** 与 **Kalshi NO + Polymarket YES**——在手续费、ROI 门槛与风控通过后择其一执行；**并非**「Kalshi 永远是 NO 腿、Polymarket 永远是 YES 腿」的固定映射。
+> **Kalshi** 与 **Polymarket** 之间的实盘 **二元装箱对冲**：每一笔都是在两边买入 **互为补集的 YES/NO**，使配对合约在结算时合计兑付趋近 **每份约 1 美元**。**引擎对两种对称结构并行估值**，例如 **Kalshi YES + Polymarket NO** 与 **Kalshi NO + Polymarket YES**，在手续费、ROI 门槛与风控通过后 **择优执行其中一侧**。
 >
 > 仅供研究与学习，不构成投资建议。
 
@@ -14,19 +14,19 @@
 |------|----------|
 | **运行时** | **Rust** + **Tokio** 异步 I/O，核心路径无脚本解释器开销，单进程可并发发起大量 HTTP。 |
 | **Release 构建** | 工作区 `Cargo.toml` 启用 **`opt-level = 3`**、**`lto = true`**、**`codegen-units = 1`**，面向生产二进制最大化吞吐。 |
-| **双腿并行** | 校验通过后，**Kalshi IOC 买单**与 **Polymarket 限价 FAK 买单**通过 **`tokio::join!`** **同时发出**——墙钟延迟接近「较慢一端」的往返时延，而非两腿顺序相加。 |
-| **扫描并发** | **`ARB_TRACK_CONCURRENCY`**（默认 **40**）限制 **价格追踪**与**全量套利验证**的并行度，在保持盘口刷新灵敏的同时避免连接风暴。 |
-| **匹配吞吐** | TF-IDF 相似度采用 **`MATCH_MATMUL_CHUNK_ROWS`（512）** 分块矩阵计算，适配大规模市场全集而非朴素双重循环。 |
+| **双腿并行** | 校验通过后，**Kalshi IOC 买单**与 **Polymarket 限价 FAK 买单**通过 **`tokio::join!`** **同时发出**，墙钟耗时主要由 **较慢一端** 的往返时延决定（两腿并行）。 |
+| **扫描并发** | **`ARB_TRACK_CONCURRENCY`**（默认 **40**）限制 **价格追踪**与**全量套利验证**的并行度，在保持盘口刷新灵敏的同时把出站连接数控制在固定上限内。 |
+| **匹配吞吐** | TF-IDF 相似度采用 **`MATCH_MATMUL_CHUNK_ROWS`（512）** 分块矩阵乘法，面向大规模市场全集保证可持续吞吐。 |
 
 ---
 
 ## 关键点与创新点
 
 1. **对称互补两腿** — 检测阶段比较两套装箱：**Kalshi YES ask + Polymarket NO ask** 与 **Kalshi NO ask + Polymarket YES ask**；满足净利与缓冲约束的方案进入实盘报价路径，符合二元合约合并兑付的经济结构。
-2. **双腿取向扩展** — 对匹配器输出的 PM/Kalshi 对自动扩展 **两侧同时取反** 的取向，使追踪与验证覆盖等价对冲方向而无需手工改标签。
+2. **双腿取向扩展** — 对匹配器输出的 PM/Kalshi 对自动扩展 **两侧同时取反** 的取向，使追踪与验证覆盖 **两种** 等价对冲方向，取向由程序自动展开。
 3. **阶梯真实成本** — 由 **完整可见卖档阶梯**（Polymarket CLOB + Kalshi order book）逐级扫量，推导 **IOC 限价（最差成交档位）**与 **FAK 限价**；**Kalshi 整数合约份数**在识别与执行链路保持一致。
-4. **贴近交易所的费率** — **Kalshi** 按 Trade API 的 **系列级 taker 费率表**计费；**Polymarket** 优先使用 **`fee-rate`** 动态 bps，请求失败时退回保守 **`PM_TAKER_FEE_BPS_WHEN_FETCH_FAILS`**，既避免乐观低估也不轻易丢弃信号。
-5. **资金安全门控** — **`CONFIRM`**、**`LIVE_TRADING_ON`** 与 **`require_live_orders_allowed`** 守卫所有可能改变余额的路径；无合格机会时主循环保持 **只读** API。
+4. **贴近交易所的费率** — **Kalshi** 按 Trade API 的 **系列级 taker 费率表**计费；**Polymarket** 优先使用 **`fee-rate`** 动态 bps，请求失败时退回保守 **`PM_TAKER_FEE_BPS_WHEN_FETCH_FAILS`**，定价保守且仍可继续识别。
+5. **资金安全门控** — **`CONFIRM`**、**`LIVE_TRADING_ON`** 与 **`require_live_orders_allowed`** 守卫所有可能改变余额的路径；在两次已通过校验的执行之间，主循环仅调用 **只读** 接口（行情、订单簿、费率表等）。
 6. **成交后对账** — 并行下单仍可能出现 **两腿成交量不一致**；系统对超额一侧在名义足够时 **Kalshi IOC 卖平**或 **Polymarket FAK 卖出**，失败则写入 **`naked_positions`**，并在 **`desk_events.jsonl`** 留结构化记录。
 
 ---
