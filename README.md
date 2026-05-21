@@ -45,6 +45,30 @@ Market ingest → Similarity matching → Dual-orientation expansion
 
 TF-IDF similarity search projects venue-wide market descriptions into a joint vector space. Rather than iterating pairwise, the matcher uses chunked matrix multiplication with **512-row blocks** (`MATCH_MATMUL_CHUNK_ROWS`), allowing ndarray-friendly dense kernels to absorb large venue snapshots without scripting-language loop overhead. This keeps full-catalog re-matching within practical wall-clock bounds even as market counts grow into the thousands.
 
+### Three-Stage Pair Validation
+
+Market matching follows a funnel architecture that progressively narrows candidates before they reach the execution pipeline:
+
+```
+TF-IDF similarity → Rule-based filtering → LLM validation → Active tracking
+```
+
+**Stage 1 — TF-IDF similarity.** Vectorized market descriptions are compared via cosine similarity against `SIMILARITY_THRESHOLD`. This stage is optimized for throughput via chunked matrix multiplication.
+
+**Stage 2 — Rule-based filtering.** Surviving pairs are checked against deterministic rules: keyword category constraints (`config/categories.toml`), settlement date alignment, and minimum volume or open-interest floors. Pairs that fail any rule are dropped without touching the LLM.
+
+**Stage 3 — LLM validation.** All remaining candidates are sent to **DeepSeek Chat** (`llm_validator.rs`) for a final accept/reject decision. The model receives structured prompts comparing the two market descriptions and returns a binary judgment with a short rationale.
+
+| Aspect | Detail |
+|--------|--------|
+| Model | DeepSeek Chat, zero temperature for deterministic output |
+| Timeout | `LLM_TIMEOUT_MS` (default 10s) |
+| Concurrency | LLM calls are fanned out with bounded parallelism to stay within API rate limits while processing full-match batches |
+| Failure behavior | Timeout, rate-limit, or parse failure → pair is **rejected** (conservative default) |
+| Disable | Set `LLM_PROVIDER` to empty or omit `DEEPSEEK_API_KEY` to skip the LLM stage; the funnel degrades to a two-stage pipeline |
+
+The LLM stage runs **off the hot path**—only during pair formation and periodic full re-match cycles, never between signal detection and order execution.
+
 ### Ladder-Accurate Economics
 
 | Aspect | Detail |
