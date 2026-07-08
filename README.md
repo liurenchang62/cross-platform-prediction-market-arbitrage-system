@@ -6,6 +6,17 @@ A production-grade monitoring and execution stack for cross-venue binary-contrac
 
 > Research and educational use. Not investment advice.
 
+### Design Highlights
+
+| | |
+|---|---|
+| **No hardcoded sides** | Both orientations—Kalshi YES + Polymarket NO *and* Kalshi NO + Polymarket YES—are evaluated every cycle. The live book decides which direction fires; neither venue is pinned to a fixed role. |
+| **Parallel dual-leg execution** | A single `tokio::join!` barrier submits both venue orders simultaneously. End-to-end latency equals the *slower* round-trip, not the *sum* of two sequential REST chains. |
+| **Full ladder economics** | Detection walks the complete visible ask ladder on both venues—not top-of-book snapshots. IOC limits and FAK budgets are derived from actual VWAP across walked levels, eliminating optimistic best-quote mispricing. |
+| **Integer-aligned sizing** | Kalshi integer contract counts are locked at detection time using the same ladder walk used for pricing. Detection and execution operate on identical quantities, closing the classic fractional-vs-integer gap. |
+| **Three-stage validation funnel** | TF-IDF chunked matrix multiply → deterministic rule filter → DeepSeek LLM. The LLM runs entirely off the hot path; order latency is unaffected. |
+| **Rust + LTO release profile** | `opt-level = 3`, `lto = true`, `codegen-units = 1`. No GC pauses, no interpreter overhead. The binary's bottleneck is network I/O, not compute. |
+
 ---
 
 ## System Architecture
