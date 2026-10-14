@@ -154,4 +154,4 @@ The checked-in source currently sets `LIVE_TRADING_ON = true`, and startup copie
 
 ## License
 
-No open-source license has been declared. The repository is publicly viewable, but reuse rights are not granted unless the owner adds a license.
+Released under the [MIT License](LICENSE).
