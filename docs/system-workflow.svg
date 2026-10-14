@@ -1,38 +1,45 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="760" viewBox="0 0 1400 760" role="img" aria-labelledby="title desc">
-  <title id="title">Cross-platform prediction market arbitrage workflow</title>
-  <desc id="desc">Workflow from Kalshi and Polymarket catalogs through contract matching, order-book evaluation, concurrent execution, reconciliation and portfolio records.</desc>
+<svg xmlns="http://www.w3.org/2000/svg" width="1440" height="900" viewBox="0 0 1440 900" role="img" aria-labelledby="title desc">
+  <title id="title">Prediction-market arbitrage operating workflow</title>
+  <desc id="desc">Three lanes show contract discovery, opportunity evaluation, concurrent execution, reconciliation, and portfolio review.</desc>
   <defs>
-    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%"><feDropShadow dx="0" dy="3" stdDeviation="4" flood-color="#0f172a" flood-opacity="0.12"/></filter>
-    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#526173"/></marker>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%"><feDropShadow dx="0" dy="4" stdDeviation="7" flood-color="#14213d" flood-opacity="0.10"/></filter>
+    <marker id="arrow" markerWidth="11" markerHeight="11" refX="9" refY="5.5" orient="auto"><path d="M0 0 L11 5.5 L0 11 Z" fill="#52627a"/></marker>
     <style>
-      .band{fill:#f8fafc;stroke:#d8e1eb;stroke-width:1.5}.box{fill:#ffffff;stroke:#7b8ba1;stroke-width:1.5;filter:url(#shadow)}
-      .control{fill:#fff7d6;stroke:#d19a17;stroke-width:1.6;filter:url(#shadow)}.exception{fill:#fff0ef;stroke:#c94a45;stroke-width:1.6;filter:url(#shadow)}
-      .title{font:600 22px Arial,sans-serif;fill:#15263c}.label{font:600 17px Arial,sans-serif;fill:#172033;text-anchor:middle}.small{font:14px Arial,sans-serif;fill:#445268;text-anchor:middle}
-      .flow{fill:none;stroke:#526173;stroke-width:2;marker-end:url(#arrow)}
+      .lane{fill:#f7f9fc;stroke:#dbe3ee;stroke-width:1.5}.source{fill:#fff;stroke:#7b8aa2;stroke-width:1.5;filter:url(#shadow)}
+      .analysis{fill:#eaf3ff;stroke:#3878c7;stroke-width:1.6;filter:url(#shadow)}.control{fill:#ecf8f5;stroke:#238777;stroke-width:1.6;filter:url(#shadow)}
+      .recovery{fill:#fff0ed;stroke:#d45c4d;stroke-width:1.6;filter:url(#shadow)}.store{fill:#f3efff;stroke:#7a61b8;stroke-width:1.6;filter:url(#shadow)}
+      .heading{font:700 22px Arial,sans-serif;fill:#17243a}.step{font:700 17px Arial,sans-serif;fill:#17243a;text-anchor:middle}.detail{font:14px Arial,sans-serif;fill:#47556b;text-anchor:middle}
+      .number{font:700 14px Arial,sans-serif;fill:#fff;text-anchor:middle;dominant-baseline:middle}.flow{fill:none;stroke:#52627a;stroke-width:2.2;marker-end:url(#arrow)}
+      .branch{fill:none;stroke:#d45c4d;stroke-width:2;stroke-dasharray:7 5;marker-end:url(#arrow)}.note{font:13px Arial,sans-serif;fill:#6a7485}
     </style>
   </defs>
-  <rect width="1400" height="760" fill="#ffffff"/>
-  <rect class="band" x="40" y="32" width="1320" height="205" rx="12"/><text class="title" x="70" y="70">Contract discovery and equivalence</text>
-  <rect class="box" x="80" y="100" width="200" height="90" rx="8"/><text class="label" x="180" y="137">Kalshi catalog</text><text class="small" x="180" y="163">markets and metadata</text>
-  <rect class="box" x="330" y="100" width="200" height="90" rx="8"/><text class="label" x="430" y="137">Polymarket catalog</text><text class="small" x="430" y="163">markets and metadata</text>
-  <rect class="box" x="590" y="100" width="220" height="90" rx="8"/><text class="label" x="700" y="137">TF-IDF retrieval</text><text class="small" x="700" y="163">exact cosine search</text>
-  <rect class="control" x="870" y="100" width="210" height="90" rx="8"/><text class="label" x="975" y="137">Rule validation</text><text class="small" x="975" y="163">semantics and dates</text>
-  <rect class="control" x="1140" y="100" width="170" height="90" rx="8"/><text class="label" x="1225" y="137">LLM review</text><text class="small" x="1225" y="163">optional final filter</text>
-  <path class="flow" d="M280 145 H590"/><path class="flow" d="M530 145 H590"/><path class="flow" d="M810 145 H870"/><path class="flow" d="M1080 145 H1140"/>
-
-  <rect class="band" x="40" y="265" width="1320" height="205" rx="12"/><text class="title" x="70" y="303">Market evaluation and execution</text>
-  <rect class="box" x="80" y="335" width="210" height="90" rx="8"/><text class="label" x="185" y="372">Oriented pairs</text><text class="small" x="185" y="398">both hedge directions</text>
-  <rect class="box" x="350" y="335" width="210" height="90" rx="8"/><text class="label" x="455" y="372">Order books</text><text class="small" x="455" y="398">full visible ladders</text>
-  <rect class="control" x="620" y="335" width="230" height="90" rx="8"/><text class="label" x="735" y="370">Economics and limits</text><text class="small" x="735" y="396">fees, depth, size, return</text>
-  <rect class="control" x="910" y="335" width="200" height="90" rx="8"/><text class="label" x="1010" y="370">Live-order gate</text><text class="small" x="1010" y="396">permission and risk state</text>
-  <rect class="box" x="1170" y="335" width="150" height="90" rx="8"/><text class="label" x="1245" y="370">Submit</text><text class="small" x="1245" y="396">IOC and FAK</text>
-  <path class="flow" d="M1225 190 V220 H185 V335"/><path class="flow" d="M290 380 H350"/><path class="flow" d="M560 380 H620"/><path class="flow" d="M850 380 H910"/><path class="flow" d="M1110 380 H1170"/>
-
-  <rect class="band" x="40" y="498" width="1320" height="225" rx="12"/><text class="title" x="70" y="536">Reconciliation and portfolio state</text>
-  <rect class="box" x="100" y="570" width="210" height="95" rx="8"/><text class="label" x="205" y="607">Returned fills</text><text class="small" x="205" y="633">compare both venues</text>
-  <rect class="control" x="380" y="570" width="210" height="95" rx="8"/><text class="label" x="485" y="607">Fill reconciliation</text><text class="small" x="485" y="633">matched and excess size</text>
-  <rect class="exception" x="660" y="570" width="210" height="95" rx="8"/><text class="label" x="765" y="607">Residual cleanup</text><text class="small" x="765" y="633">sell excess or record risk</text>
-  <rect class="box" x="940" y="570" width="170" height="95" rx="8"/><text class="label" x="1025" y="607">Event records</text><text class="small" x="1025" y="633">append-only JSONL</text>
-  <rect class="box" x="1180" y="570" width="150" height="95" rx="8"/><text class="label" x="1255" y="607">Portfolio tools</text><text class="small" x="1255" y="633">P&amp;L and settlement</text>
-  <path class="flow" d="M1245 425 V475 H205 V570"/><path class="flow" d="M310 617 H380"/><path class="flow" d="M590 617 H660"/><path class="flow" d="M870 617 H940"/><path class="flow" d="M1110 617 H1180"/>
+  <rect width="1440" height="900" fill="#fff"/>
+  <rect class="lane" x="40" y="38" width="1360" height="238" rx="16"/><text class="heading" x="72" y="78">1 · Establish contract equivalence</text>
+  <circle cx="118" cy="147" r="18" fill="#3878c7"/><text class="number" x="118" y="147">1</text>
+  <rect class="source" x="155" y="105" width="220" height="86" rx="10"/><text class="step" x="265" y="140">Venue catalogs</text><text class="detail" x="265" y="165">Kalshi + Polymarket</text>
+  <rect class="analysis" x="435" y="105" width="220" height="86" rx="10"/><text class="step" x="545" y="140">Category TF-IDF</text><text class="detail" x="545" y="165">exact cosine retrieval</text>
+  <rect class="control" x="715" y="105" width="220" height="86" rx="10"/><text class="step" x="825" y="140">Rule screen</text><text class="detail" x="825" y="165">event, date, settlement</text>
+  <rect class="control" x="995" y="105" width="220" height="86" rx="10"/><text class="step" x="1105" y="140">Semantic review</text><text class="detail" x="1105" y="165">DeepSeek when enabled</text>
+  <rect class="analysis" x="1260" y="105" width="105" height="86" rx="10"/><text class="step" x="1312" y="140">Pair</text><text class="detail" x="1312" y="165">retained</text>
+  <path class="flow" d="M375 148 H435"/><path class="flow" d="M655 148 H715"/><path class="flow" d="M935 148 H995"/><path class="flow" d="M1215 148 H1260"/>
+  <text class="note" x="155" y="228">Candidates rejected at any screen do not enter live tracking.</text>
+  <rect class="lane" x="40" y="304" width="1360" height="274" rx="16"/><text class="heading" x="72" y="344">2 · Price executable hedge bundles</text>
+  <circle cx="118" cy="421" r="18" fill="#3878c7"/><text class="number" x="118" y="421">2</text>
+  <rect class="analysis" x="155" y="378" width="220" height="86" rx="10"/><text class="step" x="265" y="413">Two orientations</text><text class="detail" x="265" y="438">YES/NO and NO/YES</text>
+  <rect class="source" x="435" y="378" width="220" height="86" rx="10"/><text class="step" x="545" y="413">Visible ask ladders</text><text class="detail" x="545" y="438">both venues, full depth</text>
+  <rect class="analysis" x="715" y="378" width="220" height="86" rx="10"/><text class="step" x="825" y="413">Common quantity</text><text class="detail" x="825" y="438">depth-weighted limits</text>
+  <rect class="control" x="995" y="378" width="220" height="86" rx="10"/><text class="step" x="1105" y="413">Economics + risk</text><text class="detail" x="1105" y="438">fees, buffer, capital</text>
+  <rect class="control" x="1260" y="378" width="105" height="86" rx="10"/><text class="step" x="1312" y="413">Gate</text><text class="detail" x="1312" y="438">pass</text>
+  <path class="flow" d="M720 276 V304"/><path class="flow" d="M375 421 H435"/><path class="flow" d="M655 421 H715"/><path class="flow" d="M935 421 H995"/><path class="flow" d="M1215 421 H1260"/>
+  <text class="note" x="155" y="510">The detector emits an opportunity only when both legs support one quantity and the post-cost threshold is met.</text>
+  <rect class="lane" x="40" y="606" width="1360" height="250" rx="16"/><text class="heading" x="72" y="646">3 · Execute, reconcile, and account</text>
+  <circle cx="118" cy="733" r="18" fill="#238777"/><text class="number" x="118" y="733">3</text>
+  <rect class="control" x="155" y="690" width="225" height="86" rx="10"/><text class="step" x="267" y="725">Concurrent submission</text><text class="detail" x="267" y="750">Kalshi IOC + PM FAK</text>
+  <rect class="analysis" x="450" y="690" width="210" height="86" rx="10"/><text class="step" x="555" y="725">Fill comparison</text><text class="detail" x="555" y="750">matched vs. excess size</text>
+  <rect class="recovery" x="730" y="690" width="210" height="86" rx="10"/><text class="step" x="835" y="725">Residual response</text><text class="detail" x="835" y="750">sell excess or record</text>
+  <rect class="store" x="1010" y="690" width="180" height="86" rx="10"/><text class="step" x="1100" y="725">Desk records</text><text class="detail" x="1100" y="750">JSONL + round state</text>
+  <rect class="store" x="1260" y="690" width="105" height="86" rx="10"/><text class="step" x="1312" y="725">Review</text><text class="detail" x="1312" y="750">P&amp;L</text>
+  <path class="flow" d="M720 578 V606"/><path class="flow" d="M380 733 H450"/><path class="flow" d="M660 733 H730"/><path class="flow" d="M940 733 H1010"/><path class="flow" d="M1190 733 H1260"/>
+  <path class="branch" d="M555 776 V820 H835 V776"/><text class="note" x="450" y="836">Unequal fills enter compensating cleanup; cleanup is not an atomic rollback.</text>
+  <rect x="930" y="866" width="14" height="14" rx="3" fill="#eaf3ff" stroke="#3878c7"/><text class="note" x="952" y="878">analysis</text><rect x="1015" y="866" width="14" height="14" rx="3" fill="#ecf8f5" stroke="#238777"/><text class="note" x="1037" y="878">control</text><rect x="1100" y="866" width="14" height="14" rx="3" fill="#fff0ed" stroke="#d45c4d"/><text class="note" x="1122" y="878">recovery</text><rect x="1195" y="866" width="14" height="14" rx="3" fill="#f3efff" stroke="#7a61b8"/><text class="note" x="1217" y="878">records</text>
 </svg>

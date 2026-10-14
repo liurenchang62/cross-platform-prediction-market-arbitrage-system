@@ -1,12 +1,12 @@
 # Architecture
 
-This document describes code-level responsibilities. The end-to-end trading workflow is summarized in the repository README and is not repeated here.
+This document describes code-level ownership, state transitions, and the boundary between research logic and order-capable components. The chronological operating workflow remains in the repository README.
 
 ## Component map
 
 ![Component architecture](component-architecture.svg)
 
-⬜ Processing or state · 🟨 Decision or control · 🟥 Exception recovery
+**Color key:** blue = contract intelligence · green = trading runtime · coral = recovery · violet = persistent state and reporting
 
 ## Component boundaries
 
@@ -19,6 +19,29 @@ This document describes code-level responsibilities. The end-to-end trading work
 | Orchestration | `main.rs`, `tracking.rs`, `session_risk.rs` | Refresh cadence, oriented-pair tracking, concurrency limits, live gate and session capital state |
 | Reconciliation | `trade_reconciliation.rs`, `position_cleanup.rs`, `desk_events.rs` | Fill comparison, excess-leg cleanup, unresolved-exposure records and event persistence |
 | Portfolio tools | `portfolio_monitor/src/` | Account snapshots, cash flow, P&L, turnover, settlement reconciliation and operator utilities |
+
+Detailed directory-level maps are available in the [trader guide](../trader/README.md) and [portfolio-monitor guide](../portfolio_monitor/README.md).
+
+## Execution sequence
+
+```text
+TrackedArbitrage
+    │
+    ├─ fetch Kalshi and Polymarket books
+    ├─ build executable YES/NO ladders
+    ├─ calculate one common integer quantity
+    ├─ apply fees, buffer, return threshold, and capital caps
+    └─ ArbitrageOpportunity
+           │
+           ├─ require process-wide live-order permission
+           ├─ launch Kalshi IOC and Polymarket FAK futures together
+           ├─ await both venue responses
+           ├─ compare returned fills
+           ├─ submit compensating sell for any excess leg
+           └─ append execution and residual state
+```
+
+The opportunity object is the boundary between market observation and an order-capable action. It carries the shared quantity and venue-specific limit prices derived from the books used in the decision.
 
 ## Data and control flow
 
@@ -46,6 +69,8 @@ The execution function launches both venue requests through `tokio::join!`. Retu
 - A separate rate limiter shapes Kalshi order-book traffic.
 - LLM validation uses bounded concurrency during matching and remains outside the execution hot path.
 - Kalshi and Polymarket order futures begin from the same `tokio::join!` call, but the venues remain independent systems with no atomic commit.
+
+Concurrency is bounded at the workload that creates it: matching validation uses a configured buffer, active-pair evaluation uses `ARB_TRACK_CONCURRENCY`, and Kalshi order-book requests use a separate limiter. This prevents catalog size from becoming an unbounded number of simultaneous external requests.
 
 ## Design boundaries
 

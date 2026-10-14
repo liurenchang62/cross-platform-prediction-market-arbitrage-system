@@ -1,160 +1,157 @@
 # Cross-Platform Prediction Market Arbitrage System
 
-An event-driven Rust system for identifying and executing hedged trades across economically equivalent binary contracts on Kalshi and Polymarket. The system builds cross-venue contract pairs from live market catalogs, evaluates both complementary hedge orientations against visible order-book depth, submits venue-native orders concurrently, and reconciles fills and residual exposure after execution.
+An event-driven Rust system that matches economically equivalent binary contracts on Kalshi and Polymarket, prices complementary positions from visible order-book depth, and manages the execution and reconciliation of the resulting two-venue trades.
 
-> Research software. Live trading involves execution, settlement, venue, and regulatory risk. Nothing in this repository is investment advice or a guarantee of future returns.
+The implementation connects three problems that are often evaluated separately: cross-venue contract equivalence, executable rather than quoted arbitrage economics, and post-trade control of non-atomic fills.
 
-## System at a glance
+> Research software. Live operation can create positions and move collateral. This repository is not investment advice and does not imply future profitability.
 
-| Layer | Implementation |
-|---|---|
-| Contract matching | Category-specific TF-IDF vector spaces, exact cosine-similarity search with chunked matrix multiplication, deterministic semantic and settlement rules, and optional DeepSeek validation |
-| Opportunity model | Both Kalshi YES + Polymarket NO and Kalshi NO + Polymarket YES are evaluated against the fixed $1 complementary payoff |
-| Execution | Full visible ask ladders, depth-weighted prices, venue-specific fees, slippage and capital limits; Kalshi IOC and Polymarket FAK orders are submitted concurrently |
-| Risk and operations | Central live-order permission gate, per-leg and per-pair limits, fill reconciliation, residual-position cleanup, persistent round limits, structured event records, and portfolio-monitoring utilities |
+## What the system implements
 
-## System workflow
+| Problem | Implemented approach | Where to inspect |
+|---|---|---|
+| Contract equivalence | Category-specific TF-IDF retrieval, exact cosine search in matrix chunks, deterministic settlement rules, and optional DeepSeek review | [`trader/src/market_matcher.rs`](trader/src/market_matcher.rs), [`trader/src/validation.rs`](trader/src/validation.rs) |
+| Executable pricing | Both complementary hedge orientations, full visible ask ladders, common integer sizing, depth-weighted limits, venue fees, and an execution buffer | [`trader/src/arbitrage_detector.rs`](trader/src/arbitrage_detector.rs), [`trader/src/fee_model.rs`](trader/src/fee_model.rs) |
+| Two-venue execution | Kalshi immediate-or-cancel and Polymarket fill-and-kill orders launched from one concurrent join point | [`trader/src/kalshi_trade.rs`](trader/src/kalshi_trade.rs), [`trader/src/polymarket_trade.rs`](trader/src/polymarket_trade.rs) |
+| Exposure control | Central order gate, capital caps, persistent round limits, returned-fill comparison, excess-leg cleanup, and unresolved-position records | [`trader/src/system_params.rs`](trader/src/system_params.rs), [`trader/src/position_cleanup.rs`](trader/src/position_cleanup.rs) |
+| Post-trade accounting | Append-only execution events plus position, cash-flow, turnover, profit, and settlement-reconciliation utilities | [`portfolio_monitor/`](portfolio_monitor/) |
 
-![System workflow](docs/system-workflow.svg)
+## From two contracts to one hedged payoff
 
-⬜ Processing or state · 🟨 Decision or control · 🟥 Exception recovery
-
-The workflow separates contract equivalence from trade economics. A pair must first survive text retrieval, deterministic validation, and, when configured, LLM review. The execution path then obtains current order books, evaluates both hedge directions, applies fee and liquidity constraints, and submits orders only after the live-order gate and session controls pass.
-
-## Arbitrage model
-
-For two contracts that settle on the same binary event, the system evaluates the complementary bundles
+For contracts with aligned resolution rules, the system evaluates both bundles:
 
 ```text
 Kalshi YES + Polymarket NO
 Kalshi NO  + Polymarket YES
 ```
 
-Each completed bundle pays approximately $1 at settlement when the two contracts are economically equivalent and their resolution rules align. For a target quantity `q`, the detector walks both visible ask ladders and estimates
+A complete bundle settles near one dollar. For a common quantity `q`, the pre-trade calculation is:
 
 ```text
-gross settlement value = q × $1
-estimated total cost   = Kalshi depth cost + Polymarket depth cost
-                         + venue fees + execution buffer
-estimated net return   = gross settlement value - estimated total cost
+settlement value = q × $1
+all-in cost      = Kalshi ladder cost + Polymarket ladder cost
+                   + venue fees + execution buffer
+estimated return = settlement value - all-in cost
 ```
 
-An opportunity proceeds only when executable depth supports the same integer-aligned quantity on both venues and the estimated net return clears the configured threshold. This is a pre-trade estimate; realized fills, fees, settlement outcomes, and any residual exposure can differ.
+The detector walks the available ask ladders instead of multiplying a top-of-book quote by the requested size. A candidate proceeds only if both legs support the same integer-aligned quantity and the estimated post-cost return clears the configured threshold. The estimate is not a guarantee of fills or settlement outcome.
 
-## Contract-matching pipeline
+## Operating workflow
 
-| Stage | Role | Failure behavior |
+![Operating workflow from contract discovery through reconciliation](docs/system-workflow.svg)
+
+The first lane establishes economic equivalence before a pair reaches active tracking. The second evaluates live liquidity and risk limits. The third separates order submission from fill reconciliation because the venues do not share an atomic transaction boundary.
+
+## Contract intelligence
+
+The matching path is designed for large, heterogeneous market catalogs rather than a fixed hand-maintained pair list.
+
+1. Kalshi and Polymarket listings are normalized into one binary-market representation.
+2. Category keywords partition the search space and select category-aware validation rules.
+3. TF-IDF vectors are compared with exact bidirectional cosine search in 512-row matrix chunks.
+4. Deterministic validators reject mismatched event types, dates, thresholds, participants, rounds, and settlement semantics.
+5. When enabled, DeepSeek reviews the remaining ambiguous candidates using a structured accept/reject response.
+6. Every retained pair is expanded into the two complementary hedge orientations before tracking.
+
+LLM validation runs while pairs are formed, not after an opportunity reaches the execution path. A failed, timed-out, or unparseable LLM response is rejected rather than treated as approval. See [matching and validation internals](trader/README.md#contract-matching-and-validation).
+
+## Execution and risk framework
+
+| Stage | Checks and response |
+|---|---|
+| Before sizing | Exclude expired, imminent, date-skewed, or round-limited pairs; fetch both current order books and the relevant fee state |
+| Opportunity sizing | Walk both ladders, derive a common quantity and worst acceptable limit prices, include venue-specific fees and the configured execution buffer |
+| Capital approval | Apply per-leg and combined-pair fractions of session reference capital, Kalshi deployable-balance limits, and the central live-order permission gate |
+| Order submission | Start venue-native Kalshi IOC and Polymarket FAK requests together through `tokio::join!` to avoid intentionally sequencing one leg behind the other |
+| Fill reconciliation | Compare returned fill quantities; submit an immediate sell for excess contracts on one venue when possible |
+| Failure containment | Persist residual exposure when cleanup is incomplete, preserve successful-round state across restarts, and emit structured desk events for review |
+| Session oversight | Compare cash and collateral with startup references, suppress new execution after configured thresholds, and issue optional rebalancing alerts |
+
+Concurrency reduces deliberate inter-leg delay; it does not make the trade atomic. A rejected request, changing order book, venue outage, or partial fill can still leave directional exposure. Cleanup is a compensating trade and may also fail or execute at an unfavorable price.
+
+## Component architecture
+
+![Layered component architecture](docs/component-architecture.svg)
+
+The repository separates contract intelligence from the order-capable runtime and keeps portfolio analysis in a second workspace crate. Persistent files provide an audit trail and restart-aware limits, but they are not a transactional database. The detailed module map and state ownership are documented in [Architecture](docs/ARCHITECTURE.md).
+
+## Validation record and evidence boundary
+
+The project was exercised with live venue catalogs, authenticated order paths, reconciliation utilities, and bounded small-capital trading. These observations describe the development scope; they are not performance forecasts.
+
+| Area | Recorded scope | Interpretation boundary |
 |---|---|---|
-| Catalog normalization | Converts Kalshi and Polymarket listings into a shared market representation with titles, outcomes and resolution metadata | Incomplete or out-of-horizon markets are excluded |
-| TF-IDF retrieval | Builds category-specific vector spaces and performs exact cosine-similarity search in 512-row matrix blocks | Candidates below the similarity threshold are discarded |
-| Deterministic validation | Checks event semantics, settlement-date alignment and category-specific rules | A failed rule removes the pair before tracking |
-| LLM validation | Sends remaining ambiguous pairs to DeepSeek with a structured accept/reject prompt | Timeout, rate-limit or parsing failure rejects the pair |
-| Active tracking | Expands each accepted pair into both complementary hedge orientations | Expired, imminent or round-limited pairs are removed |
+| Catalog ingestion | Configured for approximately 50,000 listings per venue | Capacity setting, not a claim that every listing produced a candidate |
+| Similarity stage | Microsecond-level measurements for individual comparison operations during development | Does not include catalog download, vector construction, validation, or network time |
+| Retained-pair review | 100% agreement on the manually validated retained-pair sample | Sample-specific result, not accuracy over all possible contracts |
+| End-to-end execution | Small-scale completed cycles exercised detection, concurrent submission, fill handling, and portfolio accounting | Private venue records are not published and cannot be independently reconstructed here |
+| Completed-cycle outcome | 10%–20% net return on capital deployed in the reported individual cycles | Not annualized and not evidence of repeatability or expected future return |
 
-LLM calls occur during pair formation rather than between signal detection and order submission. The execution path therefore does not depend on an LLM response after a pair enters active tracking.
+The public repository exposes implementation paths and record schemas. Credentials, account identifiers, private trade logs, and raw account exports remain excluded.
 
-## Order-book execution and risk controls
-
-| Control area | Implementation |
-|---|---|
-| Executable pricing | Walks the full visible ask ladder on each venue and derives average fill prices and worst accepted limits for the requested quantity |
-| Cost model | Includes Kalshi series fee schedules, Polymarket CLOB fee rates, a conservative fallback fee, and a configurable execution buffer |
-| Concurrent submission | Uses a single `tokio::join!` point to submit Kalshi IOC and Polymarket FAK orders without intentionally sequencing one venue behind the other |
-| Fill reconciliation | Compares returned fills, sells excess contracts with venue-native immediate-or-cancel behavior, and records unresolved exposure separately |
-| Capital limits | Applies session-reference sizing, per-leg and combined-pair caps, a Kalshi deployable-balance ceiling, and a maximum number of successful rounds per oriented pair |
-| Session monitoring | Tracks venue cash and collateral relative to startup balances, pauses new executions when thresholds are crossed, and can issue rebalancing alerts |
-| Operational records | Writes append-only desk events, unresolved-position records, persistent round counters, and post-trade reconciliation data under the ignored `logs/` directory |
-
-Cross-venue orders are not atomic. Concurrent submission reduces intentional delay between legs but cannot eliminate venue latency, rejection, partial-fill, or residual-position risk. Cleanup orders may also fail or execute at unfavorable prices.
-
-## Validation scope
-
-The project was exercised with live venue catalogs, authenticated order paths, portfolio reconciliation tools, and small-scale live trading. The following results describe the development and validation scope; they are not general performance guarantees.
-
-| Area | Observed scope |
-|---|---|
-| Catalog scale | Market ingestion and matching were configured for approximately 50,000 listings per venue |
-| Similarity search | Exact cosine scoring used chunked matrix operations; development measurements recorded microsecond-level scoring at the comparison stage |
-| Pair validation | The manually validated retained-pair set used during development recorded 100% agreement with its reference labels; the result is specific to that evaluated set |
-| End-to-end execution | Completed small-capital arbitrage cycles exercised detection, concurrent orders, fill reconciliation and portfolio accounting |
-| Live outcomes | Completed cycles in the reported validation period produced net returns of 10%–20% on the capital deployed in those individual cycles; this is not an annualized result or evidence of repeatable future returns |
-
-Raw account records, credentials and private trading logs are intentionally not published. The repository exposes the implementation and record schemas, but the reported live outcomes cannot be independently reconstructed from public data alone.
-
-## Safety boundary
-
-`LIVE_TRADING_ON` selects live execution or surveillance behavior at build time. At startup, its value is copied directly into the central runtime permission gate checked by order and cleanup entry points. The current implementation does not prompt for an additional interactive confirmation.
-
-Credentials can be supplied through environment variables or ignored files under `env/`; environment variables take precedence. No credentials, local logs, private keys, or account exports should be committed.
-
-The repository currently ships with `LIVE_TRADING_ON = true`. Review the configuration and use the connectivity checker before running the trader. See [Configuration](docs/CONFIGURATION.md) and [Operations](docs/OPERATIONS.md).
-
-## Repository structure
+## Repository guide
 
 ```text
-cross-platform-prediction-market-arbitrage-system/
-├── Cargo.toml                  # Rust workspace and release profile
-├── config/
-│   └── categories.toml         # Category taxonomy for contract matching
-├── docs/
-│   ├── ARCHITECTURE.md         # Component boundaries and data flow
-│   ├── CONFIGURATION.md        # Controls and credential sources
-│   ├── OPERATIONS.md           # Safe operating and recovery workflow
-│   ├── component-architecture.svg
-│   └── system-workflow.svg
-├── trader/
-│   └── src/                    # Matching, detection, execution and reconciliation
-├── portfolio_monitor/
-│   └── src/                    # Portfolio, cash-flow and settlement utilities
-├── COMMANDS.md                 # Build, run and reporting commands
-├── SECURITY.md                 # Credential and disclosure guidance
-└── README.md
+.
+├── trader/                 # Matching, pricing, execution, risk, and reconciliation
+│   └── README.md           # Trader module map and execution invariants
+├── portfolio_monitor/      # Position, cash-flow, profit, turnover, and settlement tools
+│   └── README.md           # Utility matrix, inputs, and side-effect boundaries
+├── config/                 # Matching taxonomy
+│   └── README.md           # Category behavior and editing guidance
+├── docs/                   # Architecture, configuration, and operating guides
+│   └── README.md           # Documentation index and reading paths
+├── COMMANDS.md             # Build and command reference
+└── SECURITY.md             # Credential and disclosure guidance
 ```
 
-The source retains detailed implementation comments and runtime diagnostics in their original language where changing them would not improve public documentation. All visitor-facing project documentation is in English.
+Start with the path that matches the question:
 
-## Quick start
+- **Research and matching:** [Trader internals](trader/README.md#contract-matching-and-validation)
+- **Execution and exposure:** [Trader execution path](trader/README.md#execution-path-and-invariants)
+- **Architecture and state:** [Architecture](docs/ARCHITECTURE.md)
+- **Credentials and controls:** [Configuration](docs/CONFIGURATION.md)
+- **Preflight and recovery:** [Operations](docs/OPERATIONS.md)
+- **Portfolio and settlement:** [Portfolio monitor](portfolio_monitor/README.md)
+- **Runnable commands:** [Command reference](COMMANDS.md)
 
-Install the stable Rust toolchain, then run read-only checks before starting the main process:
+## Build and inspect safely
+
+Rust stable is required. Compile and test the workspace before connecting accounts:
 
 ```bash
-# Compile the workspace
 cargo build --workspace --release
-
-# Validate credential presence and venue connectivity
+cargo test --workspace
 cargo run -p trader --bin check_env --release
+```
 
-# Run the trader; this can place orders when LIVE_TRADING_ON is true
+`check_env` validates credential presence and selected connectivity without starting the trading loop. The main binary is not a simulation command:
+
+```bash
 cargo run -p trader --release
 ```
 
-The main process connects to external services and can submit live orders when its gates are enabled. It is not a simulation command. For environment variables, operational checks, portfolio tools and recovery commands, use:
+The checked-in source currently sets `LIVE_TRADING_ON = true`, and startup copies that value directly into the runtime order gate. There is no second interactive confirmation. Review [Configuration](docs/CONFIGURATION.md) and [Operations](docs/OPERATIONS.md) before invoking the main binary.
 
-- [Configuration](docs/CONFIGURATION.md)
-- [Operations](docs/OPERATIONS.md)
-- [Command reference](COMMANDS.md)
-- [Architecture](docs/ARCHITECTURE.md)
-- [Security](SECURITY.md)
+## Technology and implementation choices
 
-## Technology
-
-- Rust 2021 and Tokio
-- `reqwest` for HTTP integrations
-- `ndarray` for vectorized similarity calculations
-- Kalshi RSA-PSS request signing
+- Rust 2021 and Tokio for asynchronous scheduling and bounded concurrent work
+- `ndarray` for vectorized, chunked cosine-similarity calculations
+- `reqwest` for market-data and authenticated HTTP integrations
+- RSA-PSS request signing for Kalshi
 - Polymarket CLOB SDK and Alloy signing components
-- JSONL event records and CSV/PNG portfolio reports
+- JSONL event records with CSV and PNG portfolio outputs
 
-## Limitations
+## Known boundaries
 
-- Contract equivalence is model- and rule-dependent; similar wording does not guarantee identical resolution criteria.
-- Visible order-book depth can change between detection and execution.
-- Kalshi and Polymarket do not provide an atomic cross-venue transaction.
-- Immediate-or-cancel behavior limits resting exposure but does not guarantee balanced fills.
-- LLM validation depends on a third-party service and rejects uncertain or failed responses by design.
-- Venue APIs, fee schedules, collateral conventions and jurisdictional restrictions can change.
-- Published validation figures describe a bounded historical test period and do not establish expected profitability.
+- Similar language and high cosine similarity do not prove identical settlement rules.
+- Visible liquidity can change between detection and execution; hidden liquidity and queue position are not modeled.
+- Immediate-or-cancel behavior limits resting orders but does not guarantee balanced fills.
+- The LLM stage depends on an external service and uses rejection as its failure default.
+- File-backed events and counters support traceability but not distributed or transactional recovery.
+- Venue APIs, fees, collateral conventions, access rules, and resolution processes can change independently.
+- The repository contains no public historical backtest, latency benchmark, or independently auditable profitability record.
 
 ## License
 
-No open-source license has been declared. The repository is publicly viewable, but reuse rights are not granted unless a license is added by the author.
+No open-source license has been declared. The repository is publicly viewable, but reuse rights are not granted unless the owner adds a license.
