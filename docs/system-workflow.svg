@@ -30,7 +30,7 @@
   <rect class="analysis" x="715" y="378" width="220" height="86" rx="10"/><text class="step" x="825" y="413">Common quantity</text><text class="detail" x="825" y="438">depth-weighted limits</text>
   <rect class="control" x="995" y="378" width="220" height="86" rx="10"/><text class="step" x="1105" y="413">Economics + risk</text><text class="detail" x="1105" y="438">fees, buffer, capital</text>
   <rect class="control" x="1260" y="378" width="105" height="86" rx="10"/><text class="step" x="1312" y="413">Gate</text><text class="detail" x="1312" y="438">pass</text>
-  <path class="flow" d="M720 276 V292"/><path class="flow" d="M375 421 H423"/><path class="flow" d="M655 421 H703"/><path class="flow" d="M935 421 H983"/><path class="flow" d="M1215 421 H1248"/>
+  <path class="flow" d="M375 421 H423"/><path class="flow" d="M655 421 H703"/><path class="flow" d="M935 421 H983"/><path class="flow" d="M1215 421 H1248"/>
   <text class="note" x="155" y="510">The detector emits an opportunity only when both legs support one quantity and the post-cost threshold is met.</text>
   <rect class="lane" x="40" y="606" width="1360" height="250" rx="16"/><text class="heading" x="72" y="646">3 · Execute, reconcile, and account</text>
   <circle cx="118" cy="733" r="18" fill="#238777"/><text class="number" x="118" y="733">3</text>
@@ -39,7 +39,7 @@
   <rect class="recovery" x="730" y="690" width="210" height="86" rx="10"/><text class="step" x="835" y="725">Residual response</text><text class="detail" x="835" y="750">sell excess or record</text>
   <rect class="store" x="1010" y="690" width="180" height="86" rx="10"/><text class="step" x="1100" y="725">Desk records</text><text class="detail" x="1100" y="750">JSONL + round state</text>
   <rect class="store" x="1260" y="690" width="105" height="86" rx="10"/><text class="step" x="1312" y="725">Review</text><text class="detail" x="1312" y="750">P&amp;L</text>
-  <path class="flow" d="M720 578 V594"/><path class="flow" d="M380 733 H438"/><path class="flow" d="M660 733 H718"/><path class="flow" d="M940 733 H998"/><path class="flow" d="M1190 733 H1248"/>
+  <path class="flow" d="M380 733 H438"/><path class="flow" d="M660 733 H718"/><path class="flow" d="M940 733 H998"/><path class="flow" d="M1190 733 H1248"/>
   <text class="note" x="450" y="820">Fill differences trigger compensating cleanup; cleanup is not an atomic rollback.</text>
   <rect x="930" y="866" width="14" height="14" rx="3" fill="#eaf3ff" stroke="#3878c7"/><text class="note" x="952" y="878">analysis</text><rect x="1015" y="866" width="14" height="14" rx="3" fill="#ecf8f5" stroke="#238777"/><text class="note" x="1037" y="878">control</text><rect x="1100" y="866" width="14" height="14" rx="3" fill="#fff0ed" stroke="#d45c4d"/><text class="note" x="1122" y="878">recovery</text><rect x="1195" y="866" width="14" height="14" rx="3" fill="#f3efff" stroke="#7a61b8"/><text class="note" x="1217" y="878">records</text>
 </svg>
