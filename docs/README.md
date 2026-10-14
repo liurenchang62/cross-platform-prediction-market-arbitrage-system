@@ -15,7 +15,7 @@ The documents in this directory answer different review questions rather than re
 ## Visuals
 
 - [`system-workflow.svg`](system-workflow.svg) follows one pair from discovery to post-trade review.
-- [`component-architecture.svg`](component-architecture.svg) shows code and state boundaries rather than chronological steps.
+- [`component-architecture.svg`](component-architecture.svg) is displayed on the project homepage and shows code and state boundaries rather than chronological steps.
 
 The visuals intentionally use different structures: a three-lane sequence for lifecycle reasoning and a layered component map for ownership and dependencies.
 

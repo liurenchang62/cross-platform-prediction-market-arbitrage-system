@@ -73,7 +73,7 @@ Concurrency reduces deliberate inter-leg delay; it does not make the trade atomi
 
 ![Layered component architecture](docs/component-architecture.svg)
 
-The repository separates contract intelligence from the order-capable runtime and keeps portfolio analysis in a second workspace crate. Persistent files provide an audit trail and restart-aware limits, but they are not a transactional database. The detailed module map and state ownership are documented in [Architecture](docs/ARCHITECTURE.md).
+The repository separates contract intelligence from the order-capable runtime and keeps portfolio analysis in a second workspace crate. Persistent files provide an audit trail and restart-aware limits, but they are not a transactional database. Continue with [implementation ownership, execution sequence, and state persistence](docs/ARCHITECTURE.md) for the code-level explanation behind the diagram.
 
 ## Validation record and evidence boundary
 
@@ -109,7 +109,7 @@ Start with the path that matches the question:
 
 - **Research and matching:** [Trader internals](trader/README.md#contract-matching-and-validation)
 - **Execution and exposure:** [Trader execution path](trader/README.md#execution-path-and-invariants)
-- **Architecture and state:** [Architecture](docs/ARCHITECTURE.md)
+- **Code ownership and state transitions:** [Architecture details](docs/ARCHITECTURE.md)
 - **Credentials and controls:** [Configuration](docs/CONFIGURATION.md)
 - **Preflight and recovery:** [Operations](docs/OPERATIONS.md)
 - **Portfolio and settlement:** [Portfolio monitor](portfolio_monitor/README.md)

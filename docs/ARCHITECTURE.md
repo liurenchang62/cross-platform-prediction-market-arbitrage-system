@@ -2,12 +2,6 @@
 
 This document describes code-level ownership, state transitions, and the boundary between research logic and order-capable components. The chronological operating workflow remains in the repository README.
 
-## Component map
-
-![Component architecture](component-architecture.svg)
-
-**Color key:** blue = contract intelligence · green = trading runtime · coral = recovery · violet = persistent state and reporting
-
 ## Component boundaries
 
 | Area | Primary modules | Responsibility |
@@ -20,7 +14,7 @@ This document describes code-level ownership, state transitions, and the boundar
 | Reconciliation | `trade_reconciliation.rs`, `position_cleanup.rs`, `desk_events.rs` | Fill comparison, excess-leg cleanup, unresolved-exposure records and event persistence |
 | Portfolio tools | `portfolio_monitor/src/` | Account snapshots, cash flow, P&L, turnover, settlement reconciliation and operator utilities |
 
-Detailed directory-level maps are available in the [trader guide](../trader/README.md) and [portfolio-monitor guide](../portfolio_monitor/README.md).
+The visual overview is shown once in the [project README](../README.md#component-architecture). This page continues from that overview with code ownership, state transitions, and concurrency details. Directory-level maps are available in the [trader guide](../trader/README.md) and [portfolio-monitor guide](../portfolio_monitor/README.md).
 
 ## Execution sequence
 
