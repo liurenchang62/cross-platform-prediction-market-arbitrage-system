@@ -58,7 +58,7 @@ rsa = { version = "0.9", features = ["pem", "sha2"] }
 sha2 = "0.10"
 rand = "0.8"
 polymarket_client_sdk_v2 = { version = "0.5.1", features = ["clob", "data", "ctf"] }
-# 与 polymarket-client-sdk 的 CTF 示例一致：Provider + 本地签名发链上 redeem
+# Provider and local signer used for on-chain redemption through the Polymarket CTF flow
 alloy = { version = "1.6.3", default-features = false, features = [
     "signer-local",
     "sol-types",

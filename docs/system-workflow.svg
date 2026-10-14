@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="760" viewBox="0 0 1400 760" role="img" aria-labelledby="title desc">
+  <title id="title">Cross-platform prediction market arbitrage workflow</title>
+  <desc id="desc">Workflow from Kalshi and Polymarket catalogs through contract matching, order-book evaluation, concurrent execution, reconciliation and portfolio records.</desc>
+  <defs>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%"><feDropShadow dx="0" dy="3" stdDeviation="4" flood-color="#0f172a" flood-opacity="0.12"/></filter>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#526173"/></marker>
+    <style>
+      .band{fill:#f8fafc;stroke:#d8e1eb;stroke-width:1.5}.box{fill:#ffffff;stroke:#7b8ba1;stroke-width:1.5;filter:url(#shadow)}
+      .control{fill:#fff7d6;stroke:#d19a17;stroke-width:1.6;filter:url(#shadow)}.exception{fill:#fff0ef;stroke:#c94a45;stroke-width:1.6;filter:url(#shadow)}
+      .title{font:600 22px Arial,sans-serif;fill:#15263c}.label{font:600 17px Arial,sans-serif;fill:#172033;text-anchor:middle}.small{font:14px Arial,sans-serif;fill:#445268;text-anchor:middle}
+      .flow{fill:none;stroke:#526173;stroke-width:2;marker-end:url(#arrow)}
+    </style>
+  </defs>
+  <rect width="1400" height="760" fill="#ffffff"/>
+  <rect class="band" x="40" y="32" width="1320" height="205" rx="12"/><text class="title" x="70" y="70">Contract discovery and equivalence</text>
+  <rect class="box" x="80" y="100" width="200" height="90" rx="8"/><text class="label" x="180" y="137">Kalshi catalog</text><text class="small" x="180" y="163">markets and metadata</text>
+  <rect class="box" x="330" y="100" width="200" height="90" rx="8"/><text class="label" x="430" y="137">Polymarket catalog</text><text class="small" x="430" y="163">markets and metadata</text>
+  <rect class="box" x="590" y="100" width="220" height="90" rx="8"/><text class="label" x="700" y="137">TF-IDF retrieval</text><text class="small" x="700" y="163">exact cosine search</text>
+  <rect class="control" x="870" y="100" width="210" height="90" rx="8"/><text class="label" x="975" y="137">Rule validation</text><text class="small" x="975" y="163">semantics and dates</text>
+  <rect class="control" x="1140" y="100" width="170" height="90" rx="8"/><text class="label" x="1225" y="137">LLM review</text><text class="small" x="1225" y="163">optional final filter</text>
+  <path class="flow" d="M280 145 H590"/><path class="flow" d="M530 145 H590"/><path class="flow" d="M810 145 H870"/><path class="flow" d="M1080 145 H1140"/>
+
+  <rect class="band" x="40" y="265" width="1320" height="205" rx="12"/><text class="title" x="70" y="303">Market evaluation and execution</text>
+  <rect class="box" x="80" y="335" width="210" height="90" rx="8"/><text class="label" x="185" y="372">Oriented pairs</text><text class="small" x="185" y="398">both hedge directions</text>
+  <rect class="box" x="350" y="335" width="210" height="90" rx="8"/><text class="label" x="455" y="372">Order books</text><text class="small" x="455" y="398">full visible ladders</text>
+  <rect class="control" x="620" y="335" width="230" height="90" rx="8"/><text class="label" x="735" y="370">Economics and limits</text><text class="small" x="735" y="396">fees, depth, size, return</text>
+  <rect class="control" x="910" y="335" width="200" height="90" rx="8"/><text class="label" x="1010" y="370">Live-order gate</text><text class="small" x="1010" y="396">permission and risk state</text>
+  <rect class="box" x="1170" y="335" width="150" height="90" rx="8"/><text class="label" x="1245" y="370">Submit</text><text class="small" x="1245" y="396">IOC and FAK</text>
+  <path class="flow" d="M1225 190 V220 H185 V335"/><path class="flow" d="M290 380 H350"/><path class="flow" d="M560 380 H620"/><path class="flow" d="M850 380 H910"/><path class="flow" d="M1110 380 H1170"/>
+
+  <rect class="band" x="40" y="498" width="1320" height="225" rx="12"/><text class="title" x="70" y="536">Reconciliation and portfolio state</text>
+  <rect class="box" x="100" y="570" width="210" height="95" rx="8"/><text class="label" x="205" y="607">Returned fills</text><text class="small" x="205" y="633">compare both venues</text>
+  <rect class="control" x="380" y="570" width="210" height="95" rx="8"/><text class="label" x="485" y="607">Fill reconciliation</text><text class="small" x="485" y="633">matched and excess size</text>
+  <rect class="exception" x="660" y="570" width="210" height="95" rx="8"/><text class="label" x="765" y="607">Residual cleanup</text><text class="small" x="765" y="633">sell excess or record risk</text>
+  <rect class="box" x="940" y="570" width="170" height="95" rx="8"/><text class="label" x="1025" y="607">Event records</text><text class="small" x="1025" y="633">append-only JSONL</text>
+  <rect class="box" x="1180" y="570" width="150" height="95" rx="8"/><text class="label" x="1255" y="607">Portfolio tools</text><text class="small" x="1255" y="633">P&amp;L and settlement</text>
+  <path class="flow" d="M1245 425 V475 H205 V570"/><path class="flow" d="M310 617 H380"/><path class="flow" d="M590 617 H660"/><path class="flow" d="M870 617 H940"/><path class="flow" d="M1110 617 H1180"/>
+</svg>

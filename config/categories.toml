@@ -1,11 +1,11 @@
 # config/categories.toml
-# 类别映射配置文件
-# 格式：[[categories]] 每个类别是一个数组元素
+# Category taxonomy for market matching.
+# Each [[categories]] entry defines one weighted keyword group.
 
 [[categories]]
 name = "religion"
 weight = 1.0
-description = "宗教相关"
+description = "Religion"
 keywords = [
     "jesus",
     "christ",
@@ -27,7 +27,7 @@ keywords = [
 [[categories]]
 name = "gaming"
 weight = 1.0
-description = "游戏相关"
+description = "Gaming"
 keywords = [
     "gta",
     "game",
@@ -49,7 +49,7 @@ keywords = [
 [[categories]]
 name = "politics_us"
 weight = 1.0
-description = "美国政治"
+description = "United States politics"
 keywords = [
     "president",
     "election",
@@ -75,7 +75,7 @@ keywords = [
 [[categories]]
 name = "politics_uk"
 weight = 1.0
-description = "英国政治"
+description = "United Kingdom politics"
 keywords = [
     "prime minister",
     "parliament",
@@ -93,7 +93,7 @@ keywords = [
 [[categories]]
 name = "crypto"
 weight = 1.0
-description = "加密货币"
+description = "Cryptocurrency"
 keywords = [
     "bitcoin",
     "ethereum",
@@ -119,7 +119,7 @@ keywords = [
 [[categories]]
 name = "sports_basketball"
 weight = 1.0
-description = "篮球"
+description = "Basketball"
 keywords = [
     "nba",
     "basketball",
@@ -182,7 +182,7 @@ keywords = [
 [[categories]]
 name = "sports_football"
 weight = 1.0
-description = "美式足球"
+description = "American football"
 keywords = [
     "nfl",
     "super bowl",
@@ -201,7 +201,7 @@ keywords = [
 [[categories]]
 name = "sports_soccer"
 weight = 1.0
-description = "足球"
+description = "Association football"
 keywords = [
     "soccer",
     "fifa",
@@ -239,7 +239,7 @@ keywords = [
 [[categories]]
 name = "sports_golf"
 weight = 1.0
-description = "高尔夫"
+description = "Golf"
 keywords = [
     "golf",
     "valspar",
@@ -257,7 +257,7 @@ keywords = [
 [[categories]]
 name = "sports_teams"
 weight = 1.0
-description = "体育队伍/城市"
+description = "Sports teams and cities"
 keywords = [
     "miami",
     "washington",
@@ -292,7 +292,7 @@ keywords = [
 [[categories]]
 name = "sports_college"
 weight = 1.0
-description = "大学体育"
+description = "College sports"
 keywords = [
     "villanova",
     "ucla",
@@ -306,7 +306,7 @@ keywords = [
 [[categories]]
 name = "sports_other"
 weight = 1.0
-description = "其他体育相关"
+description = "Other sports"
 keywords = [
     "winner",
     "wins",
@@ -336,7 +336,7 @@ keywords = [
 [[categories]]
 name = "weather"
 weight = 1.0
-description = "天气相关"
+description = "Weather"
 keywords = [
     "weather",
     "hurricane",
@@ -358,7 +358,7 @@ keywords = [
 [[categories]]
 name = "entertainment_movies"
 weight = 1.0
-description = "电影"
+description = "Film"
 keywords = [
     "movie",
     "film",
@@ -379,7 +379,7 @@ keywords = [
 [[categories]]
 name = "entertainment_music"
 weight = 1.0
-description = "音乐"
+description = "Music"
 keywords = [
     "grammy",
     "album",
@@ -398,7 +398,7 @@ keywords = [
 [[categories]]
 name = "technology"
 weight = 1.0
-description = "科技"
+description = "Technology"
 keywords = [
     "apple",
     "iphone",
@@ -419,7 +419,7 @@ keywords = [
 [[categories]]
 name = "business"
 weight = 1.0
-description = "商业"
+description = "Business"
 keywords = [
     "ceo",
     "market",
@@ -441,7 +441,7 @@ keywords = [
 [[categories]]
 name = "science"
 weight = 1.0
-description = "科学"
+description = "Science"
 keywords = [
     "nobel",
     "physics",

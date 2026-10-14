@@ -1,0 +1,41 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="820" viewBox="0 0 1400 820" role="img" aria-labelledby="title desc">
+  <title id="title">Component architecture</title>
+  <desc id="desc">Code component relationships among venue clients, matching, tracking, economics, execution, risk, reconciliation and portfolio tools.</desc>
+  <defs>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%"><feDropShadow dx="0" dy="3" stdDeviation="4" flood-color="#0f172a" flood-opacity="0.12"/></filter>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#526173"/></marker>
+    <style>
+      .zone{fill:#f8fafc;stroke:#d8e1eb;stroke-width:1.5}.box{fill:#ffffff;stroke:#7b8ba1;stroke-width:1.5;filter:url(#shadow)}
+      .control{fill:#fff7d6;stroke:#d19a17;stroke-width:1.6;filter:url(#shadow)}.exception{fill:#fff0ef;stroke:#c94a45;stroke-width:1.6;filter:url(#shadow)}
+      .heading{font:600 22px Arial,sans-serif;fill:#15263c}.label{font:600 17px Arial,sans-serif;fill:#172033;text-anchor:middle}.small{font:14px Arial,sans-serif;fill:#445268;text-anchor:middle}
+      .flow{fill:none;stroke:#526173;stroke-width:2;marker-end:url(#arrow)}
+    </style>
+  </defs>
+  <rect width="1400" height="820" fill="#ffffff"/>
+  <rect class="zone" x="40" y="35" width="1320" height="150" rx="12"/><text class="heading" x="70" y="72">External venues and services</text>
+  <rect class="box" x="130" y="95" width="230" height="60" rx="8"/><text class="label" x="245" y="132">Kalshi APIs</text>
+  <rect class="box" x="470" y="95" width="230" height="60" rx="8"/><text class="label" x="585" y="132">Polymarket APIs</text>
+  <rect class="box" x="810" y="95" width="230" height="60" rx="8"/><text class="label" x="925" y="132">DeepSeek API</text>
+  <rect class="box" x="1150" y="95" width="140" height="60" rx="8"/><text class="label" x="1220" y="132">Feishu</text>
+
+  <rect class="zone" x="40" y="215" width="1320" height="365" rx="12"/><text class="heading" x="70" y="252">Trader workspace</text>
+  <rect class="box" x="90" y="285" width="210" height="78" rx="8"/><text class="label" x="195" y="317">Venue clients</text><text class="small" x="195" y="341">catalogs and books</text>
+  <rect class="box" x="360" y="285" width="210" height="78" rx="8"/><text class="label" x="465" y="317">Vector index</text><text class="small" x="465" y="341">TF-IDF retrieval</text>
+  <rect class="control" x="630" y="285" width="210" height="78" rx="8"/><text class="label" x="735" y="317">Pair validation</text><text class="small" x="735" y="341">rules and LLM</text>
+  <rect class="box" x="900" y="285" width="210" height="78" rx="8"/><text class="label" x="1005" y="317">Tracking state</text><text class="small" x="1005" y="341">oriented pairs</text>
+  <rect class="control" x="1170" y="285" width="150" height="78" rx="8"/><text class="label" x="1245" y="317">Session risk</text><text class="small" x="1245" y="341">capital state</text>
+
+  <rect class="box" x="180" y="440" width="230" height="82" rx="8"/><text class="label" x="295" y="473">Arbitrage detector</text><text class="small" x="295" y="498">depth and cost model</text>
+  <rect class="control" x="485" y="440" width="230" height="82" rx="8"/><text class="label" x="600" y="473">Main orchestrator</text><text class="small" x="600" y="498">cadence and concurrency</text>
+  <rect class="box" x="790" y="440" width="230" height="82" rx="8"/><text class="label" x="905" y="473">Venue execution</text><text class="small" x="905" y="498">IOC and FAK orders</text>
+  <rect class="exception" x="1095" y="440" width="225" height="82" rx="8"/><text class="label" x="1207" y="473">Reconciliation</text><text class="small" x="1207" y="498">cleanup and records</text>
+
+  <path class="flow" d="M245 155 V195 H55 V324 H90"/><path class="flow" d="M585 155 V195 H320 V324 H300"/><path class="flow" d="M925 155 V195 H735 V285"/><path class="flow" d="M300 324 H360"/><path class="flow" d="M570 324 H630"/><path class="flow" d="M840 324 H900"/><path class="flow" d="M1110 324 H1170"/>
+  <path class="flow" d="M1005 363 V400 H295 V440"/><path class="flow" d="M410 481 H485"/><path class="flow" d="M715 481 H790"/><path class="flow" d="M1020 481 H1095"/><path class="flow" d="M1245 363 V405 H600 V440"/>
+
+  <rect class="zone" x="40" y="610" width="1320" height="170" rx="12"/><text class="heading" x="70" y="647">Persistent records and portfolio monitoring</text>
+  <rect class="box" x="150" y="680" width="260" height="65" rx="8"/><text class="label" x="280" y="708">JSONL and round state</text><text class="small" x="280" y="730">events, residuals, limits</text>
+  <rect class="box" x="570" y="680" width="260" height="65" rx="8"/><text class="label" x="700" y="708">Portfolio monitor</text><text class="small" x="700" y="730">positions, cash flow, P&amp;L</text>
+  <rect class="box" x="990" y="680" width="260" height="65" rx="8"/><text class="label" x="1120" y="708">Reports and reconciliation</text><text class="small" x="1120" y="730">CSV, charts, settlement</text>
+  <path class="flow" d="M1207 522 V560 H280 V680"/><path class="flow" d="M410 712 H570"/><path class="flow" d="M830 712 H990"/>
+</svg>

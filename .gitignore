@@ -1,30 +1,30 @@
-# Rust 构建输出
+# Rust build output
 /target/
 **/*.rs.bk
 Cargo.lock
 
-# IDE 文件
+# IDE files
 .vscode/
 .idea/
 *.iml
 
-# 系统文件
+# Operating-system files
 .DS_Store
 Thumbs.db
 
-# 日志文件
+# Runtime logs
 *.log
 /logs/
 
-# portfolio_monitor 制图输出
+# Portfolio-monitor report output
 /portfolio_monitor/out/
 
-# 环境变量
+# Local environment files
 .env
 .env.*
 /env/
 
-# 本地密钥目录（Kalshi Demo PEM 等，勿提交）
+# Local key material; never commit PEM files or other credentials
 /secrets/
 
 *.zip
