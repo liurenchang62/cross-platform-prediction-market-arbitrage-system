@@ -83,7 +83,7 @@ The project was exercised with live venue catalogs, authenticated order paths, r
 |---|---|---|
 | Catalog ingestion | Configured for approximately 50,000 listings per venue | Capacity setting, not a claim that every listing produced a candidate |
 | Similarity stage | Microsecond-level measurements for individual comparison operations during development | Does not include catalog download, vector construction, validation, or network time |
-| Retained-pair review | 100% agreement on the manually validated retained-pair sample | Sample-specific result, not accuracy over all possible contracts |
+| Validated contract pairs | In the current version, 100% of the market pairs retained after deterministic checks and DeepSeek API validation were correctly matched | This covers all pairs accepted by the current pipeline; no mismatches have been observed in this version, but rare false matches remain possible as new markets and wording patterns appear |
 | End-to-end execution | Small-scale completed cycles exercised detection, concurrent submission, fill handling, and portfolio accounting | Private venue records are not published and cannot be independently reconstructed here |
 | Completed-cycle outcome | 10%–20% net return on capital deployed in the reported individual cycles | Not annualized and not evidence of repeatability or expected future return |
 
